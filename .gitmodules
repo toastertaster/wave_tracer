@@ -4,7 +4,7 @@
 	url = https://github.com/g-truc/glm
 [submodule "deps/tinybvh"]
 	path = deps/tinybvh
-	url = https://git.uwaterloo.ca/shlomist/tinybvh
+	url = git@github.com:toastertaster/tinybvh.git
 [submodule "deps/tinyobjloader"]
 	path = deps/tinyobjloader
 	url = https://github.com/tinyobjloader/tinyobjloader
@@ -34,7 +34,7 @@
 	url = https://github.com/mpusz/mp-units
 [submodule "deps/tinyexpr-plusplus"]
 	path = deps/tinyexpr-plusplus
-	url = https://git.uwaterloo.ca/shlomist/tinyexpr-plusplus
+	url = git@github.com:toastertaster/tinyexpr-plusplus.git
 [submodule "deps/GitHash"]
 	path = deps/GitHash
 	url = https://github.com/Svalorzen/GitHash
