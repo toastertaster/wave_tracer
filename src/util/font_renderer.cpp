@@ -140,17 +140,19 @@ vec2_t renderer(font_renderer::impl_t* pimpl,
             const auto g = slot->bitmap.buffer[x+slot->bitmap.width*y];
 
             if (target.components()==1) {
-                f_t& p = *reinterpret_cast<f_t*>(&target(ix,iy,0));
+                Fp& p = target(ix,iy,0);
 
                 const auto c = p<.5 ? colour_bright : colour_dark;
-                p = m::mix(p, glm::luminosity(vec3_t{ c }), f_t(g)/255);
+                p = static_cast<Fp>(m::mix(f_t(p), glm::luminosity(vec3_t{ c }), f_t(g)/255));
             }
             else if (target.components()==3) {
-                vec3_t& p = *reinterpret_cast<vec3_t*>(&target(ix,iy,0));
+                const vec3_t p = { target(ix,iy,0), target(ix,iy,1), target(ix,iy,2) };
 
                 const auto c = glm::luminosity(p)<.5 ? colour_bright : colour_dark;
                 const auto a = c.w*f_t(g)/255;
-                p = m::mix(p, vec3_t{ c }, a);
+                const auto mixed = m::mix(p, vec3_t{ c }, a);
+                for (auto ch=0; ch<3; ++ch)
+                    target(ix,iy,ch) = static_cast<Fp>(mixed[ch]);
             }
         }
 

@@ -175,11 +175,11 @@ public:
 
         auto out = bitmap::bitmap_t<Fp>::create(bmp.width(), bmp.height(), bitmap::pixel_layout_e::RGB);
         for (auto p=0ul; p<bmp.total_pixels(); ++p) {
-            if (chnls==1)
-                reinterpret_cast<vec3_t*>(out.data())[p] = (*this)(bmp.data()[p]);
-            if (chnls==3)
-                reinterpret_cast<vec3_t*>(out.data())[p] = 
-                    (*this)(vec3_t{ bmp.data()[3*p+0], bmp.data()[3*p+1], bmp.data()[3*p+2] });
+            const vec3_t rgb = chnls==1 ?
+                (*this)(bmp.data()[p]) :
+                (*this)(vec3_t{ bmp.data()[3*p+0], bmp.data()[3*p+1], bmp.data()[3*p+2] });
+            for (auto c=0; c<3; ++c)
+                out.data()[3*p+c] = static_cast<Fp>(rgb[c]);
         }
 
         return out;
