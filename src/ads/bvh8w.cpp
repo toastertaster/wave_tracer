@@ -587,19 +587,21 @@ bool bvh8w_t::shadow(const ray_t &ray, const pqrange_t<> traversal_range) const 
         start = std::chrono::high_resolution_clock::now();
 
     // traverse bvh8w
+    // The result is traverse()'s return value, not `work.triangle.dist`: GCC 13.3
+    // at -O3 (aarch64; its IPA mod/ref analysis) assumes traverse<true> leaves
+    // `work` unmodified, and this returned false for every ray.
     static constexpr bool shadow = true;
     int nodes = 0;
-    ::traverse<shadow>(this, ray, work, nodes);
+    const bool occluded = ::traverse<shadow>(this, ray, work, nodes);
 
     // record ray cast
-    ads_stats::on_ray_cast_event(m::isfinite(work.triangle.dist) && work.triangle.dist<=traversal_range.max, 
-                                 !m::isfinite(work.triangle.dist) && !V().contains(ray.propagate(traversal_range.max)),
+    ads_stats::on_ray_cast_event(occluded, 
+                                 !occluded && !V().contains(ray.propagate(traversal_range.max)),
                                  true,
                                  start,
                                  nodes);
 
-    assert(work.triangle.dist == limits<length_t>::infinity() || traversal_range.contains(work.triangle.dist));
-    return work.triangle.dist < limits<length_t>::infinity();
+    return occluded;
 }
 
 
