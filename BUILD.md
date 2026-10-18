@@ -40,6 +40,24 @@ sudo apt install git-lfs build-essential pkg-config libxmu-dev libxi-dev libgl-d
 * **AVX512f** and **AVX512dq** --- when compiling with double-precision support (```DBL_PRECISION``` set to `ON`)
 
 
+### GPU (experimental)
+
+GPU support is optional at compile time and at run time: with these options `OFF` (the default) nothing GPU-related is built and no GPU toolchain is needed, and a GPU build renders on the CPU unless asked otherwise.
+
+```GPU_CUDA```: (default `OFF`) build the CUDA backend. Needs the CUDA toolkit (`nvcc`); kernels are compiled for the GPUs of the building machine unless `CMAKE_CUDA_ARCHITECTURES` is set. The CUDA runtime is linked statically, so only the NVIDIA driver is needed at run time.
+
+```GPU_OPTIX```: (default `OFF`) answer GPU ray queries with OptiX's hardware ray tracing. Requires `GPU_CUDA`, CMake 3.27 and the OptiX SDK, found in `/opt/optix*` or given with `-DOptiX_INSTALL_DIR=...` (or the environment variable of the same name). An OptiX SDK needs a recent enough NVIDIA driver (OptiX 9.1 needs a newer one than 9.0); with an older driver, choose an older SDK.
+
+```GPU_DBL_PRECISION```: (default `OFF`) use 64-bit floating point in GPU kernels, independent of `DBL_PRECISION`. OptiX is then not used for ray queries (its traversal is 32-bit). Most GPUs compute 64-bit floating point far slower than 32-bit, and Apple GPUs not at all.
+
+At run time, `render --gpu` uses the GPU. So far the GPU answers acceleration-structure queries (`wt/gpu/gpu.hpp`); rendering with `--gpu` fails with an error naming the integrator, rather than silently rendering on the CPU. The GPU code is laid out as follows:
+
+* `include/wt/gpu/kernel/`: the kernels, in a C++17 subset shared by CUDA, Metal and host C++ (see `config.hpp`): math, intersection tests and the `bvh8w` traversals, ported from the CPU code.
+* `include/wt/gpu/gpu.hpp`: the API the rest of wave_tracer uses (`gpu::device_t`, `gpu::geometry_t`).
+* `include/wt/gpu/backend.hpp`: the interface backends implement; `src/gpu/cuda/`, `src/gpu/optix/`: the CUDA backend.
+* `cmake/wt_gpu.cmake`: the options above, also used by builds that embed wave_tracer.
+
+
 
 ### Build type configuration
 

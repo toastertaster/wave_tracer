@@ -18,6 +18,7 @@
 
 #include <wt/scene/scene_renderer.hpp>
 #include <wt/scene/scene.hpp>
+#include <wt/gpu/gpu.hpp>
 #include <wt/util/thread_pool/tpool.hpp>
 
 #include <wt/util/logger/logger.hpp>
@@ -383,6 +384,12 @@ scene::render_result_t scene_renderer_t::render(
         const wt_context_t& ctx, const ads::ads_t& ads,
         const scene::render_opts_t opts) {
     using clock = std::chrono::steady_clock;
+
+    // Rendering on a GPU fails rather than silently rendering on the CPU.
+    if (ctx.gpu_device)
+        throw gpu::gpu_error_t(std::format(
+            "GPU rendering is not implemented yet for the '{}' integrator; render without the GPU device",
+            scene->integrator().description().type));
 
     // grab a copy of sensors to render
     const auto& sensors = scene->sensors();

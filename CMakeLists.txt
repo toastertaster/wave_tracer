@@ -166,6 +166,8 @@ set(SRC
     
     src/util/statistics_collector/stat_collector_registry.cpp
     src/util/statistics_collector/stat_histogram.cpp
+
+    src/gpu/gpu.cpp
 )
 
 
@@ -201,6 +203,10 @@ if(APPLE)
 else()
     add_executable(wave_tracer ${SRC})
 endif()
+
+# GPU backends (experimental; options GPU_CUDA, GPU_OPTIX, GPU_DBL_PRECISION, all OFF by default)
+include(cmake/wt_gpu.cmake)
+wt_add_gpu_backends(wave_tracer)
 
 
 # -- compilation options --

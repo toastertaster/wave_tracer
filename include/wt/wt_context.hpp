@@ -22,6 +22,8 @@ class preview_window_t;
 
 namespace thread_pool { class tpool_t; }
 
+namespace gpu { class device_t; }
+
 /**
  * @brief Used for logging and output verbosity adjustments.
  */
@@ -56,6 +58,12 @@ struct wt_context_t {
 
     /** @brief Thread pool */
     wt::thread_pool::tpool_t* threadpool;
+
+    /**
+     * @brief GPU to render on (experimental, see wt/gpu/gpu.hpp), owned by the application.
+     *        Null renders on the CPU.
+     */
+    const wt::gpu::device_t* gpu_device = nullptr;
 
 
     /**
