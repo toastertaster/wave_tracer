@@ -333,7 +333,7 @@ void scene_renderer_t::process_interrupts(void* incomplete_render_ctxs_ptr) {
         // process interrupts
         std::unique_lock l(*interrupts_queue_mutex);
         while (!interrupts_queue.empty()) {
-            auto interrupt = std::move(interrupts_queue.back());
+            auto interrupt = std::move(interrupts_queue.front());
             interrupts_queue.pop();
 
             if (const auto pause = dynamic_cast<const pause_t*>(interrupt.get()); pause) {
