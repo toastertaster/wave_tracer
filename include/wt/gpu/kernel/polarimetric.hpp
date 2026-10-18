@@ -27,6 +27,9 @@ namespace wt::gpu::kernel {
 /** @brief Stokes parameters vector (`stokes_parameters_t`). */
 struct stokes {
     real s0, s1, s2, s3;
+
+    WT_GPU_FN stokes operator*(real s) const { return { s0*s, s1*s, s2*s, s3*s }; }
+    WT_GPU_FN stokes operator+(stokes o) const { return { s0+o.s0, s1+o.s1, s2+o.s2, s3+o.s3 }; }
 };
 
 /**

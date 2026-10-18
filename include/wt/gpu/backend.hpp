@@ -61,6 +61,7 @@ struct ball_hit_t {
  */
 struct plt_path_scene_t {
     std::vector<kernel::tri_shading> tris;     // per BVH triangle
+    std::vector<kernel::edge> edges;
     std::vector<kernel::material> materials;
     std::vector<kernel::point_emitter> emitters;
     std::vector<kernel::real> emitter_cdf;
@@ -77,7 +78,7 @@ public:
     /**
      * @brief Traces paths `first .. first+count-1` and accumulates them into
      *        the film. A path's index and `seed` determine its random numbers.
-     *        Returns the query status flags of all paths.
+     *        Returns the status flags of all paths (kernel::status_*).
      */
     virtual std::uint32_t trace(std::uint64_t first, std::uint64_t count, std::uint32_t seed) = 0;
 

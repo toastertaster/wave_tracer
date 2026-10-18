@@ -24,6 +24,8 @@
 #include <wt/interaction/surface_profile/dirac.hpp>
 #include <wt/sensor/sensor/virtual_plane_sensor.hpp>
 #include <wt/sensor/film/film_storage.hpp>
+#include <wt/util/logger/logger.hpp>
+#include <wt/gpu/kernel/plt_path.hpp>
 
 #include "to_kernel.hpp"
 
@@ -54,10 +56,6 @@ void compile_integrator(const scene_t& scene, const sensor::sensor_t& sensor,
     const auto& opts = plt_path->get_options();
     if (opts.transport_direction!=bsdf::transport_e::forward)
         throw gpu_error_t("GPU rendering supports only forward plt_path (direction=\"forward\") so far");
-    if (!sensor.ray_trace_only())
-        throw gpu_error_t(std::format(
-            "GPU rendering supports only ray tracing so far: render sensor <{}> in ray-tracing mode "
-            "(--ray-tracing, or the sensor's ray_trace_only)", sensor.get_id()));
 
     out.params.max_depth = opts.max_depth;
     out.params.russian_roulette = opts.RR ? 1 : 0;
@@ -187,6 +185,7 @@ void compile_geometry(const scene_t& scene, const ads::bvh8w_t& bvh, const waven
     }
 
     // shading data in the BVH's triangle order (see flatten() in src/gpu/gpu.cpp)
+    const auto edge_id = [](const ads::tuid_t e) { return e ? std::uint32_t(e.uid) : kernel::no_edge; };
     out.tris.resize(bvh.triangles_count());
     for (std::size_t i=0; i<out.tris.size(); ++i) {
         const auto& t = bvh.tri(ads::tuid_t{ ads::idx_t(i) });
@@ -197,6 +196,29 @@ void compile_geometry(const scene_t& scene, const ads::bvh8w_t& bvh, const waven
             s.n[v] = to_kernel(dir3_t{ mesh_tri.n[v] });
         s.dpdu = to_kernel(mesh_tri.tangent_frame.dpdu);
         s.material = shape_material[t.shape_idx];
+        s.edges[0] = edge_id(t.edge_ab);
+        s.edges[1] = edge_id(t.edge_bc);
+        s.edges[2] = edge_id(t.edge_ca);
+    }
+
+    // edges
+    if (bvh.edges_count()>=std::size_t(1)<<31)
+        throw gpu_error_t("GPU rendering supports up to 2^31 edges");
+    const auto* first_tri = &bvh.tri(ads::tuid_t{ 0 });
+    const auto tri_index = [&](const ads::tri_t* t) {
+        return t ? std::uint32_t(t - first_tri) : kernel::no_triangle;
+    };
+    out.edges.resize(bvh.edges_count());
+    for (std::size_t i=0; i<out.edges.size(); ++i) {
+        const auto& e = bvh.edge(std::uint32_t(i));
+        out.edges[i] = kernel::edge{
+            .a = to_kernel(e.a), .b = to_kernel(e.b),
+            .n1 = to_kernel(e.n1), .t1 = to_kernel(e.t1),
+            .n2 = to_kernel(e.n2), .t2 = to_kernel(e.t2),
+            .alpha = real(u::to_rad(e.alpha)),
+            .tri1 = tri_index(e.tri1),
+            .tri2 = tri_index(e.tri2),
+        };
     }
 }
 
@@ -218,8 +240,12 @@ void compile_sensor(const sensor::sensor_t& sensor, const wavenumber_t k, plt_pa
     s.quad[1] = to_kernel(o + extent.x*f.t);
     s.quad[2] = to_kernel(o + extent.y*f.b);
     s.quad[3] = to_kernel(o + extent.x*f.t + extent.y*f.b);
-    const auto recp_element_extent = f_t(1) / plane->element_extent();
+    const auto element_extent = plane->element_extent();
+    const auto recp_element_extent = f_t(1) / element_extent;
+    s.extent = { real(u::to_m(extent.x)), real(u::to_m(extent.y)) };
+    s.element_extent = { real(u::to_m(element_extent.x)), real(u::to_m(element_extent.y)) };
     s.recp_element_extent = { real(u::to_inv_m(recp_element_extent.x)), real(u::to_inv_m(recp_element_extent.y)) };
+    s.recp_area = real(u::to_inv_m2(f_t(1) / plane->area()));
     s.importance = real(u::to_num(plane->importance()));
 
     // film
@@ -287,6 +313,12 @@ void renderer_t::render(std::uint64_t first, std::uint64_t count) {
     }
     if (status & kernel::status_stack_overflow)
         throw gpu_error_t("GPU BVH traversal overflowed its stack");
+    if ((status & kernel::status_iteration_limit) && !warned_iteration_limit) {
+        warned_iteration_limit = true;
+        logger::cwarn()
+            << "(gpu) some paths took more than " << kernel::max_path_iterations
+            << " steps and were stopped" << '\n';
+    }
 }
 
 void renderer_t::write_film(sensor::film_storage_handle_t& film) const {

@@ -88,12 +88,19 @@ __global__ void intersect_balls_kernel(k::bvh_view bvh, const k::ball* queries, 
  * Forward plt_path
  */
 
-/** @brief Ray queries for the path tracer: the CUDA BVH traversal. */
+/** @brief Geometry queries for the path tracer: the CUDA BVH traversals. */
 struct cuda_bvh_geometry_t {
     k::bvh_view bvh;
 
     __device__ k::ray_hit intersect(const k::ray& r, k::range rng) const {
         return k::intersect_ray(bvh, r, rng);
+    }
+    __device__ bool occluded(const k::ray& r, k::range rng, k::u32& status) const {
+        return k::ray_occluded(bvh, r, rng, status);
+    }
+    __device__ k::cone_hit intersect_cone(const k::cone& c, k::range rng, k::real z_scale,
+                                          k::tri_sink& sink) const {
+        return k::intersect_cone(bvh, c, rng, z_scale, sink);
     }
 };
 
@@ -106,17 +113,49 @@ struct cuda_film_t {
     }
 };
 
-__global__ void plt_path_forward_kernel(k::plt_scene scene, std::uint64_t first, std::uint64_t count,
-                                        std::uint32_t seed, double* film, std::uint32_t* status) {
+/** @brief A path to (re-)trace, skipping the splats an earlier attempt made. */
+struct path_entry_t {
+    std::uint64_t path;
+    std::uint32_t skip;
+};
+
+struct scratch_view_t {
+    k::u32* tris;
+    k::u32* edges;
+    k::aperture_entry* aperture;
+    k::u32 tri_capacity, edge_capacity;
+};
+
+/**
+ * @brief Traces paths `first+i`, or `list[i]` if `list` is given. Paths that
+ *        outgrow their scratch memory are appended to `overflow`.
+ *        Three resident blocks per SM cap registers at 168 per thread (from
+ *        about 250): more warps hide more memory latency (18% faster on a GB10).
+ */
+__global__ void __launch_bounds__(block_size, 3) plt_path_forward_kernel(k::plt_scene scene,
+                                        std::uint64_t first, std::uint64_t count, const path_entry_t* list,
+                                        std::uint32_t seed, double* film, scratch_view_t scratch,
+                                        path_entry_t* overflow, std::uint32_t* overflow_count,
+                                        std::uint32_t* status) {
     const std::uint64_t i = std::uint64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     if (i>=count) return;
 
-    const std::uint64_t path = first+i;
+    const std::uint64_t path = list ? list[i].path : first+i;
     k::rng rnd = k::rng::for_path(seed, k::u32(path), k::u32(path>>32));
     const cuda_bvh_geometry_t geometry = { scene.bvh };
-    cuda_film_t sink = { film };
+    k::path_film<cuda_film_t> pf = { { film }, list ? list[i].skip : 0, 0 };
+    const k::path_scratch ps = {
+        scratch.tris + i*scratch.tri_capacity,
+        scratch.edges + i*scratch.edge_capacity,
+        scratch.aperture + i*scratch.edge_capacity,
+        scratch.tri_capacity, scratch.edge_capacity,
+    };
 
-    const k::u32 s = k::trace_forward_path(scene, geometry, sink, rnd);
+    k::u32 s = k::trace_forward_path(scene, geometry, pf, ps, rnd);
+    if (s & k::status_scratch_overflow) {
+        overflow[atomicAdd(overflow_count, 1u)] = { path, pf.splats };
+        s &= ~k::status_scratch_overflow;
+    }
     if (s!=k::status_ok)
         atomicOr(status, s);
 }
@@ -128,6 +167,7 @@ public:
     {
         set_device(ordinal);
         tris.upload(scene.tris.data(), scene.tris.size());
+        edges.upload(scene.edges.data(), scene.edges.size());
         materials.upload(scene.materials.data(), scene.materials.size());
         emitters.upload(scene.emitters.data(), scene.emitters.size());
         emitter_cdf.upload(scene.emitter_cdf.data(), scene.emitter_cdf.size());
@@ -136,9 +176,11 @@ public:
         film.resize(film_size);
         check(cudaMemset(film.get(), 0, film_size*sizeof(double)), "clearing the film");
         status_word.resize(1);
+        overflow_count.resize(1);
 
         params.bvh = bvh;
         params.tris = tris.get();
+        params.edges = edges.get();
         params.materials = materials.get();
         params.emitters = emitters.get();
         params.emitter_cdf = emitter_cdf.get();
@@ -152,12 +194,32 @@ public:
         set_device(ordinal);
         std::uint32_t status = k::status_ok;
         status_word.upload(&status, 1);
+
+        // paths that outgrew their scratch memory are re-traced with more room
+        std::vector<path_entry_t> pending, overflowed;
+        k::u32 tri_capacity = initial_capacity, edge_capacity = initial_capacity;
         for (std::uint64_t start=0; start<count; start+=launch_size) {
             const auto n = std::min<std::uint64_t>(launch_size, count-start);
-            plt_path_forward_kernel<<<grid_size(n), block_size>>>(params, first+start, n, seed,
-                                                                  film.get(), status_word.get());
-            check(cudaGetLastError(), "launching the path tracing kernel");
+            launch(first+start, n, nullptr, seed, tri_capacity, edge_capacity, pending);
         }
+        while (!pending.empty()) {
+            if (tri_capacity>=max_capacity)
+                throw std::runtime_error("a path found more than " + std::to_string(max_capacity) +
+                                         " triangles or edges in one query");
+            tri_capacity *= 4;
+            edge_capacity *= 4;
+
+            // as many paths per launch as fit the scratch memory the first launches used
+            const std::size_t batch = std::max<std::size_t>(1, launch_size*initial_capacity/tri_capacity);
+            overflowed.clear();
+            for (std::size_t start=0; start<pending.size(); start+=batch) {
+                const auto n = std::min(batch, pending.size()-start);
+                path_list.upload(pending.data()+start, n);
+                launch(0, n, path_list.get(), seed, tri_capacity, edge_capacity, overflowed);
+            }
+            std::swap(pending, overflowed);
+        }
+
         status_word.download(&status, 1);
         return status;
     }
@@ -169,18 +231,55 @@ public:
 
 private:
     /** @brief Paths per kernel launch. */
-    static constexpr std::uint64_t launch_size = std::uint64_t(1)<<20;
+    static constexpr std::uint64_t launch_size = std::uint64_t(1)<<18;
+    /** @brief Triangles and edges a path holds at first; paths needing more are re-traced. */
+    static constexpr k::u32 initial_capacity = 64;
+    static constexpr k::u32 max_capacity = 1u<<20;
+
+    /** @brief Launches the kernel for `count` paths, appending those that overflowed to `overflowed`. */
+    void launch(std::uint64_t first, std::uint64_t count, const path_entry_t* list, std::uint32_t seed,
+                k::u32 tri_capacity, k::u32 edge_capacity, std::vector<path_entry_t>& overflowed) {
+        scratch_tris.resize(count*tri_capacity);
+        scratch_edges.resize(count*edge_capacity);
+        scratch_aperture.resize(count*edge_capacity);
+        overflow.resize(count);
+        const std::uint32_t zero = 0;
+        overflow_count.upload(&zero, 1);
+
+        const scratch_view_t scratch = {
+            scratch_tris.get(), scratch_edges.get(), scratch_aperture.get(),
+            tri_capacity, edge_capacity,
+        };
+        plt_path_forward_kernel<<<grid_size(count), block_size>>>(
+                params, first, count, list, seed, film.get(), scratch,
+                overflow.get(), overflow_count.get(), status_word.get());
+        check(cudaGetLastError(), "launching the path tracing kernel");
+
+        std::uint32_t n;
+        overflow_count.download(&n, 1);
+        const auto offset = overflowed.size();
+        overflowed.resize(offset+n);
+        overflow.download(overflowed.data()+offset, n);
+    }
 
     int ordinal;
     k::plt_scene params;
 
     device_buffer_t<k::tri_shading>   tris;
+    device_buffer_t<k::edge>          edges;
     device_buffer_t<k::material>      materials;
     device_buffer_t<k::point_emitter> emitters;
     device_buffer_t<k::real>          emitter_cdf;
     device_buffer_t<double>           film;
     std::size_t film_size = 0;
     device_buffer_t<std::uint32_t>    status_word;
+
+    device_buffer_t<k::u32>            scratch_tris;
+    device_buffer_t<k::u32>            scratch_edges;
+    device_buffer_t<k::aperture_entry> scratch_aperture;
+    device_buffer_t<path_entry_t>      overflow;
+    device_buffer_t<std::uint32_t>     overflow_count;
+    device_buffer_t<path_entry_t>      path_list;
 };
 
 

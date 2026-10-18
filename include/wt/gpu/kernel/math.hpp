@@ -38,6 +38,18 @@ WT_GPU_FN float  k_cos(float x)  { return cosf(x); }
 WT_GPU_FN double k_cos(double x) { return cos(x); }
 WT_GPU_FN float  k_erf(float x)  { return erff(x); }
 WT_GPU_FN double k_erf(double x) { return erf(x); }
+WT_GPU_FN float  k_tan(float x)  { return tanf(x); }
+WT_GPU_FN double k_tan(double x) { return tan(x); }
+WT_GPU_FN float  k_atan2(float y, float x)  { return atan2f(y,x); }
+WT_GPU_FN double k_atan2(double y, double x) { return atan2(y,x); }
+WT_GPU_FN float  k_exp(float x)  { return expf(x); }
+WT_GPU_FN double k_exp(double x) { return exp(x); }
+WT_GPU_FN float  k_log(float x)  { return logf(x); }
+WT_GPU_FN double k_log(double x) { return log(x); }
+WT_GPU_FN float  k_floor(float x)  { return floorf(x); }
+WT_GPU_FN double k_floor(double x) { return floor(x); }
+WT_GPU_FN float  k_round(float x)  { return roundf(x); }
+WT_GPU_FN double k_round(double x) { return round(x); }
 
 WT_GPU_FN real inf() {
 #if defined(__METAL_VERSION__)
@@ -56,10 +68,25 @@ WT_GPU_FN real sqr(real x) { return x*x; }
 WT_GPU_FN real sin(real x) { return k_sin(x); }
 WT_GPU_FN real cos(real x) { return k_cos(x); }
 WT_GPU_FN real erf(real x) { return k_erf(x); }
+WT_GPU_FN real tan(real x) { return k_tan(x); }
+WT_GPU_FN real atan2(real y, real x) { return k_atan2(y,x); }
+WT_GPU_FN real exp(real x) { return k_exp(x); }
+WT_GPU_FN real log(real x) { return k_log(x); }
+WT_GPU_FN real floor(real x) { return k_floor(x); }
+/** @brief Rounds half away from zero (glm::round, std::round). */
+WT_GPU_FN real round(real x) { return k_round(x); }
+/** @brief glm::mod: x - y*floor(x/y). */
+WT_GPU_FN real mod(real x, real y) { return x - y*floor(x/y); }
 
 constexpr real pi = real(3.14159265358979323846);
 constexpr real two_pi = real(6.28318530717958647692);
+constexpr real pi_2 = real(1.57079632679489661923);
+constexpr real pi_4 = real(0.78539816339744830962);
+constexpr real inv_pi = real(0.31830988618379067154);
+constexpr real inv_two_pi = real(0.15915494309189533577);
 constexpr real inv_sqrt_two = real(0.70710678118654752440);
+constexpr real inv_sqrt_two_pi = real(0.39894228040143267794);
+constexpr real sqrt_pi_2 = real(1.25331413731550025121);
 
 WT_GPU_FN bool isnan(real x) { return x!=x; }
 WT_GPU_FN bool isfinite(real x) { return abs(x)<inf(); }

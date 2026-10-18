@@ -16,8 +16,8 @@
  * GPU rendering implements a subset of wave_tracer; scenes outside it fail
  * with a `gpu_error_t` that names the unsupported feature, rather than
  * silently rendering on the CPU. Supported so far:
- *   - the plt_path integrator, forward transport, in ray-tracing mode
- *     (`sensor_t::ray_trace_only()`, e.g. `--ray-tracing`);
+ *   - the plt_path integrator, forward transport (beams, free-space
+ *     diffraction, or ray tracing);
  *   - virtual_plane (coverage) sensors sensitive to a single wavelength;
  *   - point emitters;
  *   - surface_spm BSDFs with a Dirac surface profile (specular), optionally
@@ -84,6 +84,7 @@ private:
 
     std::uint64_t paths_per_spe;
     std::size_t film_values;
+    bool warned_iteration_limit = false;
 };
 
 }

@@ -23,11 +23,27 @@
 
 namespace wt::gpu::kernel {
 
+constexpr u32 no_triangle = 0xffffffffu;
+constexpr u32 no_edge = 0xffffffffu;
+
 /** @brief Shading data of a BVH triangle (`bvh_view::tris` order). */
 struct tri_shading {
     vec3 n[3];      // decoded vertex normals (`mesh::triangle_t::n`)
     vec3 dpdu;      // `mesh::triangle_t::tangent_frame.dpdu`
     u32 material;
+    u32 edges[3];   // `ads::tri_t::edge_ab, edge_bc, edge_ca`, or no_edge
+};
+
+/**
+ * @brief A geometric edge (`ads::edge_t`): of one triangle, or shared by two.
+ *        Face normals point out of the wedge.
+ */
+struct edge {
+    vec3 a, b;
+    vec3 n1, t1;    // face normal, and tangent pointing into the face, of triangle 1
+    vec3 n2, t2;    // ... of triangle 2
+    real alpha;     // wedge opening angle (radians)
+    u32 tri1, tri2; // BVH triangles; tri2 is no_triangle for an edge of one triangle
 };
 
 /** @brief No BSDF at the rendered wavenumber: paths end here (`composite_t` without a matching bin). */
@@ -63,7 +79,10 @@ struct virtual_plane_sensor {
     vec3 origin;                // corner of element (0,0)
     frame f;                    // t,b span the plane; n is its front
     vec3 quad[4];               // the corners `Si` intersects: a, b, c, d
+    vec2 extent;
+    vec2 element_extent;
     vec2 recp_element_extent;
+    real recp_area;
     real importance;            // `virtual_plane_sensor_t::importance()`
 };
 
@@ -92,6 +111,7 @@ struct plt_path_params {
 struct plt_scene {
     bvh_view bvh;
     const WT_GPU_GLOBAL tri_shading* tris;
+    const WT_GPU_GLOBAL edge* edges;
     const WT_GPU_GLOBAL material* materials;
 
     const WT_GPU_GLOBAL point_emitter* emitters;

@@ -212,6 +212,58 @@ WT_GPU_FN cone cone_through_ellipse(vec3 x, vec3 y, vec3 n, ray r, real tan_alph
     return c;
 }
 
+/**
+ * @brief `elliptic_cone_t::cone_through_ellipsoid`: the cone around `r` with
+ *        opening `tan_alpha` through the ellipsoid with axes lengths `axes`
+ *        along the axes of `axes_frame`, centred at `r.o`.
+ */
+WT_GPU_FN cone cone_through_ellipsoid(vec3 axes, frame axes_frame, ray r, real tan_alpha) {
+    const vec3 wolocal = axes_frame.to_local(r.d);
+    const frame f = build_orthogonal_frame(wolocal);
+
+    // convert footprint ellipsoid into a (unit) sphere and intersect there
+    const vec3 nn = normalize(axes * wolocal);
+    const frame fc = build_orthogonal_frame(nn);  // sphere's frame
+
+    // ... then transform back to ellipsoid. (The CPU's frame_t::to_local(pqvec2_t)
+    // projects with the x,y components of the vectors only.)
+    const vec3 t1 = axes * fc.t;
+    const vec3 t2 = axes * fc.b;
+    const auto to_local2 = [&](vec3 v) {
+        return vec2{ dot(vec2{ v.x,v.y }, vec2{ f.t.x,f.t.y }), dot(vec2{ v.x,v.y }, vec2{ f.b.x,f.b.y }) };
+    };
+    const vec2 A0 = to_local2(t1), A1 = to_local2(t2);   // columns of mat2_t A
+
+    // 0 determinant?
+    if (A0.x*A1.y==A1.x*A0.y) {
+        // degenerate ray case
+        return make_cone(r, build_orthogonal_frame(r.d).t, 0, tan_alpha, 1, 1);
+    }
+
+    // ... and SVD in-order to reconstruct intersection ellipse
+    const svd2_t svd = svd2(A0.x, A1.x, A0.y, A1.y);
+    vec2 X = { svd.Ucos, -svd.Usin };
+    real lX = abs(svd.sigma1);
+    real lY = abs(svd.sigma2);
+    if (lX<lY) {
+        swap(lX,lY);
+        X = { svd.Usin, svd.Ucos };
+    }
+
+    // eccentricity and cone origin distance from centre
+    const real e = lY>real(0) ? sqrt(lX/lY) : real(1);
+
+    const vec3 X3 = normalize(f.t*X.x + f.b*X.y);
+    return make_cone(r, axes_frame.to_world(X3), lX, tan_alpha, 1/e, e);
+}
+
+/** @brief `elliptic_cone_t::contains` (scalar), within distances [0,∞). */
+WT_GPU_FN bool cone_contains(const WT_GPU_THREAD cone& c, vec3 p) {
+    const vec3 l = c.frame().to_local(p - c.r.o);
+    return range::positive().contains(l.z) && c.z_apex<=l.z &&
+           sqr(l.x) + sqr(c.e*l.y) <= sqr(l.z*c.tan_alpha + c.x0);
+}
+
 
 /*
  * Surfaces
@@ -301,6 +353,12 @@ struct beam {
 
     WT_GPU_FN vec3 dir() const { return envelope.r.d; }
     WT_GPU_FN vec3 origin() const { return envelope.r.o; }
+    WT_GPU_FN bool is_ray() const { return envelope.is_ray(); }
+
+    /** @brief `beam_t::operator+=`: adds another beam's Stokes parameters, reoriented. */
+    WT_GPU_FN void add(const WT_GPU_THREAD beam& o) {
+        S = S + reorient(o.S, o.Sframe, Sframe);
+    }
 
     /** @brief `beam_generic_t::footprint` (beam local frame) */
     WT_GPU_FN vec3 footprint3(real dist) const {
@@ -336,6 +394,27 @@ struct beam {
         S = reorient((M*weight) * reorient(S, Sframe, SPin), SPout, new_frame);
         Sframe = new_frame;
         self_intersection_distance = sid;
+    }
+
+    /**
+     * @brief `beam_t::transform_region_interaction`: interact in the region
+     *        around `wp` (diffraction), `dist` from the beam origin, and
+     *        scatter into `wo`. (Unpolarized: the CPU only scales.)
+     */
+    WT_GPU_FN void transform_region_interaction(vec3 wp, real dist, vec3 wo, real weight) {
+        envelope = cone_through_ellipsoid(footprint3(dist), envelope.frame(), make_ray(wp, wo), envelope.tan_alpha);
+        S = S*weight;
+        Sframe = envelope.frame();
+        // no surface, no clip
+        self_intersection_distance = 0;
+    }
+
+    /** @brief `beam_t::transform_restart`: restart propagation from `wp`, `dist` from the beam origin (null interaction). */
+    WT_GPU_FN void transform_restart(vec3 wp, real dist) {
+        envelope.r.o = wp;
+        set_x0(envelope, envelope.x0 + dist*envelope.tan_alpha);
+        // no surface, no clip
+        self_intersection_distance = 0;
     }
 };
 
