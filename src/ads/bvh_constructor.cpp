@@ -11,6 +11,8 @@
 #include <wt/ads/bvh_constructor.hpp>
 #include <wt/ads/traversal_common.hpp>
 
+#include <atomic>
+
 
 // SAH parameters for costs of traversal / insertion
 // For cone tracing, build very deep trees: subtrees contained in a cone get traversed as a leaf.
@@ -166,12 +168,13 @@ bvh_constructor_t::bvh_constructor_t(
 
         {
             pt.set_status("tiny_bvh build()");
-            f_t prog = 0;
-            tinybvh::progress_tracker = [&](f_t p) {
-                if (p>prog+f_t(.02)) {
+            // Threaded builds report from several threads: only the thread that
+            // advances the last reported value by 2% forwards it.
+            std::atomic<f_t> reported = 0;
+            tbvh.progressCallback = [&](f_t p) {
+                f_t last = reported.load();
+                if (p>last+f_t(.02) && reported.compare_exchange_strong(last, p))
                     pt.set_progress(p * build_pb);
-                    prog = p;
-                }
             };
 
 #ifdef TBVH_USE_SINGLES
@@ -208,13 +211,13 @@ bvh_constructor_t::bvh_constructor_t(
 
             pt.set_progress(build_pb);
             pt.set_status("tiny_bvh optimize()");
-            tinybvh::progress_tracker = [&](f_t p) {
-                pt.set_progress(p * (optimize_pb-build_pb) + build_pb);
-            };
 
 #ifdef TBVH_USE_SINGLES
             {
                 tinybvh::BVH_Verbose tmp;
+                tmp.progressCallback = [&](f_t p) {
+                    pt.set_progress(p * (optimize_pb-build_pb) + build_pb);
+                };
                 tmp.ConvertFrom(tbvh);
                 tmp.Optimize(tbvh_optimize_iterations);
                 tbvh.ConvertFrom(tmp);
