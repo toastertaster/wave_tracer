@@ -168,6 +168,7 @@ set(SRC
     src/util/statistics_collector/stat_histogram.cpp
 
     src/gpu/gpu.cpp
+    src/gpu/renderer.cpp
 )
 
 

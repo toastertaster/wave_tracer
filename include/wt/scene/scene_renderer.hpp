@@ -106,6 +106,8 @@ public:
 private:
     // multiplicative factor of desired parallelism for enqueueing parallel jobs
     static constexpr f_t parallel_jobs_factor = 1.5;
+    // GPU rendering: paths traced per pass (passes trace whole samples of all sensor elements)
+    static constexpr std::size_t gpu_paths_per_pass = std::size_t(1)<<22;
 
     std::future<scene::render_result_t> future;
 
@@ -155,6 +157,10 @@ private:
             const scene_t* scene,
             const wt_context_t& ctx, const ads::ads_t& ads,
             const scene::render_opts_t render_opts);
+    scene::render_result_t render_gpu(
+            const scene_t* scene,
+            const wt_context_t& ctx, const ads::ads_t& ads,
+            const scene::render_opts_t& render_opts);
 
 public:
     /**

@@ -55,6 +55,16 @@ public:
     composite_t(composite_t&&) = default;
 
     /**
+     * @brief The BSDF of the spectral range containing wavenumber ``k``, or nullptr if no range does.
+     */
+    [[nodiscard]] inline const bsdf_t* bsdf_for(wavenumber_t k) const noexcept {
+        const auto it = bsdfs.lower_bound(map_range_t::range(k));
+        if (it!=bsdfs.end() && it->first.contains(k))
+            return it->second.get();
+        return nullptr;
+    }
+
+    /**
      * @brief Spectral albedo. Returns std::nullopt when albedo cannot be computed.
      * @param k wavenumber
      */

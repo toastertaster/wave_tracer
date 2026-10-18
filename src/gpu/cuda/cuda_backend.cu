@@ -16,10 +16,12 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
 #include <wt/gpu/backend.hpp>
+#include <wt/gpu/kernel/plt_path.hpp>
 #include "cuda_util.hpp"
 
 #if defined(WT_GPU_OPTIX) && !defined(WT_GPU_DBL_PRECISION)
@@ -82,6 +84,106 @@ __global__ void intersect_balls_kernel(k::bvh_view bvh, const k::ball* queries, 
 }
 
 
+/*
+ * Forward plt_path
+ */
+
+/** @brief Ray queries for the path tracer: the CUDA BVH traversal. */
+struct cuda_bvh_geometry_t {
+    k::bvh_view bvh;
+
+    __device__ k::ray_hit intersect(const k::ray& r, k::range rng) const {
+        return k::intersect_ray(bvh, r, rng);
+    }
+};
+
+/** @brief The film, accumulated in double precision. */
+struct cuda_film_t {
+    double* data;
+
+    __device__ void add(k::u32 i, k::real v) {
+        atomicAdd(data+i, double(v));
+    }
+};
+
+__global__ void plt_path_forward_kernel(k::plt_scene scene, std::uint64_t first, std::uint64_t count,
+                                        std::uint32_t seed, double* film, std::uint32_t* status) {
+    const std::uint64_t i = std::uint64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i>=count) return;
+
+    const std::uint64_t path = first+i;
+    k::rng rnd = k::rng::for_path(seed, k::u32(path), k::u32(path>>32));
+    const cuda_bvh_geometry_t geometry = { scene.bvh };
+    cuda_film_t sink = { film };
+
+    const k::u32 s = k::trace_forward_path(scene, geometry, sink, rnd);
+    if (s!=k::status_ok)
+        atomicOr(status, s);
+}
+
+class cuda_plt_path_renderer_t final : public backend_renderer_t {
+public:
+    cuda_plt_path_renderer_t(int ordinal, k::bvh_view bvh, const plt_path_scene_t& scene)
+        : ordinal(ordinal)
+    {
+        set_device(ordinal);
+        tris.upload(scene.tris.data(), scene.tris.size());
+        materials.upload(scene.materials.data(), scene.materials.size());
+        emitters.upload(scene.emitters.data(), scene.emitters.size());
+        emitter_cdf.upload(scene.emitter_cdf.data(), scene.emitter_cdf.size());
+
+        film_size = std::size_t(scene.film.width) * scene.film.height * scene.film.components;
+        film.resize(film_size);
+        check(cudaMemset(film.get(), 0, film_size*sizeof(double)), "clearing the film");
+        status_word.resize(1);
+
+        params.bvh = bvh;
+        params.tris = tris.get();
+        params.materials = materials.get();
+        params.emitters = emitters.get();
+        params.emitter_cdf = emitter_cdf.get();
+        params.emitter_count = k::u32(scene.emitters.size());
+        params.sensor = scene.sensor;
+        params.film = scene.film;
+        params.params = scene.params;
+    }
+
+    std::uint32_t trace(std::uint64_t first, std::uint64_t count, std::uint32_t seed) override {
+        set_device(ordinal);
+        std::uint32_t status = k::status_ok;
+        status_word.upload(&status, 1);
+        for (std::uint64_t start=0; start<count; start+=launch_size) {
+            const auto n = std::min<std::uint64_t>(launch_size, count-start);
+            plt_path_forward_kernel<<<grid_size(n), block_size>>>(params, first+start, n, seed,
+                                                                  film.get(), status_word.get());
+            check(cudaGetLastError(), "launching the path tracing kernel");
+        }
+        status_word.download(&status, 1);
+        return status;
+    }
+
+    void read_film(double* out) override {
+        set_device(ordinal);
+        film.download(out, film_size);
+    }
+
+private:
+    /** @brief Paths per kernel launch. */
+    static constexpr std::uint64_t launch_size = std::uint64_t(1)<<20;
+
+    int ordinal;
+    k::plt_scene params;
+
+    device_buffer_t<k::tri_shading>   tris;
+    device_buffer_t<k::material>      materials;
+    device_buffer_t<k::point_emitter> emitters;
+    device_buffer_t<k::real>          emitter_cdf;
+    device_buffer_t<double>           film;
+    std::size_t film_size = 0;
+    device_buffer_t<std::uint32_t>    status_word;
+};
+
+
 class cuda_geometry_t final : public backend_geometry_t {
 public:
     cuda_geometry_t(int ordinal, const bvh_arrays_t& bvh
@@ -95,6 +197,7 @@ public:
         nodes.upload(bvh.nodes.data(), bvh.nodes.size());
         leaves.upload(bvh.leaves.data(), bvh.leaves.size());
         tris.upload(bvh.tris.data(), bvh.tris.size());
+        tri_count = bvh.tris.size();
 #if defined(WT_GPU_USE_OPTIX)
         if (optix && !bvh.tris.empty())
             optix_rays = std::make_unique<optix::ray_geometry_t>(*optix, bvh, tris.get());
@@ -168,6 +271,13 @@ public:
         tri_lists.download(out_tris, count*capacity);
     }
 
+    [[nodiscard]] std::unique_ptr<backend_renderer_t> create_plt_path_renderer(
+            const plt_path_scene_t& scene) override {
+        if (scene.tris.size()!=tri_count)
+            throw std::runtime_error("the compiled scene does not match the uploaded geometry");
+        return std::make_unique<cuda_plt_path_renderer_t>(ordinal, view(), scene);
+    }
+
 private:
     [[nodiscard]] k::bvh_view view() const noexcept {
         return { nodes.get(), leaves.get(), tris.get() };
@@ -178,6 +288,7 @@ private:
     device_buffer_t<k::bvh_node> nodes;
     device_buffer_t<k::bvh_leaf> leaves;
     device_buffer_t<k::bvh_tri>  tris;
+    std::size_t tri_count = 0;
 
     // per-call buffers, reused across calls
     device_buffer_t<ray_query_t>   ray_queries;

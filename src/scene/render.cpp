@@ -7,7 +7,9 @@
 *
 */
 
+#include <algorithm>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <future>
@@ -18,7 +20,7 @@
 
 #include <wt/scene/scene_renderer.hpp>
 #include <wt/scene/scene.hpp>
-#include <wt/gpu/gpu.hpp>
+#include <wt/gpu/renderer.hpp>
 #include <wt/util/thread_pool/tpool.hpp>
 
 #include <wt/util/logger/logger.hpp>
@@ -85,6 +87,62 @@ void print_sensor_summary(const sensor::sensor_t* sensor, const sensor::film_sto
     cout
         << reset
         << '\n' << '\n';
+}
+
+
+/**
+ * @brief Develops a sensor's film after `spe_completed` samples per element.
+ * @param fractional_spe for partial results, the (average) samples per element written
+ */
+std::pair<std::string, sensor_render_result_t> develop_sensor(
+        const sensor::sensor_t* sensor,
+        const sensor::film_storage_handle_t* film_storage,
+        const std::size_t spe_completed,
+        const std::optional<f_t> fractional_spe,
+        const duration_t& render_elapsed_time) {
+    sensor_render_result_t::developed_films_t developed_films;
+    const auto tonemapped_film_colour_encoding = film_storage->get_colour_encoding_of_developed_tonemapped_film();
+
+    if (film_storage->is_polarimetric()) {
+        // develop polarimetric films - 4 component Stokes parameters per channel as pixel type
+        developed_films = developed_polarimetric_film_pair_t{
+            .developed_tonemapped = film_storage->get_tonemap() ?
+                std::make_unique<sensor::developed_polarimetric_film_t<2>>(
+                    film_storage->develop_stokes_d2(spe_completed)) :
+                nullptr,
+            .tonemapped_film_colour_encoding = tonemapped_film_colour_encoding,
+            .developed = std::make_unique<sensor::developed_polarimetric_film_t<2>>(
+                    film_storage->develop_lin_stokes_d2(spe_completed)),
+        };
+    } else {
+        // develop scalar films - single fp per channel as pixel type
+        developed_films = developed_scalar_film_pair_t{
+            .developed_tonemapped = film_storage->get_tonemap() ?
+                std::make_unique<sensor::developed_scalar_film_t<2>>(
+                    film_storage->develop_d2(spe_completed)) :
+                nullptr,
+            .tonemapped_film_colour_encoding = tonemapped_film_colour_encoding,
+            .developed = 
+                std::make_unique<sensor::developed_scalar_film_t<2>>(
+                    film_storage->develop_lin_d2(spe_completed)),
+        };
+    }
+
+    logger::cout(verbosity_e::info)
+        << "(scene_renderer) developed film for <" << sensor->get_id() << ">: "
+        << (film_storage->is_polarimetric() ? "polarimetric (Stokes) " : "")
+        << film_storage->film_size().x << "×" << film_storage->film_size().y << " @ " << spe_completed << "spp" << '\n';
+
+    return std::make_pair(
+        sensor->get_id(), 
+        sensor_render_result_t{
+            .sensor = sensor,
+            .render_elapsed_time = render_elapsed_time,
+            .developed_films = std::move(developed_films),
+            .spe_written = spe_completed,
+            .fractional_spe = fractional_spe,
+        }
+    );
 }
 
 
@@ -244,51 +302,9 @@ struct render_context_t {
     }
 
     [[nodiscard]] auto develop(const duration_t& render_elapsed_time) const {
-        const auto spe_completed = this->spp_complete();
-
-        sensor_render_result_t::developed_films_t developed_films;
-        const auto tonemapped_film_colour_encoding = film_storage->get_colour_encoding_of_developed_tonemapped_film();
-
-        if (film_storage->is_polarimetric()) {
-            // develop polarimetric films - 4 component Stokes parameters per channel as pixel type
-            developed_films = developed_polarimetric_film_pair_t{
-                .developed_tonemapped = film_storage->get_tonemap() ?
-                    std::make_unique<sensor::developed_polarimetric_film_t<2>>(
-                        film_storage->develop_stokes_d2(spe_completed)) :
-                    nullptr,
-                .tonemapped_film_colour_encoding = tonemapped_film_colour_encoding,
-                .developed = std::make_unique<sensor::developed_polarimetric_film_t<2>>(
-                        film_storage->develop_lin_stokes_d2(spe_completed)),
-            };
-        } else {
-            // develop scalar films - single fp per channel as pixel type
-            developed_films = developed_scalar_film_pair_t{
-                .developed_tonemapped = film_storage->get_tonemap() ?
-                    std::make_unique<sensor::developed_scalar_film_t<2>>(
-                        film_storage->develop_d2(spe_completed)) :
-                    nullptr,
-                .tonemapped_film_colour_encoding = tonemapped_film_colour_encoding,
-                .developed = 
-                    std::make_unique<sensor::developed_scalar_film_t<2>>(
-                        film_storage->develop_lin_d2(spe_completed)),
-            };
-        }
-
-        logger::cout(verbosity_e::info)
-            << "(scene_renderer) developed film for <" << sensor->get_id() << ">: "
-            << (film_storage->is_polarimetric() ? "polarimetric (Stokes) " : "")
-            << film_storage->film_size().x << "×" << film_storage->film_size().y << " @ " << spe_completed << "spp" << '\n';
-
-        return std::make_pair(
-            sensor->get_id(), 
-            sensor_render_result_t{
-                .sensor = sensor,
-                .render_elapsed_time = render_elapsed_time,
-                .developed_films = std::move(developed_films),
-                .spe_written = spe_completed,
-                .fractional_spe = is_complete() ? std::nullopt : std::optional<f_t>{ fractional_spp_complete() },
-            }
-        );
+        return develop_sensor(sensor, film_storage.get(), this->spp_complete(),
+                              is_complete() ? std::nullopt : std::optional<f_t>{ fractional_spp_complete() },
+                              render_elapsed_time);
     }
 
 private:
@@ -385,11 +401,8 @@ scene::render_result_t scene_renderer_t::render(
         const scene::render_opts_t opts) {
     using clock = std::chrono::steady_clock;
 
-    // Rendering on a GPU fails rather than silently rendering on the CPU.
     if (ctx.gpu_device)
-        throw gpu::gpu_error_t(std::format(
-            "GPU rendering is not implemented yet for the '{}' integrator; render without the GPU device",
-            scene->integrator().description().type));
+        return render_gpu(scene, ctx, ads, opts);
 
     // grab a copy of sensors to render
     const auto& sensors = scene->sensors();
@@ -578,6 +591,195 @@ scene::render_result_t scene_renderer_t::render(
 
         ret.sensors.emplace(rctx.develop(ret.render_elapsed_time));
         assert(ret.sensors[id].spe_written == rctx.samples_per_element);
+    }
+
+    wt::logger::cout(verbosity_e::info) << "(scene_renderer) done. Elapsed: " << std::format("{:%H:%M:%S}", ret.render_elapsed_time) << '\n';
+
+    return ret;
+}
+
+
+/*
+ * GPU rendering: passes of whole samples per element run synchronously, one
+ * after another, on `ctx.gpu_device`; interrupts apply between passes. Scenes
+ * the GPU cannot render fail with gpu::gpu_error_t rather than falling back
+ * to the CPU.
+ */
+scene::render_result_t scene_renderer_t::render_gpu(
+        const scene_t* scene,
+        const wt_context_t& ctx, const ads::ads_t& ads,
+        const scene::render_opts_t& opts) {
+    using clock = std::chrono::steady_clock;
+
+    struct gpu_sensor_render_t {
+        const sensor::sensor_t* sensor;
+        std::unique_ptr<sensor::film_storage_handle_t> film_storage;
+        std::unique_ptr<gpu::renderer_t> renderer;
+
+        std::size_t samples_per_element;
+        std::size_t samples_per_pass;
+        std::size_t samples_completed = 0;
+
+        [[nodiscard]] bool is_complete() const noexcept { return samples_completed==samples_per_element; }
+        [[nodiscard]] f_t progress() const noexcept { return f_t(samples_completed) / f_t(samples_per_element); }
+
+        void update_film() const { renderer->write_film(*film_storage); }
+        [[nodiscard]] auto develop(const duration_t& render_elapsed_time) const {
+            update_film();
+            return develop_sensor(sensor, film_storage.get(), samples_completed,
+                                  is_complete() ? std::nullopt : std::optional<f_t>{ f_t(samples_completed) },
+                                  render_elapsed_time);
+        }
+    };
+
+    std::vector<gpu_sensor_render_t> renders;
+    std::size_t total_passes = 0;
+    for (const auto& scs : scene->sensors()) {
+        const auto* s = scs.get_sensor();
+        const auto samples_per_element = s->requested_samples_per_element();
+        // ignore 0spp sensors (useful to selectively turn off sensors)
+        if (samples_per_element==0) continue;
+
+        auto film_storage = s->create_sensor_film(ctx, scene->integrator().sensor_write_flags());
+        auto renderer = std::make_unique<gpu::renderer_t>(*ctx.gpu_device, *scene, *s, ads);
+        const auto samples_per_pass = std::clamp<std::size_t>(
+                gpu_paths_per_pass / renderer->paths_per_sample(), 1, samples_per_element);
+
+        print_sensor_summary(s, film_storage.get());
+
+        total_passes += (samples_per_element+samples_per_pass-1) / samples_per_pass;
+        renders.push_back(gpu_sensor_render_t{
+            .sensor = s,
+            .film_storage = std::move(film_storage),
+            .renderer = std::move(renderer),
+            .samples_per_element = samples_per_element,
+            .samples_per_pass = samples_per_pass,
+        });
+    }
+
+    wt::logger::cout(verbosity_e::info)
+        << "(scene_renderer) starting render on " << ctx.gpu_device->description() << "..." << '\n';
+
+    state = {
+        .total_jobs = total_passes,
+        .start_time = clock::now(),
+    };
+    state.last_checkpoint = state.start_time;
+
+    // Do we have a render preview?
+    std::unique_ptr<scene_previewer_t> previewer;
+    if (opts.previewer) {
+        scene_previewer_t::sensors_map_t preview_sensors;
+        for (auto& r : renders)
+            preview_sensors.emplace(r.sensor->get_id(), r.film_storage.get());
+        previewer = std::make_unique<scene_previewer_t>(opts, preview_sensors);
+
+        // initial empty preview
+        for (const auto& r : renders)
+            previewer->preview(r.sensor->get_id(), 0);
+    }
+
+    for (;;) {
+        // process interrupts
+        if (interrupt_flag.test(std::memory_order_acquire)) {
+            std::unique_lock l(*interrupts_queue_mutex);
+            while (!interrupts_queue.empty()) {
+                auto interrupt = std::move(interrupts_queue.front());
+                interrupts_queue.pop();
+
+                if (dynamic_cast<const pause_t*>(interrupt.get())) {
+                    logger::cout(verbosity_e::info) << "(scene_renderer) pause interrupt." << '\n';
+                    if (!state.paused)
+                        state.checkpoint();
+                    state.paused = true;
+                }
+                else if (dynamic_cast<const resume_t*>(interrupt.get())) {
+                    logger::cout(verbosity_e::info) << "(scene_renderer) resume interrupt." << '\n';
+                    if (state.paused)
+                        state.checkpoint(true);
+                    state.paused = false;
+                }
+                else if (dynamic_cast<const terminate_t*>(interrupt.get())) {
+                    logger::cout(verbosity_e::info) << "(scene_renderer) terminate interrupt." << '\n';
+                    state.terminated = true;
+                }
+                else if (const auto capture = dynamic_cast<const capture_intermediate_t*>(interrupt.get()); capture) {
+                    logger::cout(verbosity_e::info) << "(scene_renderer) capture intermediate interrupt." << '\n';
+                    // passes are synchronous: the films are consistent between passes
+                    render_result_t results;
+                    results.render_elapsed_time = state.elapsed_time();
+                    for (const auto& r : renders)
+                        results.sensors.emplace(r.develop(results.render_elapsed_time));
+                    (*capture)(std::move(results));
+                }
+            }
+            interrupt_flag.clear(std::memory_order_relaxed);
+        }
+
+        if (state.terminated)
+            break;
+        if (state.paused) {
+            using namespace std::chrono_literals;
+            std::this_thread::sleep_for(1ms);
+            continue;
+        }
+
+        // render a pass of the next incomplete sensor
+        const auto it = std::ranges::find_if(renders, [](const auto& r) { return !r.is_complete(); });
+        if (it==renders.end()) {
+            state.completed = true;
+            break;
+        }
+        auto& r = *it;
+        const auto samples = std::min(r.samples_per_pass, r.samples_per_element-r.samples_completed);
+
+        state.jobs_enqueued = 1;
+        r.renderer->render(r.samples_completed, samples);
+        r.samples_completed += samples;
+        state.jobs_enqueued = 0;
+        ++state.jobs_completed;
+        state.checkpoint();
+
+        if (opts.progress_callback)
+            opts.progress_callback->progress_update(r.sensor->get_id(), r.progress());
+        if (previewer) {
+            r.update_film();
+            previewer->preview(r.sensor->get_id(), f_t(r.samples_completed));
+        }
+    }
+
+    for (const auto& r : renders) {
+        if (r.is_complete()) continue;
+        const auto& id = r.sensor->get_id();
+        wt::logger::cout(verbosity_e::info) 
+            << "(scene_renderer) sensor <" << id << "> has incomplete rendering." << '\n';
+        if (opts.progress_callback)
+            opts.progress_callback->on_terminate(id);
+    }
+
+    if (state.terminated) {
+        wt::logger::cout(verbosity_e::info) << "(scene_renderer) rendering terminated." << '\n';
+    }
+    if (state.completed) {
+        wt::logger::cout(verbosity_e::info) << "(scene_renderer) rendering completed successfully." << '\n';
+    }
+
+    // write out films for completed renders
+    render_result_t ret;
+    ret.render_elapsed_time = state.elapsed_time();
+
+    for (const auto& r : renders) {
+        if (!r.is_complete()) continue;
+        if (opts.progress_callback)
+            opts.progress_callback->on_complete(r.sensor->get_id(), ret.render_elapsed_time);
+        ret.sensors.emplace(r.develop(ret.render_elapsed_time));
+    }
+
+    // update preview with final render
+    if (previewer) {
+        for (const auto& r : renders)
+            previewer->preview(r.sensor->get_id(), f_t(r.samples_completed));
+        previewer = {};
     }
 
     wt::logger::cout(verbosity_e::info) << "(scene_renderer) done. Elapsed: " << std::format("{:%H:%M:%S}", ret.render_elapsed_time) << '\n';

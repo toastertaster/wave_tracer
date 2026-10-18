@@ -295,6 +295,15 @@ public:
     }
 
     [[nodiscard]] inline auto dimensions() const noexcept { return size; }
+
+    /**
+     * @brief Radius, in film elements, of the Gaussian footprint splatted for beam reconstruction.
+     */
+    [[nodiscard]] inline auto reconstruction_filter_radius() const noexcept { return rf_radius; }
+    /**
+     * @brief Standard deviation, in film elements, of the Gaussian footprint splatted for beam reconstruction.
+     */
+    [[nodiscard]] inline auto reconstruction_filter_stddev() const noexcept { return rfilter.std_dev(); }
     
     [[nodiscard]] inline const auto aspect_ratio() const noexcept requires (Dims==2) {
         return f_t(size.x)/f_t(size.y);

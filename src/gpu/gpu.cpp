@@ -14,44 +14,14 @@
 
 #include <wt/ads/bvh8w/bvh8w.hpp>
 
+#include "to_kernel.hpp"
+
 using namespace wt;
 using namespace wt::gpu;
 
 namespace {
 
 using kernel::real;
-
-/*
- * wave_tracer types -> kernel types (metres)
- */
-
-kernel::vec3 to_kernel(const vec3_t& v) noexcept {
-    return { real(v.x), real(v.y), real(v.z) };
-}
-kernel::vec3 to_kernel(const pqvec3_t& p) noexcept {
-    return to_kernel(vec3_t{ u::to_m(p) });
-}
-kernel::range to_kernel(const pqrange_t<>& r) noexcept {
-    return { real(u::to_m(r.min)), real(u::to_m(r.max)) };
-}
-kernel::ray to_kernel(const ray_t& r) noexcept {
-    return { to_kernel(r.o), to_kernel(vec3_t{ r.d }), to_kernel(r.invd) };
-}
-kernel::cone to_kernel(const elliptic_cone_t& c) noexcept {
-    return {
-        .r = to_kernel(c.ray()),
-        .x = to_kernel(vec3_t{ c.x() }),
-        .y = to_kernel(vec3_t{ c.y() }),
-        .x0 = real(u::to_m(c.x0())),
-        .tan_alpha = real(c.get_tan_alpha()),
-        .e = real(c.get_e()),
-        .one_over_e = real(c.get_one_over_e()),
-        .z_apex = real(u::to_m(c.get_z_apex())),
-    };
-}
-kernel::ball to_kernel(const ball_t& b) noexcept {
-    return { to_kernel(b.centre), real(u::to_m(b.radius)) };
-}
 
 bvh_arrays_t flatten(const ads::bvh8w_t& bvh) {
     bvh_arrays_t arrays;
@@ -80,7 +50,7 @@ bvh_arrays_t flatten(const ads::bvh8w_t& bvh) {
     arrays.tris.resize(bvh.triangles_count());
     for (std::size_t i=0; i<arrays.tris.size(); ++i) {
         const auto& t = bvh.tri(ads::tuid_t{ ads::idx_t(i) });
-        arrays.tris[i] = { to_kernel(t.a), to_kernel(t.b), to_kernel(t.c), to_kernel(vec3_t{ t.n }) };
+        arrays.tris[i] = { to_kernel(t.a), to_kernel(t.b), to_kernel(t.c), to_kernel(t.n) };
     }
 
     return arrays;

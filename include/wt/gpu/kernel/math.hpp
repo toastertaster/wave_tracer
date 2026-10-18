@@ -32,6 +32,12 @@ WT_GPU_FN float  k_fma(float a, float b, float c)    { return fmaf(a,b,c); }
 WT_GPU_FN double k_fma(double a, double b, double c) { return fma(a,b,c); }
 WT_GPU_FN float  k_abs(float x)  { return fabsf(x); }
 WT_GPU_FN double k_abs(double x) { return fabs(x); }
+WT_GPU_FN float  k_sin(float x)  { return sinf(x); }
+WT_GPU_FN double k_sin(double x) { return sin(x); }
+WT_GPU_FN float  k_cos(float x)  { return cosf(x); }
+WT_GPU_FN double k_cos(double x) { return cos(x); }
+WT_GPU_FN float  k_erf(float x)  { return erff(x); }
+WT_GPU_FN double k_erf(double x) { return erf(x); }
 
 WT_GPU_FN real inf() {
 #if defined(__METAL_VERSION__)
@@ -47,6 +53,13 @@ WT_GPU_FN real sqrt(real x) { return k_sqrt(x); }
 WT_GPU_FN real fma(real a, real b, real c) { return k_fma(a,b,c); }
 WT_GPU_FN real abs(real x) { return k_abs(x); }
 WT_GPU_FN real sqr(real x) { return x*x; }
+WT_GPU_FN real sin(real x) { return k_sin(x); }
+WT_GPU_FN real cos(real x) { return k_cos(x); }
+WT_GPU_FN real erf(real x) { return k_erf(x); }
+
+constexpr real pi = real(3.14159265358979323846);
+constexpr real two_pi = real(6.28318530717958647692);
+constexpr real inv_sqrt_two = real(0.70710678118654752440);
 
 WT_GPU_FN bool isnan(real x) { return x!=x; }
 WT_GPU_FN bool isfinite(real x) { return abs(x)<inf(); }
@@ -83,6 +96,8 @@ WT_GPU_FN vec3 operator*(vec3 a, vec3 b) { return { a.x*b.x, a.y*b.y, a.z*b.z };
 WT_GPU_FN vec3 operator*(vec3 a, real s) { return { a.x*s, a.y*s, a.z*s }; }
 WT_GPU_FN vec3 operator*(real s, vec3 a) { return { s*a.x, s*a.y, s*a.z }; }
 WT_GPU_FN vec3 operator/(vec3 a, real s) { return { a.x/s, a.y/s, a.z/s }; }
+WT_GPU_FN vec3 abs(vec3 a) { return { abs(a.x), abs(a.y), abs(a.z) }; }
+WT_GPU_FN real max_element(vec3 a) { return max(a.x, a.y, a.z); }
 
 WT_GPU_FN vec2 operator+(vec2 a, vec2 b) { return { a.x+b.x, a.y+b.y }; }
 WT_GPU_FN vec2 operator-(vec2 a, vec2 b) { return { a.x-b.x, a.y-b.y }; }
@@ -118,6 +133,8 @@ WT_GPU_FN real diff_prod(real a, real b, real c, real d) {
     const real ret = fma(a,b,-cd);
     return ret + fma(-c,d,cd);
 }
+// a*b + c*d
+WT_GPU_FN real sum_prod(real a, real b, real c, real d) { return diff_prod(a,b, -c,d); }
 // Compensated dot product (wt::m::eft::dot).
 WT_GPU_FN real dot(vec3 a, vec3 b) {
     real d = 0, err = 0, err1, err2;
@@ -144,6 +161,11 @@ WT_GPU_FN vec3 cross(vec3 a, vec3 b) {
     };
 }
 WT_GPU_FN real length2(vec3 a) { return dot(a,a); }
+WT_GPU_FN real length2(vec2 a) { return dot(a,a); }
+WT_GPU_FN real length(vec3 a) { return sqrt(length2(a)); }
+// wt::m::normalize: v/length(v)
+WT_GPU_FN vec3 normalize(vec3 a) { return a / length(a); }
+WT_GPU_FN vec2 normalize(vec2 a) { return a / sqrt(length2(a)); }
 
 // glm::sign
 WT_GPU_FN real sign(real x) { return real(real(0)<x) - real(x<real(0)); }

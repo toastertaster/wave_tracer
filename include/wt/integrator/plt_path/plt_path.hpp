@@ -42,6 +42,8 @@ public:
                std::string id, 
                options_t opts) noexcept;
 
+    [[nodiscard]] inline const auto& get_options() const noexcept { return options; }
+
     [[nodiscard]] sensor::sensor_write_flags_e sensor_write_flags() const noexcept override {
         // forward integrators will always use a direct connections to sensor strategy
         return options.transport_direction == bsdf::transport_e::forward ?

@@ -25,6 +25,7 @@
 #include <vector>
 
 #include <wt/gpu/kernel/bvh.hpp>
+#include <wt/gpu/kernel/scene.hpp>
 
 namespace wt::gpu {
 
@@ -54,6 +55,37 @@ struct ball_hit_t {
 };
 
 /**
+ * @brief A scene compiled for forward plt_path rendering of one sensor at one
+ *        wavenumber (see wt/gpu/kernel/scene.hpp). The device pointers of
+ *        `kernel::plt_scene` are filled in by the backend.
+ */
+struct plt_path_scene_t {
+    std::vector<kernel::tri_shading> tris;     // per BVH triangle
+    std::vector<kernel::material> materials;
+    std::vector<kernel::point_emitter> emitters;
+    std::vector<kernel::real> emitter_cdf;
+    kernel::virtual_plane_sensor sensor;
+    kernel::film_desc film;
+    kernel::plt_path_params params;
+};
+
+/** @brief Traces paths of a compiled scene on a device, accumulating a film there. Not thread safe. */
+class backend_renderer_t {
+public:
+    virtual ~backend_renderer_t() noexcept = default;
+
+    /**
+     * @brief Traces paths `first .. first+count-1` and accumulates them into
+     *        the film. A path's index and `seed` determine its random numbers.
+     *        Returns the query status flags of all paths.
+     */
+    virtual std::uint32_t trace(std::uint64_t first, std::uint64_t count, std::uint32_t seed) = 0;
+
+    /** @brief Copies the film to `out`: element (x,y) component c at `out[(y*width + x)*components + c]`. */
+    virtual void read_film(double* out) = 0;
+};
+
+/**
  * @brief Scene geometry on a device. Queries are batched and synchronous;
  *        results are in query order. Not thread safe.
  */
@@ -78,6 +110,10 @@ public:
     virtual void intersect_balls(const kernel::ball* queries, std::size_t count,
                                  std::uint32_t capacity,
                                  ball_hit_t* hits, std::uint32_t* tris) = 0;
+
+    /** @brief Uploads a scene compiled for this geometry, for rendering with forward plt_path. */
+    [[nodiscard]] virtual std::unique_ptr<backend_renderer_t> create_plt_path_renderer(
+            const plt_path_scene_t& scene) = 0;
 };
 
 /** @brief A GPU backend on one device. */

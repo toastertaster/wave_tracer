@@ -245,6 +245,34 @@ public:
     }
 
     /**
+     * @brief Replaces the light images (the direct splats) with an image accumulated elsewhere, e.g. on a GPU.
+     *        Element ``p`` (linear index, x fastest) component ``c`` is ``values[p*components + c]``.
+     *        (not thread safe)
+     */
+    void set_light_image(const FilmStoragePixelT* values) noexcept
+        requires (!polarimetric)
+    {
+        assert(light_surfaces);
+        if (!light_surfaces)
+            return;
+
+        const auto comps = pixel_layout().components;
+        const auto dims = dimensions();
+        for (std::size_t i=0; i<light_surfaces->size(); ++i) {
+            auto& storage = (*light_surfaces)[i];
+            for_range(size_t{ 0 }, dims, [&](auto p) {
+                std::size_t idx = 0, stride = 1;
+                for (auto d=0ul;d<Dims;++d) {
+                    idx += std::size_t(p[d]) * stride;
+                    stride *= dims[d];
+                }
+                for (std::uint8_t c=0;c<comps;++c)
+                    storage(p,c) = i==0 ? StorageT(values[idx*comps + c]) : StorageT{};
+            });
+        }
+    }
+
+    /**
      * @brief Colour encoding of the tonemapped developed film.
      */
     [[nodiscard]] inline bitmap::colour_encoding_t get_colour_encoding_of_developed_tonemapped_film() const noexcept override {

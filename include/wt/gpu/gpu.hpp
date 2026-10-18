@@ -39,6 +39,7 @@ namespace wt::gpu {
 class backend_t;
 class backend_geometry_t;
 class geometry_t;
+class renderer_t;
 
 /** @brief A GPU was requested but is unavailable, or cannot do what was asked. */
 class gpu_error_t : public std::runtime_error {
@@ -135,6 +136,7 @@ public:
 
 private:
     friend class device_t;
+    friend class renderer_t;
     explicit geometry_t(std::unique_ptr<backend_geometry_t> backend) noexcept;
 
     std::unique_ptr<backend_geometry_t> backend;
