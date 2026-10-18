@@ -184,12 +184,12 @@ bvh_constructor_t::bvh_constructor_t(
                     tbvhtris.emplace_back(u::to_m(t.c.x), u::to_m(t.c.y), u::to_m(t.c.z), 0);
                 }
 
-#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
-                // On ARM, AVX is unavailable; Build() dispatches to the NEON
-                // builder at runtime.
-                tbvh.Build(tbvhtris.data(), tbvhtris.size()/3);
-#else
+#ifdef BVH_USEAVX
                 tbvh.BuildAVX(tbvhtris.data(), tbvhtris.size()/3);
+#else
+                // tinybvh was compiled without AVX (no -mavx, or not x86), so
+                // BuildAVX is a stub that exits: use the reference builder.
+                tbvh.Build(tbvhtris.data(), tbvhtris.size()/3);
 #endif
             }
 #else
