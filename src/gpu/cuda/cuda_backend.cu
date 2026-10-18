@@ -117,49 +117,192 @@ struct cuda_film_t {
 struct path_entry_t {
     std::uint64_t path;
     std::uint32_t skip;
+    std::uint32_t seed;
 };
 
-struct scratch_view_t {
+/**
+ * @brief Paths in flight, each in a slot: its state and its scratch memory.
+ *        Unused slots are on a stack, `free_slots`.
+ */
+struct path_pool_t {
+    k::forward_path* paths;
+    k::traversal_t* traversals;     // of the step in progress
+    k::u32* trace_results;          // of the step in progress: status flags, and `trace_found`
+    k::u32* free_slots;
     k::u32* tris;
     k::u32* edges;
     k::aperture_entry* aperture;
     k::u32 tri_capacity, edge_capacity;
+
+    __device__ k::path_scratch scratch(k::u32 slot) const {
+        return {
+            tris + std::size_t(slot)*tri_capacity,
+            edges + std::size_t(slot)*edge_capacity,
+            aperture + std::size_t(slot)*edge_capacity,
+            tri_capacity, edge_capacity,
+        };
+    }
 };
 
 /**
- * @brief Traces paths `first+i`, or `list[i]` if `list` is given. Paths that
- *        outgrow their scratch memory are appended to `overflow`.
- *        Three resident blocks per SM cap registers at 168 per thread (from
- *        about 250): more warps hide more memory latency (18% faster on a GB10).
+ * @brief Loads and stores (of path states) in 16-byte words: a plain struct
+ *        copy makes 4-byte accesses, many times slower.
  */
-__global__ void __launch_bounds__(block_size, 3) plt_path_forward_kernel(k::plt_scene scene,
-                                        std::uint64_t first, std::uint64_t count, const path_entry_t* list,
-                                        std::uint32_t seed, double* film, scratch_view_t scratch,
-                                        path_entry_t* overflow, std::uint32_t* overflow_count,
-                                        std::uint32_t* status) {
-    const std::uint64_t i = std::uint64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+template <typename T>
+__device__ T load_vectors(const T* src) {
+    constexpr int words = sizeof(T)/sizeof(uint4);
+    static_assert(words*sizeof(uint4)==sizeof(T));
+    uint4 w[words];
+    for (int i=0; i<words; ++i)
+        w[i] = reinterpret_cast<const uint4*>(src)[i];
+    T v;
+    memcpy(&v, w, sizeof(v));
+    return v;
+}
+template <typename T>
+__device__ void store_vectors(T* dst, const T& v) {
+    constexpr int words = sizeof(T)/sizeof(uint4);
+    static_assert(words*sizeof(uint4)==sizeof(T));
+    uint4 w[words];
+    memcpy(w, &v, sizeof(v));
+    for (int i=0; i<words; ++i)
+        reinterpret_cast<uint4*>(dst)[i] = w[i];
+}
+
+/** @brief `trace_results` flag: the traversal found an interaction. */
+constexpr k::u32 trace_found = 1u<<31;
+
+/** @brief Counters of a step: paths that go on, slots freed, paths that overflowed. */
+struct step_counters_t {
+    std::uint32_t queued, freed, overflowed;
+};
+
+__global__ void fill_free_slots_kernel(k::u32* free_slots, k::u32 count) {
+    const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i<count) free_slots[i] = i;
+}
+
+/**
+ * @brief Starts `count` paths: `base+i` with `seed`, or `list[base+i]` if
+ *        `list` is given. They take the slots on top of the free stack
+ *        (`free_top` slots) and are queued after the `queued` paths of `queue`.
+ */
+__global__ void start_paths_kernel(k::plt_scene scene, std::uint64_t base, k::u32 count,
+                                   const path_entry_t* list, std::uint32_t seed, path_pool_t pool,
+                                   k::u32 free_top, k::u32* queue, k::u32 queued) {
+    const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i>=count) return;
 
-    const std::uint64_t path = list ? list[i].path : first+i;
-    k::rng rnd = k::rng::for_path(seed, k::u32(path), k::u32(path>>32));
-    const cuda_bvh_geometry_t geometry = { scene.bvh };
-    k::path_film<cuda_film_t> pf = { { film }, list ? list[i].skip : 0, 0 };
-    const k::path_scratch ps = {
-        scratch.tris + i*scratch.tri_capacity,
-        scratch.edges + i*scratch.edge_capacity,
-        scratch.aperture + i*scratch.edge_capacity,
-        scratch.tri_capacity, scratch.edge_capacity,
-    };
+    const path_entry_t e = list ? list[base+i] : path_entry_t{ base+i, 0, seed };
+    const k::u32 slot = pool.free_slots[free_top-1-i];
+    const auto rnd = k::rng::for_path(e.seed, k::u32(e.path), k::u32(e.path>>32));
+    store_vectors(pool.paths+slot, k::start_forward_path(scene, rnd, e.skip));
+    queue[queued+i] = slot;
+}
 
-    k::u32 s = k::trace_forward_path(scene, geometry, pf, ps, rnd);
+/**
+ * @brief Ends or requeues a path after a step: paths that go on are queued in
+ *        `next_queue`; those that end free their slots, pushed above the
+ *        `free_top` free ones. Paths that outgrew their scratch memory end and
+ *        are listed in `overflow`.
+ */
+__device__ void finish_step(const path_pool_t& pool, k::u32 slot, const k::forward_path& p, bool goes_on,
+                            k::u32 s, k::u32* next_queue, k::u32 free_top, step_counters_t* counters,
+                            path_entry_t* overflow, std::uint32_t* status) {
     if (s & k::status_scratch_overflow) {
-        overflow[atomicAdd(overflow_count, 1u)] = { path, pf.splats };
+        // the path's generator says which path it is
+        const std::uint64_t path = p.rnd.path_lo | std::uint64_t(p.rnd.path_hi)<<32;
+        overflow[atomicAdd(&counters->overflowed, 1u)] = { path, p.splats, p.rnd.seed };
         s &= ~k::status_scratch_overflow;
+        goes_on = false;
+    }
+    if (goes_on) {
+        store_vectors(pool.paths+slot, p);
+        next_queue[atomicAdd(&counters->queued, 1u)] = slot;
+    } else {
+        pool.free_slots[free_top + atomicAdd(&counters->freed, 1u)] = slot;
     }
     if (s!=k::status_ok)
         atomicOr(status, s);
 }
 
+/**
+ * @brief First part of a step of the `count` queued paths: traces their beams
+ *        (`trace_step`). A kernel of its own, so that the BVH traversals run
+ *        with fewer registers, without warps diverging into interaction code.
+ */
+__global__ void trace_paths_kernel(k::plt_scene scene, path_pool_t pool, const k::u32* queue, k::u32 count) {
+    const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i>=count) return;
+
+    const k::u32 slot = queue[i];
+    const k::forward_path p = load_vectors(pool.paths+slot);
+    const cuda_bvh_geometry_t geometry = { scene.bvh };
+
+    k::traversal_t tr;
+    k::u32 s = k::status_ok;
+    const bool found = k::trace_step(scene, geometry, pool.scratch(slot), p, tr, s);
+    if (found)
+        store_vectors(pool.traversals+slot, tr);
+    pool.trace_results[slot] = s | (found ? trace_found : 0u);
+}
+
+/** @brief Second part of a step of the `count` queued paths (`interact`), after `trace_paths_kernel`. */
+__global__ void __launch_bounds__(block_size, 4) interact_paths_kernel(k::plt_scene scene, path_pool_t pool,
+                                        const k::u32* queue, k::u32 count,
+                                        double* film, k::u32* next_queue, k::u32 free_top,
+                                        step_counters_t* counters, path_entry_t* overflow,
+                                        std::uint32_t* status) {
+    const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i>=count) return;
+
+    const k::u32 slot = queue[i];
+    k::forward_path p = load_vectors(pool.paths+slot);
+    const k::u32 traced = pool.trace_results[slot];
+    k::u32 s = traced & ~trace_found;
+    bool goes_on = false;
+    if (traced & trace_found) {
+        const k::traversal_t tr = load_vectors(pool.traversals+slot);
+        const cuda_bvh_geometry_t geometry = { scene.bvh };
+        cuda_film_t f = { film };
+        goes_on = k::interact(scene, geometry, f, pool.scratch(slot), tr, p, s);
+    }
+    finish_step(pool, slot, p, goes_on, s, next_queue, free_top, counters, overflow, status);
+}
+
+/**
+ * @brief Advances the `count` queued paths by up to `max_steps` whole steps,
+ *        in one kernel: for the last few paths, which would otherwise take a
+ *        pair of launches per step.
+ */
+__global__ void __launch_bounds__(block_size, 4) step_paths_kernel(k::plt_scene scene, path_pool_t pool,
+                                        const k::u32* queue, k::u32 count, k::u32 max_steps,
+                                        double* film, k::u32* next_queue, k::u32 free_top,
+                                        step_counters_t* counters, path_entry_t* overflow,
+                                        std::uint32_t* status) {
+    const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i>=count) return;
+
+    const k::u32 slot = queue[i];
+    k::forward_path p = load_vectors(pool.paths+slot);
+    const cuda_bvh_geometry_t geometry = { scene.bvh };
+    cuda_film_t f = { film };
+
+    k::u32 s = k::status_ok;
+    bool goes_on = true;
+    for (k::u32 n=0; n<max_steps && goes_on; ++n)
+        goes_on = k::step_forward_path(scene, geometry, f, pool.scratch(slot), p, s);
+    finish_step(pool, slot, p, goes_on, s, next_queue, free_top, counters, overflow, status);
+}
+
+/**
+ * @brief Forward plt_path on the GPU, as a wavefront: a pool of paths in
+ *        flight, advanced a step at a time, so that warps run paths still
+ *        going (most paths end after a step or two), with the traversals in a
+ *        kernel of their own. Ended paths' slots are refilled with new paths.
+ *        Paths in flight carry over from one `trace` to the next, so that the
+ *        GPU does not idle while a pass's last, longest, paths finish.
+ */
 class cuda_plt_path_renderer_t final : public backend_renderer_t {
 public:
     cuda_plt_path_renderer_t(int ordinal, k::bvh_view bvh, const plt_path_scene_t& scene)
@@ -175,8 +318,9 @@ public:
         film_size = std::size_t(scene.film.width) * scene.film.height * scene.film.components;
         film.resize(film_size);
         check(cudaMemset(film.get(), 0, film_size*sizeof(double)), "clearing the film");
-        status_word.resize(1);
-        overflow_count.resize(1);
+        const std::uint32_t zero = 0;
+        status_word.upload(&zero, 1);
+        counters.resize(1);
 
         params.bvh = bvh;
         params.tris = tris.get();
@@ -192,36 +336,42 @@ public:
 
     std::uint32_t trace(std::uint64_t first, std::uint64_t count, std::uint32_t seed) override {
         set_device(ordinal);
-        std::uint32_t status = k::status_ok;
-        status_word.upload(&status, 1);
+        if (main.slots==0)
+            begin(main, pool_size, initial_capacity);
+        path_source_t source = { first, count, nullptr };
+        advance(main, source, seed, pool_size/2);
+        return read_status();
+    }
+
+    std::uint32_t finish() override {
+        set_device(ordinal);
+        if (main.slots>0) {
+            path_source_t none = { 0, 0, nullptr };
+            advance(main, none, 0, 0);
+        }
 
         // paths that outgrew their scratch memory are re-traced with more room
-        std::vector<path_entry_t> pending, overflowed;
-        k::u32 tri_capacity = initial_capacity, edge_capacity = initial_capacity;
-        for (std::uint64_t start=0; start<count; start+=launch_size) {
-            const auto n = std::min<std::uint64_t>(launch_size, count-start);
-            launch(first+start, n, nullptr, seed, tri_capacity, edge_capacity, pending);
-        }
-        while (!pending.empty()) {
-            if (tri_capacity>=max_capacity)
+        k::u32 capacity = initial_capacity;
+        std::vector<path_entry_t> pending;
+        while (!overflowed.empty()) {
+            if (capacity>=max_capacity)
                 throw std::runtime_error("a path found more than " + std::to_string(max_capacity) +
                                          " triangles or edges in one query");
-            tri_capacity *= 4;
-            edge_capacity *= 4;
-
-            // as many paths per launch as fit the scratch memory the first launches used
-            const std::size_t batch = std::max<std::size_t>(1, launch_size*initial_capacity/tri_capacity);
-            overflowed.clear();
-            for (std::size_t start=0; start<pending.size(); start+=batch) {
-                const auto n = std::min(batch, pending.size()-start);
-                path_list.upload(pending.data()+start, n);
-                launch(0, n, path_list.get(), seed, tri_capacity, edge_capacity, overflowed);
-            }
+            capacity *= 4;
             std::swap(pending, overflowed);
-        }
+            overflowed.clear();
 
-        status_word.download(&status, 1);
-        return status;
+            // as many paths in flight as fit the scratch memory of the main pool
+            wavefront_t retry;
+            begin(retry, k::u32(std::max<std::size_t>(1, std::size_t(pool_size)*initial_capacity/capacity)), capacity);
+            path_list.upload(pending.data(), pending.size());
+            path_source_t source = { 0, pending.size(), path_list.get() };
+            advance(retry, source, 0, 0);
+        }
+        // the retries reuse the main pool's memory: start it anew
+        main = {};
+
+        return read_status();
     }
 
     void read_film(double* out) override {
@@ -230,36 +380,113 @@ public:
     }
 
 private:
-    /** @brief Paths per kernel launch. */
-    static constexpr std::uint64_t launch_size = std::uint64_t(1)<<18;
+    /** @brief Paths in flight. */
+    static constexpr k::u32 pool_size = 1u<<18;
     /** @brief Triangles and edges a path holds at first; paths needing more are re-traced. */
     static constexpr k::u32 initial_capacity = 64;
     static constexpr k::u32 max_capacity = 1u<<20;
+    /** @brief Paths in flight few enough to finish in one launch, rather than a launch per step. */
+    static constexpr k::u32 tail_size = 1024;
 
-    /** @brief Launches the kernel for `count` paths, appending those that overflowed to `overflowed`. */
-    void launch(std::uint64_t first, std::uint64_t count, const path_entry_t* list, std::uint32_t seed,
-                k::u32 tri_capacity, k::u32 edge_capacity, std::vector<path_entry_t>& overflowed) {
-        scratch_tris.resize(count*tri_capacity);
-        scratch_edges.resize(count*edge_capacity);
-        scratch_aperture.resize(count*edge_capacity);
-        overflow.resize(count);
-        const std::uint32_t zero = 0;
-        overflow_count.upload(&zero, 1);
+    /** @brief A pool of paths in flight. */
+    struct wavefront_t {
+        k::u32 slots = 0;           // 0: not started
+        k::u32 capacity = 0;        // scratch triangles and edges per path
+        k::u32 queued = 0;          // paths in flight, in `queues[q]`
+        k::u32 free_top = 0;        // free slots
+        int q = 0;
+    };
 
-        const scratch_view_t scratch = {
+    /** @brief Paths to start: `first+i`, or `list[i]` if `list` is given. */
+    struct path_source_t {
+        std::uint64_t first, count;
+        const path_entry_t* list;
+        std::uint64_t started = 0;
+    };
+
+    /** @brief Starts an empty pool of `slots` paths with `capacity` scratch triangles and edges each. */
+    void begin(wavefront_t& wf, k::u32 slots, k::u32 capacity) {
+        paths.resize(slots);
+        traversals.resize(slots);
+        trace_results.resize(slots);
+        free_slots.resize(slots);
+        queues[0].resize(slots);
+        queues[1].resize(slots);
+        scratch_tris.resize(std::size_t(slots)*capacity);
+        scratch_edges.resize(std::size_t(slots)*capacity);
+        scratch_aperture.resize(std::size_t(slots)*capacity);
+        overflow.resize(slots);
+
+        fill_free_slots_kernel<<<grid_size(slots), block_size>>>(free_slots.get(), slots);
+        check(cudaGetLastError(), "launching the path pool kernel");
+        wf = { slots, capacity, 0, slots, 0 };
+    }
+
+    [[nodiscard]] path_pool_t pool(const wavefront_t& wf) const noexcept {
+        return {
+            paths.get(), traversals.get(), trace_results.get(), free_slots.get(),
             scratch_tris.get(), scratch_edges.get(), scratch_aperture.get(),
-            tri_capacity, edge_capacity,
+            wf.capacity, wf.capacity,
         };
-        plt_path_forward_kernel<<<grid_size(count), block_size>>>(
-                params, first, count, list, seed, film.get(), scratch,
-                overflow.get(), overflow_count.get(), status_word.get());
-        check(cudaGetLastError(), "launching the path tracing kernel");
+    }
 
-        std::uint32_t n;
-        overflow_count.download(&n, 1);
-        const auto offset = overflowed.size();
-        overflowed.resize(offset+n);
-        overflow.download(overflowed.data()+offset, n);
+    /**
+     * @brief Starts `source`'s paths (with `seed`) and steps the paths in
+     *        flight, until all started and at most `keep` remain in flight.
+     *        Paths that overflow their scratch memory go to `overflowed`.
+     */
+    void advance(wavefront_t& wf, path_source_t& source, std::uint32_t seed, k::u32 keep) {
+        const path_pool_t pool = this->pool(wf);
+        for (;;) {
+            // fill the free slots with new paths
+            const auto n = k::u32(std::min<std::uint64_t>(wf.free_top, source.count-source.started));
+            if (n>0) {
+                start_paths_kernel<<<grid_size(n), block_size>>>(
+                        params, source.list ? source.started : source.first+source.started, n, source.list,
+                        seed, pool, wf.free_top, queues[wf.q].get(), wf.queued);
+                check(cudaGetLastError(), "launching the path start kernel");
+                source.started += n;
+                wf.queued += n;
+                wf.free_top -= n;
+            }
+            const bool all_started = source.started==source.count;
+            if (wf.queued==0 || (all_started && wf.queued<=keep))
+                return;
+
+            check(cudaMemset(counters.get(), 0, sizeof(step_counters_t)), "clearing the step counters");
+            const auto* queue = queues[wf.q].get();
+            auto* next_queue = queues[1-wf.q].get();
+            if (all_started && wf.queued<=tail_size) {
+                step_paths_kernel<<<grid_size(wf.queued), block_size>>>(
+                        params, pool, queue, wf.queued, k::max_path_iterations+1, film.get(),
+                        next_queue, wf.free_top, counters.get(), overflow.get(), status_word.get());
+                check(cudaGetLastError(), "launching the path step kernel");
+            } else {
+                trace_paths_kernel<<<grid_size(wf.queued), block_size>>>(params, pool, queue, wf.queued);
+                check(cudaGetLastError(), "launching the path tracing kernel");
+                interact_paths_kernel<<<grid_size(wf.queued), block_size>>>(
+                        params, pool, queue, wf.queued, film.get(),
+                        next_queue, wf.free_top, counters.get(), overflow.get(), status_word.get());
+                check(cudaGetLastError(), "launching the path interaction kernel");
+            }
+
+            step_counters_t c;
+            counters.download(&c, 1);
+            if (c.overflowed>0) {
+                const auto offset = overflowed.size();
+                overflowed.resize(offset+c.overflowed);
+                overflow.download(overflowed.data()+offset, c.overflowed);
+            }
+            wf.queued = c.queued;
+            wf.free_top += c.freed;
+            wf.q = 1-wf.q;
+        }
+    }
+
+    [[nodiscard]] std::uint32_t read_status() const {
+        std::uint32_t status;
+        status_word.download(&status, 1);
+        return status;
     }
 
     int ordinal;
@@ -274,12 +501,21 @@ private:
     std::size_t film_size = 0;
     device_buffer_t<std::uint32_t>    status_word;
 
+    // the path pool (`main`, or a pool re-tracing overflowed paths)
+    wavefront_t main;
+    device_buffer_t<k::forward_path>   paths;
+    device_buffer_t<k::traversal_t>    traversals;
+    device_buffer_t<k::u32>            trace_results;
+    device_buffer_t<k::u32>            free_slots;
+    device_buffer_t<k::u32>            queues[2];
     device_buffer_t<k::u32>            scratch_tris;
     device_buffer_t<k::u32>            scratch_edges;
     device_buffer_t<k::aperture_entry> scratch_aperture;
+    device_buffer_t<step_counters_t>   counters;
     device_buffer_t<path_entry_t>      overflow;
-    device_buffer_t<std::uint32_t>     overflow_count;
     device_buffer_t<path_entry_t>      path_list;
+    /** @brief Paths that outgrew their scratch memory, to re-trace with more. */
+    std::vector<path_entry_t>          overflowed;
 };
 
 

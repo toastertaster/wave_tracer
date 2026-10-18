@@ -705,7 +705,9 @@ scene::render_result_t scene_renderer_t::render_gpu(
                 }
                 else if (const auto capture = dynamic_cast<const capture_intermediate_t*>(interrupt.get()); capture) {
                     logger::cout(verbosity_e::info) << "(scene_renderer) capture intermediate interrupt." << '\n';
-                    // passes are synchronous: the films are consistent between passes
+                    // complete the paths in flight, so that the films hold the samples completed
+                    for (const auto& r : renders)
+                        r.renderer->finish();
                     render_result_t results;
                     results.render_elapsed_time = state.elapsed_time();
                     for (const auto& r : renders)
@@ -736,6 +738,8 @@ scene::render_result_t scene_renderer_t::render_gpu(
         state.jobs_enqueued = 1;
         r.renderer->render(r.samples_completed, samples);
         r.samples_completed += samples;
+        if (r.is_complete())
+            r.renderer->finish();
         state.jobs_enqueued = 0;
         ++state.jobs_completed;
         state.checkpoint();

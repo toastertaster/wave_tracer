@@ -25,8 +25,11 @@ namespace wt::gpu::kernel {
 
 constexpr int bvh_width = 8;
 
-/** @brief Internal node: 8 child boxes (SoA) and child pointers. */
-struct bvh_node {
+/**
+ * @brief Internal node: 8 child boxes (SoA) and child pointers. Aligned, so
+ *        that traversals load four children's values at once.
+ */
+struct alignas(16) bvh_node {
     real minx[bvh_width], miny[bvh_width], minz[bvh_width];
     real maxx[bvh_width], maxy[bvh_width], maxz[bvh_width];
     /** 0: empty; >0: internal node index+1; <0: -(leaf index+1). */
@@ -39,7 +42,8 @@ struct bvh_leaf {
     u32 tris_ptr, count;
 };
 
-struct bvh_tri {
+/** @brief Aligned, so that a triangle loads in a few vector loads. */
+struct alignas(16) bvh_tri {
     vec3 a, b, c;
     vec3 n;         // geometric normal, as stored by the CPU (not recomputed)
 };
@@ -57,8 +61,55 @@ WT_GPU_FN bool bvh_is_leaf(i32 ptr)  { return ptr<0; }
 WT_GPU_FN u32  bvh_leaf_index(i32 ptr) { return u32((-ptr)-1); }
 WT_GPU_FN u32  bvh_node_index(i32 ptr) { return u32(ptr-1); }
 
-WT_GPU_FN vec3 bvh_child_min(const WT_GPU_GLOBAL bvh_node& n, int i) { return { n.minx[i], n.miny[i], n.minz[i] }; }
-WT_GPU_FN vec3 bvh_child_max(const WT_GPU_GLOBAL bvh_node& n, int i) { return { n.maxx[i], n.maxy[i], n.maxz[i] }; }
+/** @brief Four consecutive children of a node. */
+struct bvh_child_quad {
+    vec3 mn[4], mx[4];
+    i32 ptr[4];
+};
+
+constexpr int bvh_quads = bvh_width/4;
+
+/** @brief Loads `p[0..3]` (16-byte aligned) with vector loads. */
+template <typename T>
+WT_GPU_FN void bvh_load4(const WT_GPU_GLOBAL T* p, WT_GPU_THREAD T* out) {
+#if defined(__CUDA_ARCH__)
+    // nvcc does not merge the scalar loads by itself
+    static_assert(sizeof(T)==4 || sizeof(T)==8);
+    if constexpr (sizeof(T)==4) {
+        const uint4 v = *reinterpret_cast<const uint4*>(p);
+        memcpy(out, &v, sizeof(v));
+    } else {
+        const ulonglong2 v0 = reinterpret_cast<const ulonglong2*>(p)[0];
+        const ulonglong2 v1 = reinterpret_cast<const ulonglong2*>(p)[1];
+        memcpy(out, &v0, sizeof(v0));
+        memcpy(out+2, &v1, sizeof(v1));
+    }
+#else
+    for (int j=0; j<4; ++j)
+        out[j] = p[j];
+#endif
+}
+
+/**
+ * @brief Loads children `4*q` to `4*q+3` with vector loads, which make
+ *        traversals much faster than per-child scalar loads.
+ */
+WT_GPU_FN bvh_child_quad bvh_load_children(const WT_GPU_GLOBAL bvh_node& n, int q) {
+    real mnx[4], mny[4], mnz[4], mxx[4], mxy[4], mxz[4];
+    bvh_child_quad c;
+    bvh_load4(n.minx+4*q, mnx);
+    bvh_load4(n.miny+4*q, mny);
+    bvh_load4(n.minz+4*q, mnz);
+    bvh_load4(n.maxx+4*q, mxx);
+    bvh_load4(n.maxy+4*q, mxy);
+    bvh_load4(n.maxz+4*q, mxz);
+    bvh_load4(n.child+4*q, c.ptr);
+    for (int j=0; j<4; ++j) {
+        c.mn[j] = { mnx[j], mny[j], mnz[j] };
+        c.mx[j] = { mxx[j], mxy[j], mxz[j] };
+    }
+    return c;
+}
 
 /** @brief Nodes with at most this many triangles are tested as one leaf by ray and ball queries. */
 constexpr u32 bvh_treat_node_as_leaf_if_triangle_count_le = 16;
@@ -163,16 +214,18 @@ WT_GPU_FN bool traverse_ray(bvh_view bvh, const WT_GPU_THREAD ray& r, range rng,
         }
 
         const int begin = s;
-        for (int i=0;i<bvh_width;++i) {
-            if (n.child[i]==0) continue;
-            const auto h = intersect_ray_aabb_fast(r, bvh_child_min(n,i), bvh_child_max(n,i),
-                                                   range{ real(0), best.dist });
-            if (!h.hit) continue;
-            if (s==ray_stack_size) {
-                best.status |= status_stack_overflow;
-                return false;
+        for (int q=0;q<bvh_quads;++q) {
+            const bvh_child_quad c = bvh_load_children(n, q);
+            for (int j=0;j<4;++j) {
+                if (c.ptr[j]==0) continue;
+                const auto h = intersect_ray_aabb_fast(r, c.mn[j], c.mx[j], range{ real(0), best.dist });
+                if (!h.hit) continue;
+                if (s==ray_stack_size) {
+                    best.status |= status_stack_overflow;
+                    return false;
+                }
+                stack[s++] = { h.tmin, c.ptr[j] };
             }
-            stack[s++] = { h.tmin, n.child[i] };
         }
         sort_descending(&stack[begin], s-begin);
     }
@@ -291,15 +344,18 @@ WT_GPU_FN void traverse_cone(bvh_view bvh, const WT_GPU_THREAD cone& cn,
         --s;
 
         const int begin = s;
-        for (int i=0;i<bvh_width;++i) {
-            if (n.child[i]==0) continue;
-            const auto h = intersect_cone_aabb_conservative(cn, bvh_child_min(n,i), bvh_child_max(n,i), rng);
-            if (!h.hit || h.tmin>=rng.max) continue;
-            if (s==cone_stack_size) {
-                rec.status |= status_stack_overflow;
-                return;
+        for (int q=0;q<bvh_quads;++q) {
+            const bvh_child_quad c = bvh_load_children(n, q);
+            for (int j=0;j<4;++j) {
+                if (c.ptr[j]==0) continue;
+                const auto h = intersect_cone_aabb_conservative(cn, c.mn[j], c.mx[j], rng);
+                if (!h.hit || h.tmin>=rng.max) continue;
+                if (s==cone_stack_size) {
+                    rec.status |= status_stack_overflow;
+                    return;
+                }
+                stack[s++] = { h.tmin, c.ptr[j] };
             }
-            stack[s++] = { h.tmin, n.child[i] };
         }
         sort_descending(&stack[begin], s-begin);
     }
@@ -358,12 +414,15 @@ WT_GPU_FN u32 intersect_ball(bvh_view bvh, ball bl, WT_GPU_THREAD tri_sink& sink
             continue;
         }
 
-        for (int i=0;i<bvh_width;++i) {
-            if (n.child[i]==0) continue;
-            if (!test_ball_aabb(bl, bvh_child_min(n,i), bvh_child_max(n,i))) continue;
-            if (s==ball_stack_size)
-                return status_stack_overflow;
-            stack[s++] = n.child[i];
+        for (int q=0;q<bvh_quads;++q) {
+            const bvh_child_quad c = bvh_load_children(n, q);
+            for (int j=0;j<4;++j) {
+                if (c.ptr[j]==0) continue;
+                if (!test_ball_aabb(bl, c.mn[j], c.mx[j])) continue;
+                if (s==ball_stack_size)
+                    return status_stack_overflow;
+                stack[s++] = c.ptr[j];
+            }
         }
     }
 

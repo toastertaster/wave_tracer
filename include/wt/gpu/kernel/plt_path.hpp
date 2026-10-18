@@ -17,13 +17,16 @@
 /*
  * Forward plt_path on the GPU: a port of `integrate_forward` and
  * `random_walk` of wt/integrator/plt_path/plt_path_detail.hpp (with
- * `traverse` of wt/integrator/traversal.hpp), one path per GPU thread, the
- * recursion unrolled into a loop. Beams propagate ballistically and
- * diffusively, diffract at edges (free-space diffraction), reflect and
- * refract at specular surfaces, and are sensed by a virtual plane sensor.
- * The host refuses other scenes (src/gpu/renderer.cpp).
+ * `traverse` of wt/integrator/traversal.hpp), the recursion unrolled into
+ * steps. Beams propagate ballistically and diffusively, diffract at edges
+ * (free-space diffraction), reflect and refract at specular surfaces, and are
+ * sensed by a virtual plane sensor. The host refuses other scenes
+ * (src/gpu/renderer.cpp).
  *
- * `trace_forward_path` is parameterized by the backend's
+ * A path's state between steps is a `forward_path`: `start_forward_path`
+ * starts one, and `step_forward_path` advances it a step, in two parts
+ * (`trace_step`, then `interact`) that backends may run in separate kernels.
+ * The functions are parameterized by the backend's
  *   Geometry: `ray_hit intersect(const ray&, range) const`,
  *             `bool occluded(const ray&, range, u32& status) const`,
  *             `cone_hit intersect_cone(const cone&, range, real z_scale, tri_sink&) const`;
@@ -273,8 +276,8 @@ WT_GPU_FN bool shadowed(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_THREA
  * Traversal
  */
 
-/** @brief Result of `traverse()` (`traversal_result_t`). */
-struct traversal_t {
+/** @brief Result of `traverse()` (`traversal_result_t`). Aligned for 16-byte copies to and from memory. */
+struct alignas(16) traversal_t {
     vec3 origin;            // traversal origin (offset for self-intersection avoidance)
     real dist;              // distance to the intersection
     real region_depth;      // depth past `dist` over which triangles are considered
@@ -504,19 +507,6 @@ WT_GPU_FN fsd_amplitudes_t do_fsd(const WT_GPU_THREAD plt_scene& scene, const WT
  * The path
  */
 
-/** @brief Splats a path's sensor connections, skipping the first `skip` (made by an earlier, overflowed, attempt). */
-template <typename Film>
-struct path_film {
-    Film film;
-    u32 skip;
-    u32 splats;
-
-    WT_GPU_FN void splat(const WT_GPU_THREAD film_desc& desc, u32 ex, u32 ey, vec2 offset, real watts) {
-        if (splats++>=skip)
-            kernel::splat(desc, film, ex, ey, offset, watts);
-    }
-};
-
 /** @brief `virtual_plane_sensor_t::sample_direct`: a sensor point connecting to `wp`, its element, and the importance of the connection. */
 struct sensor_direct_t {
     vec3 p;
@@ -555,24 +545,40 @@ WT_GPU_FN sensor_direct_t sensor_sample_direct(const WT_GPU_THREAD virtual_plane
 }
 
 /**
- * @brief Traces one forward path (`plt_path::integrate_forward`), splatting
- *        its sensor connections into `film`. Returns status flags.
+ * @brief A forward path between steps: its beam and walk data
+ *        (`path_walk_data_t`). Its aperture, when it has one, is in the
+ *        path's scratch memory. Aligned for 16-byte copies to and from memory.
  */
-template <typename Geometry, typename Film>
-WT_GPU_FN u32 trace_forward_path(const WT_GPU_THREAD plt_scene& scene,
-                                 const WT_GPU_THREAD Geometry& geometry,
-                                 WT_GPU_THREAD path_film<Film>& film,
-                                 const WT_GPU_THREAD path_scratch& scratch,
-                                 WT_GPU_THREAD rng& rnd) {
-    const plt_path_params opts = scene.params;
-    const bool ray_trace = opts.ray_tracing_only!=0;
-    const real k = opts.k;
-    const real lambda = two_pi/k;
+struct alignas(16) forward_path {
+    beam b;
+    beam prev_beam;
+    vertex_geo prev_geo;
+    rng rnd;
+    real flux;              // the emitter's: Stokes parameters are relative to it
+    real throughput;
+    u32 depth;
+    u32 iteration;
+    u32 aperture_size;
+    u32 fsd;                // nonzero: diffract through the aperture at the next interaction
+    u32 sampled_fsd;        // nonzero: the last interaction sampled a diffraction
+    u32 skip;               // splats to skip (made by an earlier, overflowed, attempt)
+    u32 splats;             // splats made
 
-    u32 status = status_ok;
-    if (opts.max_depth==0)
-        return status;
+    /** @brief Splats a sensor connection, unless an earlier attempt made it. */
+    template <typename Film>
+    WT_GPU_FN void splat(const WT_GPU_THREAD film_desc& desc, WT_GPU_THREAD Film& film,
+                         u32 ex, u32 ey, vec2 offset, real watts) {
+        if (splats++>=skip)
+            kernel::splat(desc, film, ex, ey, offset, watts);
+    }
+};
 
+/**
+ * @brief Starts a forward path (`plt_path::integrate_forward`): samples an
+ *        emitter and sources a beam. `rnd` is the path's generator; `skip`
+ *        the splats an earlier, overflowed, attempt at this path made.
+ */
+WT_GPU_FN forward_path start_forward_path(const WT_GPU_THREAD plt_scene& scene, rng rnd, u32 skip) {
     // sample an emitter (the wavenumber is fixed)
     const real ue = rnd.r();
     u32 ei = 0;
@@ -580,207 +586,267 @@ WT_GPU_FN u32 trace_forward_path(const WT_GPU_THREAD plt_scene& scene,
         ++ei;
     const point_emitter em = scene.emitters[ei];
 
-    // source a beam (point_t::sample); its Stokes parameters are relative to `em.flux`
-    beam b;
-    b.envelope = make_isotropic_cone(make_ray(em.position, uniform_sphere(rnd.r2())), em.tan_alpha, em.x0);
-    b.S = { 1,0,0,0 };
-    b.Sframe = b.envelope.frame();
-    b.self_intersection_distance = 0;
+    forward_path p;
+    // source a beam (point_t::sample)
+    p.b.envelope = make_isotropic_cone(make_ray(em.position, uniform_sphere(rnd.r2())), em.tan_alpha, em.x0);
+    p.b.S = { 1,0,0,0 };
+    p.b.Sframe = p.b.envelope.frame();
+    p.b.self_intersection_distance = 0;
 
-    // path_walk_data_t
-    vertex_geo prev_geo = { em.position, geo_point, 0 };
-    beam prev_beam = b;
-    bool sampled_fsd = false;
-    bool fsd = false;           // an aperture is in the scratch memory
-    u32 aperture_size = 0;
-    real throughput = 1;
+    p.prev_beam = p.b;
+    p.prev_geo = { em.position, geo_point, 0 };
+    p.rnd = rnd;
+    p.flux = em.flux;
+    p.throughput = 1;
+    p.depth = 1;
+    p.iteration = 0;
+    p.aperture_size = 0;
+    p.fsd = 0;
+    p.sampled_fsd = 0;
+    p.skip = skip;
+    p.splats = 0;
+    return p;
+}
 
-    u32 depth = 1;
-    for (u32 iteration=0;; ++iteration) {
-        if (iteration==max_path_iterations) {
-            status |= status_iteration_limit;
-            break;
-        }
-
-        //
-        // trace and intersect beam
-
-        cone envelope = b.envelope;
-        envelope.r.o = offseted_ray_origin(scene, prev_geo, envelope.r);
-        const traversal_t tr = traverse(geometry, envelope, lambda, ray_trace, scratch, status);
-        if (status & status_scratch_overflow)
-            return status;
-        // no intersection found
-        if (!tr.hit)
-            break;
-
-        const real dist_to_interaction = tr.dist;
-        const bool is_ballistic = tr.ballistic || b.is_ray();
-        const vec3 origin_wp = tr.origin;
-        const vec3 interaction_wp = origin_wp + dist_to_interaction*b.dir();
-
-        //
-        // evaluate fsd from previous interaction
-
-        if (fsd) {
-            const cone prev_cone = prev_beam.envelope;
-            const real f = do_fsd(scene, geometry, prev_cone, prev_geo, interaction_wp,
-                                  scratch.aperture, aperture_size, status).intensity();
-            fsd = false;
-
-            if (sampled_fsd)
-                b.S = b.S*f;
-            else {
-                prev_beam.transform_region_interaction(origin_wp, length(origin_wp-prev_cone.r.o), b.dir(), f);
-                b.add(prev_beam);
-            }
-        }
-
-        //
-        // check which triangle falls under the intersection point, if any
-
-        primary_t primary;
-        if (is_ballistic)
-            primary = { tr.tri, tr.dist, tr.baryx, tr.baryy };
-        else
-            primary = find_closest_triangle(scene, scratch.tris, tr.tri_count,
-                                            range{ dist_to_interaction, dist_to_interaction+tr.region_depth },
-                                            origin_wp, b.dir());
-        const bool has_surface = primary.tri!=no_triangle;
-
-        // distance to interaction region end, or triangle intersection
-        const real interaction_region_end = has_surface ? primary.dist : dist_to_interaction;
-
-        // the surface intersection
-        surface s;
-        if (has_surface) {
-            const bvh_tri tri = scene.bvh.tris[primary.tri];
-            const tri_shading sh = scene.tris[primary.tri];
-            s.tri = primary.tri;
-            s.wp = origin_wp + primary.dist*b.dir();
-            s.geo = build_shading_frame(tri.n, sh.dpdu);
-            const real bz = 1 - primary.baryx - primary.baryy;
-            s.shading = build_shading_frame(normalize(primary.baryx*sh.n[0] + primary.baryy*sh.n[1] + bz*sh.n[2]),
-                                            sh.dpdu);
-            s.fp = b.surface_footprint_static(s.geo, dist_to_interaction);
-        }
-
-        // edges: around a ballistic intersection, or those of the diffusive intersection's triangles
-        u32 edge_count = 0;
-        if (is_ballistic && !b.is_ray() && !ray_trace) {
-            const real zdist = b.envelope.axes(dist_to_interaction).x * 2;
-            tri_sink sink = { scratch.tris, scratch.tri_capacity, 0 };
-            const cone_hit ch = geometry.intersect_cone(
-                    b.envelope, range{ dist_to_interaction - zdist/2, dist_to_interaction + zdist/2 }, 1, sink);
-            status |= ch.status;
-            if (ch.tri_count>scratch.tri_capacity ||
-                !collect_edges(scene, scratch.tris, ch.tri_count, scratch.edges, scratch.edge_capacity, edge_count))
-                return status | status_scratch_overflow;
-        } else if (!is_ballistic && opts.fsd!=0) {
-            if (!collect_edges(scene, scratch.tris, tr.tri_count, scratch.edges, scratch.edge_capacity, edge_count))
-                return status | status_scratch_overflow;
-        }
-
-        // if we have edges, construct the fsd aperture
-        if (edge_count>0) {
-            aperture_size = build_aperture(scene.edges, scratch.edges, edge_count,
-                                           interaction_wp, b.envelope.frame(), b.footprint3(dist_to_interaction),
-                                           -b.dir(), scratch.aperture);
-            fsd = aperture_size>0;
-        }
-
-        //
-        // NEE: connect the diffracted beam to the sensor
-
-        if (depth<opts.max_depth && fsd) {
-            const sensor_direct_t sd = sensor_sample_direct(scene.sensor, interaction_wp, rnd);
-            if (sd.importance>real(0)) {
-                const real f = do_fsd(scene, geometry, b.envelope, prev_geo, sd.p,
-                                      scratch.aperture, aperture_size, status).intensity();
-                if (f!=real(0)) {
-                    beam fsd_beam = b;
-                    fsd_beam.transform_region_interaction(interaction_wp, dist_to_interaction, -sd.wd, f);
-                    if (fsd_beam.S.s0>real(0))
-                        film.splat(scene.film, sd.ex, sd.ey, sd.offset, sd.importance * fsd_beam.S.s0 * em.flux);
-                }
-            }
-        }
-
-        //
-        // sensing (connection to the virtual sensor), up to the interaction
-
-        {
-            const real max_distance = interaction_region_end -
-                                      max(real(0), dot(b.dir(), origin_wp - b.origin()));
-            const sensor_hit_t sensed = virtual_plane_hit(scene.sensor, b, range{ 0, max_distance });
-            if (sensed.hit && b.S.s0>real(0))
-                film.splat(scene.film, sensed.ex, sensed.ey, sensed.offset,
-                           b.S.s0 * em.flux * scene.sensor.importance);
-        }
-
-        // the path ends after max_depth vertices: a further interaction contributes nothing
-        if (depth>=opts.max_depth)
-            break;
-
-        //
-        // do interactions
-
-        bool sampled_null = false;
-        if (has_surface) {
-            // sample_surface_interaction
-            const vec3 wiworld = -b.dir();
-            const vec3 wi = s.shading.to_local(wiworld);
-            if (dot(wiworld, s.geo.n)*wi.z<=real(0))
-                break;
-
-            bsdf_sample_t bs;
-            if (!sample_bsdf(scene.materials[scene.tris[s.tri].material], wi, rnd, bs) || !(bs.pdf>real(0)))
-                break;
-
-            const vec3 woworld = normalize(s.shading.to_world(bs.wo));
-            if (dot(woworld, s.geo.n)*bs.wo.z<=real(0))
-                break;
-
-            prev_geo = { s.wp, geo_surface, s.tri };
-            prev_beam = b;
-            sampled_fsd = false;
-            b.transform_surface_interaction(s, woworld, bs.M, 1);
-            throughput *= bs.M.m00;
-            if (bs.eta!=real(1))
-                throughput /= sqr(bs.eta);
-        } else if (fsd) {
-            // sample_fsd_interaction
-            const fsd_sample_t fs = fsd_sample(scene.edges, scratch.aperture, aperture_size, k,
-                                               interaction_wp, prev_geo.wp, rnd);
-            prev_geo = { interaction_wp, geo_point, 0 };
-            prev_beam = b;
-            sampled_fsd = true;
-            b.transform_region_interaction(interaction_wp, dist_to_interaction, fs.wo, fs.weight);
-            throughput *= fs.weight;
-        } else {
-            // no edges: a null interaction, continue propagation
-            sampled_null = true;
-            b.transform_restart(interaction_wp, dist_to_interaction);
-        }
-
-        //
-        // continue_walk
-
-        if (b.S.s0==real(0))
-            break;
-        if (!sampled_null && opts.russian_roulette!=0) {
-            const real p = throughput<real(1) ? max(throughput, real(.5)) : real(1);
-            if (!(rnd.r()<=p))
-                break;
-            const real scale = real(1)/p;
-            b.S = b.S*scale;
-            throughput *= scale;
-        }
-        if (!sampled_null)
-            ++depth;
+/**
+ * @brief A path step's first part: traces the beam to its next interaction
+ *        (into `tr`, its triangles into the scratch memory). Returns whether
+ *        the path goes on (it found an interaction); adds status flags to
+ *        `status`. `interact` continues the step.
+ */
+template <typename Geometry>
+WT_GPU_FN bool trace_step(const WT_GPU_THREAD plt_scene& scene,
+                          const WT_GPU_THREAD Geometry& geometry,
+                          const WT_GPU_THREAD path_scratch& scratch,
+                          const WT_GPU_THREAD forward_path& p,
+                          WT_GPU_THREAD traversal_t& tr,
+                          WT_GPU_THREAD u32& status) {
+    const plt_path_params opts = scene.params;
+    if (opts.max_depth==0)
+        return false;
+    if (p.iteration==max_path_iterations) {
+        status |= status_iteration_limit;
+        return false;
     }
 
-    return status;
+    cone envelope = p.b.envelope;
+    envelope.r.o = offseted_ray_origin(scene, p.prev_geo, envelope.r);
+    tr = traverse(geometry, envelope, two_pi/opts.k, opts.ray_tracing_only!=0, scratch, status);
+    if (status & status_scratch_overflow)
+        return false;
+    return tr.hit;
+}
+
+/**
+ * @brief A path step's second part, after `trace_step` found the interaction
+ *        `tr`: splats the path's sensor connections into `film` and samples
+ *        the interaction. Returns whether the path goes on; adds status flags
+ *        to `status`.
+ */
+template <typename Geometry, typename Film>
+WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
+                        const WT_GPU_THREAD Geometry& geometry,
+                        WT_GPU_THREAD Film& film,
+                        const WT_GPU_THREAD path_scratch& scratch,
+                        const WT_GPU_THREAD traversal_t& tr,
+                        WT_GPU_THREAD forward_path& p,
+                        WT_GPU_THREAD u32& status) {
+    const plt_path_params opts = scene.params;
+    const bool ray_trace = opts.ray_tracing_only!=0;
+    const real k = opts.k;
+
+    ++p.iteration;
+
+    WT_GPU_THREAD beam& b = p.b;
+    WT_GPU_THREAD rng& rnd = p.rnd;
+
+    const real dist_to_interaction = tr.dist;
+    const bool is_ballistic = tr.ballistic || b.is_ray();
+    const vec3 origin_wp = tr.origin;
+    const vec3 interaction_wp = origin_wp + dist_to_interaction*b.dir();
+
+    //
+    // evaluate fsd from previous interaction
+
+    if (p.fsd!=0) {
+        const cone prev_cone = p.prev_beam.envelope;
+        const real f = do_fsd(scene, geometry, prev_cone, p.prev_geo, interaction_wp,
+                              scratch.aperture, p.aperture_size, status).intensity();
+        p.fsd = 0;
+
+        if (p.sampled_fsd!=0)
+            b.S = b.S*f;
+        else {
+            p.prev_beam.transform_region_interaction(origin_wp, length(origin_wp-prev_cone.r.o), b.dir(), f);
+            b.add(p.prev_beam);
+        }
+    }
+
+    //
+    // check which triangle falls under the intersection point, if any
+
+    primary_t primary;
+    if (is_ballistic)
+        primary = { tr.tri, tr.dist, tr.baryx, tr.baryy };
+    else
+        primary = find_closest_triangle(scene, scratch.tris, tr.tri_count,
+                                        range{ dist_to_interaction, dist_to_interaction+tr.region_depth },
+                                        origin_wp, b.dir());
+    const bool has_surface = primary.tri!=no_triangle;
+
+    // distance to interaction region end, or triangle intersection
+    const real interaction_region_end = has_surface ? primary.dist : dist_to_interaction;
+
+    // the surface intersection
+    surface s;
+    if (has_surface) {
+        const bvh_tri tri = scene.bvh.tris[primary.tri];
+        const tri_shading sh = scene.tris[primary.tri];
+        s.tri = primary.tri;
+        s.wp = origin_wp + primary.dist*b.dir();
+        s.geo = build_shading_frame(tri.n, sh.dpdu);
+        const real bz = 1 - primary.baryx - primary.baryy;
+        s.shading = build_shading_frame(normalize(primary.baryx*sh.n[0] + primary.baryy*sh.n[1] + bz*sh.n[2]),
+                                        sh.dpdu);
+        s.fp = b.surface_footprint_static(s.geo, dist_to_interaction);
+    }
+
+    // edges: around a ballistic intersection, or those of the diffusive intersection's triangles
+    u32 edge_count = 0;
+    if (is_ballistic && !b.is_ray() && !ray_trace) {
+        const real zdist = b.envelope.axes(dist_to_interaction).x * 2;
+        tri_sink sink = { scratch.tris, scratch.tri_capacity, 0 };
+        const cone_hit ch = geometry.intersect_cone(
+                b.envelope, range{ dist_to_interaction - zdist/2, dist_to_interaction + zdist/2 }, 1, sink);
+        status |= ch.status;
+        if (ch.tri_count>scratch.tri_capacity ||
+            !collect_edges(scene, scratch.tris, ch.tri_count, scratch.edges, scratch.edge_capacity, edge_count)) {
+            status |= status_scratch_overflow;
+            return false;
+        }
+    } else if (!is_ballistic && opts.fsd!=0) {
+        if (!collect_edges(scene, scratch.tris, tr.tri_count, scratch.edges, scratch.edge_capacity, edge_count)) {
+            status |= status_scratch_overflow;
+            return false;
+        }
+    }
+
+    // if we have edges, construct the fsd aperture
+    if (edge_count>0) {
+        p.aperture_size = build_aperture(scene.edges, scratch.edges, edge_count,
+                                         interaction_wp, b.envelope.frame(), b.footprint3(dist_to_interaction),
+                                         -b.dir(), scratch.aperture);
+        p.fsd = p.aperture_size>0 ? 1u : 0u;
+    }
+
+    //
+    // NEE: connect the diffracted beam to the sensor
+
+    if (p.depth<opts.max_depth && p.fsd!=0) {
+        const sensor_direct_t sd = sensor_sample_direct(scene.sensor, interaction_wp, rnd);
+        if (sd.importance>real(0)) {
+            const real f = do_fsd(scene, geometry, b.envelope, p.prev_geo, sd.p,
+                                  scratch.aperture, p.aperture_size, status).intensity();
+            if (f!=real(0)) {
+                beam fsd_beam = b;
+                fsd_beam.transform_region_interaction(interaction_wp, dist_to_interaction, -sd.wd, f);
+                if (fsd_beam.S.s0>real(0))
+                    p.splat(scene.film, film, sd.ex, sd.ey, sd.offset, sd.importance * fsd_beam.S.s0 * p.flux);
+            }
+        }
+    }
+
+    //
+    // sensing (connection to the virtual sensor), up to the interaction
+
+    {
+        const real max_distance = interaction_region_end -
+                                  max(real(0), dot(b.dir(), origin_wp - b.origin()));
+        const sensor_hit_t sensed = virtual_plane_hit(scene.sensor, b, range{ 0, max_distance });
+        if (sensed.hit && b.S.s0>real(0))
+            p.splat(scene.film, film, sensed.ex, sensed.ey, sensed.offset,
+                    b.S.s0 * p.flux * scene.sensor.importance);
+    }
+
+    // the path ends after max_depth vertices: a further interaction contributes nothing
+    if (p.depth>=opts.max_depth)
+        return false;
+
+    //
+    // do interactions
+
+    bool sampled_null = false;
+    if (has_surface) {
+        // sample_surface_interaction
+        const vec3 wiworld = -b.dir();
+        const vec3 wi = s.shading.to_local(wiworld);
+        if (dot(wiworld, s.geo.n)*wi.z<=real(0))
+            return false;
+
+        bsdf_sample_t bs;
+        if (!sample_bsdf(scene.materials[scene.tris[s.tri].material], wi, rnd, bs) || !(bs.pdf>real(0)))
+            return false;
+
+        const vec3 woworld = normalize(s.shading.to_world(bs.wo));
+        if (dot(woworld, s.geo.n)*bs.wo.z<=real(0))
+            return false;
+
+        p.prev_geo = { s.wp, geo_surface, s.tri };
+        p.prev_beam = b;
+        p.sampled_fsd = 0;
+        b.transform_surface_interaction(s, woworld, bs.M, 1);
+        p.throughput *= bs.M.m00;
+        if (bs.eta!=real(1))
+            p.throughput /= sqr(bs.eta);
+    } else if (p.fsd!=0) {
+        // sample_fsd_interaction
+        const fsd_sample_t fs = fsd_sample(scene.edges, scratch.aperture, p.aperture_size, k,
+                                           interaction_wp, p.prev_geo.wp, rnd);
+        p.prev_geo = { interaction_wp, geo_point, 0 };
+        p.prev_beam = b;
+        p.sampled_fsd = 1;
+        b.transform_region_interaction(interaction_wp, dist_to_interaction, fs.wo, fs.weight);
+        p.throughput *= fs.weight;
+    } else {
+        // no edges: a null interaction, continue propagation
+        sampled_null = true;
+        b.transform_restart(interaction_wp, dist_to_interaction);
+    }
+
+    //
+    // continue_walk
+
+    if (b.S.s0==real(0))
+        return false;
+    if (!sampled_null && opts.russian_roulette!=0) {
+        const real q = p.throughput<real(1) ? max(p.throughput, real(.5)) : real(1);
+        if (!(rnd.r()<=q))
+            return false;
+        const real scale = real(1)/q;
+        b.S = b.S*scale;
+        p.throughput *= scale;
+    }
+    if (!sampled_null)
+        ++p.depth;
+    return true;
+}
+
+/**
+ * @brief One step of a forward path (an iteration of `random_walk`): traces
+ *        the beam to its next interaction, splats its sensor connections into
+ *        `film` and samples the interaction. Returns whether the path goes on;
+ *        adds status flags to `status`.
+ */
+template <typename Geometry, typename Film>
+WT_GPU_FN bool step_forward_path(const WT_GPU_THREAD plt_scene& scene,
+                                 const WT_GPU_THREAD Geometry& geometry,
+                                 WT_GPU_THREAD Film& film,
+                                 const WT_GPU_THREAD path_scratch& scratch,
+                                 WT_GPU_THREAD forward_path& p,
+                                 WT_GPU_THREAD u32& status) {
+    traversal_t tr;
+    return trace_step(scene, geometry, scratch, p, tr, status) &&
+           interact(scene, geometry, film, scratch, tr, p, status);
 }
 
 }

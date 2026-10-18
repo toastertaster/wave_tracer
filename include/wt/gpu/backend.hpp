@@ -76,13 +76,22 @@ public:
     virtual ~backend_renderer_t() noexcept = default;
 
     /**
-     * @brief Traces paths `first .. first+count-1` and accumulates them into
-     *        the film. A path's index and `seed` determine its random numbers.
-     *        Returns the status flags of all paths (kernel::status_*).
+     * @brief Starts paths `first .. first+count-1` and traces them, and paths
+     *        in flight from earlier calls; may return with some still in
+     *        flight, for the next call or `finish`. A path's index and `seed`
+     *        determine its random numbers. Returns the status flags of all
+     *        paths so far (kernel::status_*).
      */
     virtual std::uint32_t trace(std::uint64_t first, std::uint64_t count, std::uint32_t seed) = 0;
 
-    /** @brief Copies the film to `out`: element (x,y) component c at `out[(y*width + x)*components + c]`. */
+    /** @brief Completes all paths in flight. Returns the status flags of all paths so far. */
+    virtual std::uint32_t finish() = 0;
+
+    /**
+     * @brief Copies the film to `out`: element (x,y) component c at
+     *        `out[(y*width + x)*components + c]`. Paths in flight have not
+     *        contributed all of their splats yet.
+     */
     virtual void read_film(double* out) = 0;
 };
 

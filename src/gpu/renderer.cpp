@@ -311,6 +311,20 @@ void renderer_t::render(std::uint64_t first, std::uint64_t count) {
     } catch (const std::exception& e) {
         throw gpu_error_t(std::string("GPU rendering failed: ") + e.what());
     }
+    check_status(status);
+}
+
+void renderer_t::finish() {
+    std::uint32_t status;
+    try {
+        status = backend->finish();
+    } catch (const std::exception& e) {
+        throw gpu_error_t(std::string("GPU rendering failed: ") + e.what());
+    }
+    check_status(status);
+}
+
+void renderer_t::check_status(std::uint32_t status) {
     if (status & kernel::status_stack_overflow)
         throw gpu_error_t("GPU BVH traversal overflowed its stack");
     if ((status & kernel::status_iteration_limit) && !warned_iteration_limit) {

@@ -69,12 +69,21 @@ public:
      */
     [[nodiscard]] std::uint64_t paths_per_sample() const noexcept { return paths_per_spe; }
 
-    /** @brief Traces samples `first .. first+count-1` of every sensor element and accumulates them. */
+    /**
+     * @brief Traces samples `first .. first+count-1` of every sensor element
+     *        and accumulates them. Some paths may still be in flight on return
+     *        (the GPU keeps working on them with the next samples): `finish`
+     *        completes them.
+     */
     void render(std::uint64_t first, std::uint64_t count);
+
+    /** @brief Completes the paths in flight, so that the film holds all samples rendered. */
+    void finish();
 
     /**
      * @brief Writes the accumulated samples into `film`, a film storage the
      *        sensor created for direct splats (as forward integrators write).
+     *        Paths in flight are missing (see `render`).
      */
     void write_film(sensor::film_storage_handle_t& film) const;
 
@@ -85,6 +94,8 @@ private:
     std::uint64_t paths_per_spe;
     std::size_t film_values;
     bool warned_iteration_limit = false;
+
+    void check_status(std::uint32_t status);
 };
 
 }
