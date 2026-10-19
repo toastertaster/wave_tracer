@@ -296,12 +296,43 @@ __global__ void __launch_bounds__(block_size, 4) step_paths_kernel(k::plt_scene 
 }
 
 /**
+ * @brief Traces `count` whole paths, `base+i` with `seed` or `list[base+i]`,
+ *        one per thread, path `i` with the scratch memory of slot `i`. For
+ *        ray tracing, whose steps are cheap: moving path states between
+ *        launches would take longer than the steps.
+ */
+__global__ void __launch_bounds__(block_size, 3) run_paths_kernel(k::plt_scene scene, path_pool_t pool,
+                                        std::uint64_t base, k::u32 count, const path_entry_t* list,
+                                        std::uint32_t seed, double* film, step_counters_t* counters,
+                                        path_entry_t* overflow, std::uint32_t* status) {
+    const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i>=count) return;
+
+    const path_entry_t e = list ? list[base+i] : path_entry_t{ base+i, 0, seed };
+    k::forward_path p = k::start_forward_path(scene, k::rng::for_path(e.seed, k::u32(e.path), k::u32(e.path>>32)),
+                                              e.skip);
+    const cuda_bvh_geometry_t geometry = { scene.bvh };
+    cuda_film_t f = { film };
+
+    k::u32 s = k::status_ok;
+    while (k::step_forward_path(scene, geometry, f, pool.scratch(i), p, s)) {}
+
+    if (s & k::status_scratch_overflow) {
+        overflow[atomicAdd(&counters->overflowed, 1u)] = { e.path, p.splats, e.seed };
+        s &= ~k::status_scratch_overflow;
+    }
+    if (s!=k::status_ok)
+        atomicOr(status, s);
+}
+
+/**
  * @brief Forward plt_path on the GPU, as a wavefront: a pool of paths in
  *        flight, advanced a step at a time, so that warps run paths still
  *        going (most paths end after a step or two), with the traversals in a
  *        kernel of their own. Ended paths' slots are refilled with new paths.
  *        Paths in flight carry over from one `trace` to the next, so that the
  *        GPU does not idle while a pass's last, longest, paths finish.
+ *        Ray-traced paths, whose steps are cheap, run whole, one per thread.
  */
 class cuda_plt_path_renderer_t final : public backend_renderer_t {
 public:
@@ -437,6 +468,21 @@ private:
      */
     void advance(wavefront_t& wf, path_source_t& source, std::uint32_t seed, k::u32 keep) {
         const path_pool_t pool = this->pool(wf);
+        if (params.params.ray_tracing_only!=0) {
+            // whole paths, a pool's worth per launch (nothing remains in flight)
+            while (source.started<source.count) {
+                const auto n = k::u32(std::min<std::uint64_t>(wf.slots, source.count-source.started));
+                check(cudaMemset(counters.get(), 0, sizeof(step_counters_t)), "clearing the step counters");
+                run_paths_kernel<<<grid_size(n), block_size>>>(
+                        params, pool, source.list ? source.started : source.first+source.started, n, source.list,
+                        seed, film.get(), counters.get(), overflow.get(), status_word.get());
+                check(cudaGetLastError(), "launching the path kernel");
+                source.started += n;
+                collect_overflowed();
+            }
+            return;
+        }
+
         for (;;) {
             // fill the free slots with new paths
             const auto n = k::u32(std::min<std::uint64_t>(wf.free_top, source.count-source.started));
@@ -470,17 +516,23 @@ private:
                 check(cudaGetLastError(), "launching the path interaction kernel");
             }
 
-            step_counters_t c;
-            counters.download(&c, 1);
-            if (c.overflowed>0) {
-                const auto offset = overflowed.size();
-                overflowed.resize(offset+c.overflowed);
-                overflow.download(overflowed.data()+offset, c.overflowed);
-            }
+            const step_counters_t c = collect_overflowed();
             wf.queued = c.queued;
             wf.free_top += c.freed;
             wf.q = 1-wf.q;
         }
+    }
+
+    /** @brief The last launch's counters; appends the paths that overflowed to `overflowed`. */
+    step_counters_t collect_overflowed() {
+        step_counters_t c;
+        counters.download(&c, 1);
+        if (c.overflowed>0) {
+            const auto offset = overflowed.size();
+            overflowed.resize(offset+c.overflowed);
+            overflow.download(overflowed.data()+offset, c.overflowed);
+        }
+        return c;
     }
 
     [[nodiscard]] std::uint32_t read_status() const {
