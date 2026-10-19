@@ -340,14 +340,17 @@ WT_GPU_FN vec3 offseted_ray_origin(vec3 a, vec3 b, vec3 c, vec3 ng, ray r) {
  */
 
 /**
- * @brief A forward-transport beam (`beam_t<transport_e::forward, ...>`): an
- *        elliptic-cone envelope and a Stokes parameters vector. The Stokes
- *        vector is relative to the flux of the emitter sample that sourced
- *        the beam, which the path tracer applies when it splats.
+ * @brief A beam (`beam_t`): an elliptic-cone envelope and radiometric data.
+ *        Forward transport: a Stokes parameters vector, relative to the flux
+ *        of the emitter sample that sourced the beam (the path tracer applies
+ *        it when it splats). Backward transport: the first row of the beam's
+ *        Mueller operator, times its scale (see polarimetric.hpp), in the
+ *        operator's incident frame. Interactions transform the two differently
+ *        (`backward` arguments).
  */
 struct beam {
     cone envelope;
-    stokes S;
+    stokes S;                   // Stokes parameters, or Mueller operator row
     frame Sframe;               // frame of `S`
     real self_intersection_distance;
 
@@ -355,9 +358,12 @@ struct beam {
     WT_GPU_FN vec3 origin() const { return envelope.r.o; }
     WT_GPU_FN bool is_ray() const { return envelope.is_ray(); }
 
-    /** @brief `beam_t::operator+=`: adds another beam's Stokes parameters, reoriented. */
-    WT_GPU_FN void add(const WT_GPU_THREAD beam& o) {
-        S = S + reorient(o.S, o.Sframe, Sframe);
+    /**
+     * @brief `beam_t::operator+=`: adds another beam's radiometric data,
+     *        reoriented (forward), or with its incident frame changed (backward).
+     */
+    WT_GPU_FN void add(const WT_GPU_THREAD beam& o, bool backward) {
+        S = S + (backward ? row_change_incident_frame(o.S, o.Sframe, Sframe) : reorient(o.S, o.Sframe, Sframe));
     }
 
     /** @brief `beam_generic_t::footprint` (beam local frame) */
@@ -378,7 +384,7 @@ struct beam {
 
     /** @brief `beam_t::transform_surface_interaction`: interact with a surface (Mueller operator `M`) and scatter into `wo`. */
     WT_GPU_FN void transform_surface_interaction(const WT_GPU_THREAD surface& s, vec3 wo,
-                                                 fresnel_mueller M, real weight) {
+                                                 mueller_block M, real weight, bool backward) {
         // a new elliptical cone that passes through the interaction footprint
         const vec2 a = s.fp.a();
         const vec2 b = s.fp.b();
@@ -386,14 +392,29 @@ struct beam {
         const vec3 wb = s.geo.t*b.x + s.geo.b*b.y;
         real sid;
         envelope = cone_through_ellipse(wa, wb, s.geo.n, make_ray(s.wp, wo), envelope.tan_alpha, sid);
-
-        // apply the BSDF, from the beam frame through the sp frames to the new beam frame
-        const frame new_frame = envelope.frame();
-        const frame SPin  = sp_frame(s, Sframe.n);
-        const frame SPout = sp_frame(s, wo);
-        S = reorient((M*weight) * reorient(S, Sframe, SPin), SPout, new_frame);
-        Sframe = new_frame;
         self_intersection_distance = sid;
+        apply_bsdf(s, wo, M*weight, backward);
+    }
+
+    /**
+     * @brief `beam_radiometric_data_t::apply_bsdf`: forward, from the beam
+     *        frame through the sp frames to the new beam frame; backward,
+     *        composes `M` to the right of the beam's operator, whose incident
+     *        frame becomes the sp frame of `wo`.
+     */
+    WT_GPU_FN void apply_bsdf(const WT_GPU_THREAD surface& s, vec3 wo, mueller_block M, bool backward) {
+        if (backward) {
+            const frame SPin  = sp_frame(s, wo);
+            const frame SPout = sp_frame(s, Sframe.n);
+            S = row_compose(S, M, Sframe, SPout);
+            Sframe = SPin;
+        } else {
+            const frame new_frame = envelope.frame();
+            const frame SPin  = sp_frame(s, Sframe.n);
+            const frame SPout = sp_frame(s, wo);
+            S = reorient(M * reorient(S, Sframe, SPin), SPout, new_frame);
+            Sframe = new_frame;
+        }
     }
 
     /**

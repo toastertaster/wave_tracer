@@ -54,7 +54,7 @@ struct ball_hit_t {
 };
 
 /**
- * @brief A scene compiled for forward plt_path rendering of one sensor at one
+ * @brief A scene compiled for plt_path rendering of one sensor at one
  *        wavenumber (see wt/gpu/kernel/scene.hpp). The device pointers of
  *        `kernel::plt_scene` are filled in by the backend.
  */
@@ -64,7 +64,7 @@ struct plt_path_scene_t {
     std::vector<kernel::material> materials;
     std::vector<kernel::point_emitter> emitters;
     std::vector<kernel::real> emitter_cdf;
-    kernel::virtual_plane_sensor sensor;
+    kernel::sensor_desc sensor;
     kernel::film_desc film;
     kernel::plt_path_params params;
 };
@@ -87,11 +87,13 @@ public:
     virtual std::uint32_t finish() = 0;
 
     /**
-     * @brief Copies the film to `out`: element (x,y) component c at
-     *        `out[(y*width + x)*components + c]`. Paths in flight have not
+     * @brief Copies the film to `values`: element (x,y) component c at
+     *        `values[(y*width + x)*components + c]`; and, for backward transport,
+     *        the sums of the reconstruction weights splatted with them to
+     *        `weights` (likewise; nullptr skips them). Paths in flight have not
      *        contributed all of their splats yet.
      */
-    virtual void read_film(double* out) = 0;
+    virtual void read_film(double* values, double* weights) = 0;
 };
 
 /**
@@ -120,7 +122,7 @@ public:
                                  std::uint32_t capacity,
                                  ball_hit_t* hits, std::uint32_t* tris) = 0;
 
-    /** @brief Uploads a scene compiled for this geometry, for rendering with forward plt_path. */
+    /** @brief Uploads a scene compiled for this geometry, for rendering with plt_path. */
     [[nodiscard]] virtual std::unique_ptr<backend_renderer_t> create_plt_path_renderer(
             const plt_path_scene_t& scene) = 0;
 };

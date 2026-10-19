@@ -59,10 +59,15 @@ using real = double;
 using real = float;
 #endif
 
-// 32-bit integers on every target (Metal's int/uint are 32-bit).
+// 32-bit integers on every target (Metal's int/uint are 32-bit), and 64-bit ones.
 using i32 = int;
 using u32 = unsigned int;
+#if defined(__METAL_VERSION__)
+using u64 = ulong;
+#else
+using u64 = unsigned long long;
+#endif
 
-static_assert(sizeof(i32)==4 && sizeof(u32)==4);
+static_assert(sizeof(i32)==4 && sizeof(u32)==4 && sizeof(u64)==8);
 
 }

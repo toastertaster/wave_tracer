@@ -17,9 +17,14 @@
  * wt/interaction/polarimetric/{stokes,mueller}.hpp, wt/interaction/fresnel.hpp
  * and wt/math/rotation.hpp.
  *
- * Forward transport only applies Mueller operators of the Fresnel form (see
- * `mueller_operator_t::fresnel`), so `fresnel_mueller` stores just its four
- * distinct elements.
+ * BSDFs here have Mueller operators of a block form (`mueller_block`):
+ * Fresnel interactions (`mueller_operator_t::fresnel`) and depolarizers.
+ *
+ * Forward transport carries a Stokes parameters vector. Backward transport
+ * carries a Mueller operator (`beam_radiometric_data_t<backward>`), composed
+ * with each interaction's to the right; a scalar film observes only its first
+ * row (times its scale), which therefore composes on its own: the GPU keeps
+ * just that row (`row_*` functions).
  */
 
 namespace wt::gpu::kernel {
@@ -56,32 +61,84 @@ WT_GPU_FN stokes reorient(stokes S, frame cur, frame nw) {
 }
 
 /**
- * @brief A Mueller operator of the Fresnel form (`mueller_operator_t::fresnel`):
- *        [[m00,m01,0,0], [m01,m00,0,0], [0,0,m22,m23], [0,0,-m23,m22]].
+ * @brief A Mueller operator of the block form [[m00,m01,0,0], [m01,m11,0,0],
+ *        [0,0,m22,m23], [0,0,-m23,m22]]: Fresnel (`mueller_operator_t::fresnel`,
+ *        m11=m00) or a scaled depolarizer (`perfect_depolarizer`, m00 only).
  */
-struct fresnel_mueller {
-    real m00, m01, m22, m23;
+struct mueller_block {
+    real m00, m01, m11, m22, m23;
 
-    WT_GPU_FN fresnel_mueller operator*(real s) const { return { m00*s, m01*s, m22*s, m23*s }; }
-    WT_GPU_FN fresnel_mueller operator/(real s) const { return { m00/s, m01/s, m22/s, m23/s }; }
+    WT_GPU_FN mueller_block operator*(real s) const { return { m00*s, m01*s, m11*s, m22*s, m23*s }; }
+    WT_GPU_FN mueller_block operator/(real s) const { return { m00/s, m01/s, m11/s, m22/s, m23/s }; }
 
     /** @brief `mueller_operator_t::operator*(stokes)`, frames assumed to match. */
     WT_GPU_FN stokes operator*(stokes S) const {
         return {
             fma(m01, S.s1, m00*S.s0),
-            fma(m00, S.s1, m01*S.s0),
+            fma(m11, S.s1, m01*S.s0),
             fma(m23, S.s3, m22*S.s2),
             fma(m22, S.s3, -m23*S.s2),
         };
     }
+    /** @brief The row vector `r` times this. */
+    WT_GPU_FN stokes row_mul(stokes r) const {
+        return {
+            fma(r.s1, m01, r.s0*m00),
+            fma(r.s1, m11, r.s0*m01),
+            fma(-r.s3, m23, r.s2*m22),
+            fma(r.s3, m22, r.s2*m23),
+        };
+    }
+
+    /** @brief `mueller_operator_t::perfect_depolarizer()` times `d` */
+    WT_GPU_FN static mueller_block depolarizer(real d) { return { d, 0, 0, 0, 0 }; }
 };
 
+/** @brief `frame_t::handness` */
+WT_GPU_FN real handness(frame f) {
+    return dot(cross(f.n, f.t), f.b)>real(0) ? real(1) : real(-1);
+}
+
+/**
+ * @brief The row vector `r` times `mueller_operator_t::rotation(t, (1,0))`,
+ *        whose middle block rotates by twice the angle of `t`.
+ */
+WT_GPU_FN stokes row_rotate(stokes r, vec2 t) {
+    // util::rotation_matrix(t, (1,0)) = [[tx,ty],[-ty,tx]], squared, transposed
+    const real c2 = t.x*t.x - t.y*t.y;
+    const real s2 = 2*t.x*t.y;
+    return { r.s0, fma(r.s2, s2, r.s1*c2), fma(r.s2, c2, -r.s1*s2), r.s3 };
+}
+
+/** @brief `mueller_operator_t::change_incident_frame(old_f, new_f)` of the row vector `r`. */
+WT_GPU_FN stokes row_change_incident_frame(stokes r, frame old_f, frame new_f) {
+    stokes ret = row_rotate(r, vec2{ dot(new_f.t, old_f.t), dot(new_f.t, old_f.b) });
+    // R = rotation * handness_flip
+    if (handness(old_f)!=handness(new_f)) {
+        ret.s2 = -ret.s2;
+        ret.s3 = -ret.s3;
+    }
+    return ret;
+}
+
+/** @brief `compose(M1, M2, M1in, M2out)` of the row vector `r` (M1's first row). */
+WT_GPU_FN stokes row_compose(stokes r, mueller_block M2, frame M1in, frame M2out) {
+    // R = handness_flip * rotation
+    if (handness(M1in)!=handness(M2out)) {
+        r.s2 = -r.s2;
+        r.s3 = -r.s3;
+    }
+    r = row_rotate(r, vec2{ dot(M2out.t, M1in.t), dot(M2out.t, M1in.b) });
+    return M2.row_mul(r);
+}
+
 /** @brief `mueller_operator_t::fresnel(fs, fp)` */
-WT_GPU_FN fresnel_mueller mueller_fresnel(complex fs, complex fp) {
+WT_GPU_FN mueller_block mueller_fresnel(complex fs, complex fp) {
     const real Rs = norm(fs);
     const real Rp = norm(fp);
     const complex x = fp*conj(fs);
-    return { (Rs+Rp)/2, (Rs-Rp)/2, x.re, x.im };
+    const real m00 = (Rs+Rp)/2;
+    return { m00, (Rs-Rp)/2, m00, x.re, x.im };
 }
 
 /** @brief `fresnel_ret_t`. The CPU's complex `eta_12` and `rs,rp,ts,tp` are real here (see `fresnel`). */
@@ -143,7 +200,7 @@ WT_GPU_FN void fresnel_reflection(complex eta_12, vec3 w,
 }
 
 /** @brief `mueller_operator_t::fresnel(eta_12, reflection, w)` */
-WT_GPU_FN fresnel_mueller mueller_fresnel(complex eta_12, bool reflection, vec3 w) {
+WT_GPU_FN mueller_block mueller_fresnel(complex eta_12, bool reflection, vec3 w) {
     if (reflection) {
         complex rs, rp;
         fresnel_reflection(eta_12, w, rs, rp);

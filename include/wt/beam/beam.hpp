@@ -197,13 +197,23 @@ struct beam_radiometric_data_t<transport_e::backward, Q> {
         };
     }
 
+    /**
+     * @brief Adds another beam's operator: both are scaled by their beams' scales, so `o`'s is added relative
+     *        to this one's.
+     */
     inline auto& operator+=(const beam_radiometric_data_t& o) noexcept {
-        M += o.M.change_incident_frame(o.frame, frame);
+        const auto oM = o.M.change_incident_frame(o.frame, frame);
+        if (scale==zero) {
+            M = oM;
+            scale = o.scale;
+        } else {
+            M += f_t(u::to_num(o.scale / scale)) * oM;
+        }
         return *this;
     }
     inline auto operator+(const beam_radiometric_data_t& o) const noexcept {
         auto ret = *this;
-        ret.M += o.M.change_incident_frame(o.frame, frame);
+        ret += o;
         return ret;
     }
 

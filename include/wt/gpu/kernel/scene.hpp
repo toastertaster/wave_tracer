@@ -18,7 +18,8 @@
  * The host compiles a wave_tracer scene into these plain structs for one
  * rendered wavenumber (src/gpu/renderer.cpp): spectra, BSDFs, emitters and the
  * sensor are evaluated at that wavenumber, and anything the GPU does not
- * implement is rejected there with an explanation. All lengths are in metres.
+ * implement is rejected there with an explanation. All lengths are in metres,
+ * radiometric quantities in SI units.
  */
 
 namespace wt::gpu::kernel {
@@ -50,14 +51,20 @@ struct edge {
 constexpr u32 material_absorbing = 0;
 /** @brief `surface_spm_t` with a Dirac surface profile: specular reflection and refraction. */
 constexpr u32 material_specular = 1;
+/** @brief `diffuse_t` with a constant reflectance: Lambertian reflection. */
+constexpr u32 material_diffuse = 2;
 
 struct material {
     u32 type;
     u32 two_sided;              // wrapped in `two_sided_t`
+    real scale;                 // product of the `scale_t` wrappers' (constant) scales
+    // specular
     u32 has_transmission;       // `IOR_has_transmission(eta)` of src/bsdf/surface_spm.cpp
     complex eta;                // `surface_spm_t::IOR(k)`: exterior over interior refractive index
     real reflection_scale;      // `surface_spm_t::reflectivity_scale(k)`
     real transmission_scale;    // `surface_spm_t::transmissivity_scale(k)`
+    // diffuse
+    real reflectance;           // `diffuse_t`'s reflectance, clamped to [0,1]
 };
 
 /** @brief An `emitter::point_t`. */
@@ -67,23 +74,49 @@ struct point_emitter {
     real tan_alpha;
     real x0;
     /**
-     * @brief Watts per unit of a beam's relative Stokes parameters: the
-     *        sampled beam's flux (`point_t::sample`) divided by the spectral
-     *        sampling density (`scene_t::sum_spectral_pdf_for_all_emitters`).
+     * @brief Forward transport: Watts per unit of a beam's relative Stokes
+     *        parameters: the sampled beam's flux (`point_t::sample`) divided by
+     *        the spectral sampling density (`scene_t::sum_spectral_pdf_for_all_emitters`).
      */
     real flux;
+    /**
+     * @brief Backward transport: the radiant intensity (W/sr), the spectral
+     *        radiant intensity divided by the spectral sampling density of
+     *        `plt_path::integrate_backward`.
+     */
+    real intensity;
+    real pmf;           // probability of sampling this emitter (`scene_t::pdf_emitter`)
 };
 
-/** @brief A `sensor::virtual_plane_sensor_t`. */
-struct virtual_plane_sensor {
+constexpr u32 sensor_virtual_plane = 0;
+constexpr u32 sensor_perspective = 1;
+
+/**
+ * @brief A `sensor::virtual_plane_sensor_t` (`type` sensor_virtual_plane), or
+ *        a `sensor::perspective_t` (sensor_perspective; backward transport only).
+ */
+struct sensor_desc {
+    u32 type;
+    // beams the sensor sources (backward transport): isotropic cones (`sourcing_geometry`)
+    real tan_alpha;
+    real x0;
+
+    // virtual plane
     vec3 origin;                // corner of element (0,0)
     frame f;                    // t,b span the plane; n is its front
     vec3 quad[4];               // the corners `Si` intersects: a, b, c, d
     vec2 extent;
     vec2 element_extent;
     vec2 recp_element_extent;
+    real area;
     real recp_area;
     real importance;            // `virtual_plane_sensor_t::importance()`
+
+    // perspective
+    vec3 position;
+    real to_camera[16];         // `sensor_to_camera_trns`, row-major: film position to camera-space point
+    real dir_to_world[9];       // `sensor_transform`'s inverse transpose, row-major: directions to world
+    vec3 ddir_dx, ddir_dy;      // `direction_pdvx/y()`
 };
 
 /** @brief Largest supported film reconstruction filter radius, in elements. */
@@ -104,10 +137,11 @@ struct plt_path_params {
     u32 russian_roulette;
     u32 fsd;
     u32 ray_tracing_only;       // `sensor_t::ray_trace_only()`
+    u32 backward;               // transport direction: paths start at the sensor
     real k;                     // rendered wavenumber (1/m)
 };
 
-/** @brief Everything a forward plt_path kernel reads. */
+/** @brief Everything a plt_path kernel reads. */
 struct plt_scene {
     bvh_view bvh;
     const WT_GPU_GLOBAL tri_shading* tris;
@@ -118,7 +152,7 @@ struct plt_scene {
     const WT_GPU_GLOBAL real* emitter_cdf;     // inclusive CDF of the emitter sampling distribution
     u32 emitter_count;
 
-    virtual_plane_sensor sensor;
+    sensor_desc sensor;
     film_desc film;
     plt_path_params params;
 };

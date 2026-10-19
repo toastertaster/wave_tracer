@@ -16,12 +16,15 @@
  * GPU rendering implements a subset of wave_tracer; scenes outside it fail
  * with a `gpu_error_t` that names the unsupported feature, rather than
  * silently rendering on the CPU. Supported so far:
- *   - the plt_path integrator, forward transport (beams, free-space
- *     diffraction, or ray tracing);
- *   - virtual_plane (coverage) sensors sensitive to a single wavelength;
+ *   - the plt_path integrator, forward and backward transport (beams,
+ *     free-space diffraction, or ray tracing);
+ *   - sensors sensitive to a single wavelength: virtual_plane (coverage)
+ *     sensors, and, with backward transport, non-polarimetric perspective
+ *     sensors;
  *   - point emitters;
- *   - surface_spm BSDFs with a Dirac surface profile (specular), optionally
- *     wrapped in twosided and composite BSDFs;
+ *   - surface_spm BSDFs with a Dirac surface profile (specular), and diffuse
+ *     BSDFs with a constant reflectance, optionally wrapped in twosided,
+ *     composite and (constant) scale BSDFs;
  *   - the bvh8w acceleration structure.
  */
 
@@ -64,8 +67,9 @@ public:
     renderer_t& operator=(const renderer_t&) = delete;
 
     /**
-     * @brief Paths per sample per element: forward transport traces as many
-     *        paths per sample as the sensor has elements, as the CPU does.
+     * @brief Paths per sample per element: as many paths per sample as the
+     *        sensor has elements, as the CPU traces (backward, a path from
+     *        each element; forward, as many paths from the emitters).
      */
     [[nodiscard]] std::uint64_t paths_per_sample() const noexcept { return paths_per_spe; }
 
@@ -82,8 +86,9 @@ public:
 
     /**
      * @brief Writes the accumulated samples into `film`, a film storage the
-     *        sensor created for direct splats (as forward integrators write).
-     *        Paths in flight are missing (see `render`).
+     *        sensor created for the integrator's splats: block splats
+     *        (backward transport) or direct splats (forward). Paths in flight
+     *        are missing (see `render`).
      */
     void write_film(sensor::film_storage_handle_t& film) const;
 
@@ -91,6 +96,7 @@ private:
     std::unique_ptr<geometry_t> geometry;
     std::unique_ptr<backend_renderer_t> backend;
 
+    bool backward;
     std::uint64_t paths_per_spe;
     std::size_t film_values;
     bool warned_iteration_limit = false;

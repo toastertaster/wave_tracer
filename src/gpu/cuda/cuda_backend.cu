@@ -85,7 +85,7 @@ __global__ void intersect_balls_kernel(k::bvh_view bvh, const k::ball* queries, 
 
 
 /*
- * Forward plt_path
+ * plt_path
  */
 
 /** @brief Geometry queries for the path tracer: the CUDA BVH traversals. */
@@ -104,12 +104,16 @@ struct cuda_bvh_geometry_t {
     }
 };
 
-/** @brief The film, accumulated in double precision. */
+/** @brief The film, and its reconstruction weights (backward transport), accumulated in double precision. */
 struct cuda_film_t {
-    double* data;
+    double* values;
+    double* weights;
 
     __device__ void add(k::u32 i, k::real v) {
-        atomicAdd(data+i, double(v));
+        atomicAdd(values+i, double(v));
+    }
+    __device__ void add_weight(k::u32 i, k::real w) {
+        atomicAdd(weights+i, double(w));
     }
 };
 
@@ -125,7 +129,7 @@ struct path_entry_t {
  *        Unused slots are on a stack, `free_slots`.
  */
 struct path_pool_t {
-    k::forward_path* paths;
+    k::path_state* paths;
     k::traversal_t* traversals;     // of the step in progress
     k::u32* trace_results;          // of the step in progress: status flags, and `trace_found`
     k::u32* free_slots;
@@ -196,30 +200,41 @@ __global__ void start_paths_kernel(k::plt_scene scene, std::uint64_t base, k::u3
     const path_entry_t e = list ? list[base+i] : path_entry_t{ base+i, 0, seed };
     const k::u32 slot = pool.free_slots[free_top-1-i];
     const auto rnd = k::rng::for_path(e.seed, k::u32(e.path), k::u32(e.path>>32));
-    store_vectors(pool.paths+slot, k::start_forward_path(scene, rnd, e.skip));
+    store_vectors(pool.paths+slot, k::start_path(scene, rnd, e.path, e.skip));
     queue[queued+i] = slot;
 }
 
 /**
- * @brief Ends or requeues a path after a step: paths that go on are queued in
- *        `next_queue`; those that end free their slots, pushed above the
- *        `free_top` free ones. Paths that outgrew their scratch memory end and
- *        are listed in `overflow`.
+ * @brief Ends a path, or lists it in `overflow` if it outgrew its scratch
+ *        memory (to be re-traced; `end_path` would splat what it has not finished).
  */
-__device__ void finish_step(const path_pool_t& pool, k::u32 slot, const k::forward_path& p, bool goes_on,
-                            k::u32 s, k::u32* next_queue, k::u32 free_top, step_counters_t* counters,
-                            path_entry_t* overflow, std::uint32_t* status) {
+__device__ void end_path(const k::plt_scene& scene, cuda_film_t& film, k::path_state& p, k::u32& s,
+                         step_counters_t* counters, path_entry_t* overflow) {
     if (s & k::status_scratch_overflow) {
         // the path's generator says which path it is
         const std::uint64_t path = p.rnd.path_lo | std::uint64_t(p.rnd.path_hi)<<32;
         overflow[atomicAdd(&counters->overflowed, 1u)] = { path, p.splats, p.rnd.seed };
         s &= ~k::status_scratch_overflow;
-        goes_on = false;
+    } else {
+        k::end_path(scene, film, p);
     }
+}
+
+/**
+ * @brief Ends or requeues a path after a step: paths that go on are queued in
+ *        `next_queue`; those that end (`end_path`) free their slots, pushed
+ *        above the `free_top` free ones.
+ */
+__device__ void finish_step(const k::plt_scene& scene, cuda_film_t& film, const path_pool_t& pool, k::u32 slot,
+                            k::path_state& p, bool goes_on, k::u32 s, k::u32* next_queue, k::u32 free_top,
+                            step_counters_t* counters, path_entry_t* overflow, std::uint32_t* status) {
+    if (s & k::status_scratch_overflow)
+        goes_on = false;
     if (goes_on) {
         store_vectors(pool.paths+slot, p);
         next_queue[atomicAdd(&counters->queued, 1u)] = slot;
     } else {
+        end_path(scene, film, p, s, counters, overflow);
         pool.free_slots[free_top + atomicAdd(&counters->freed, 1u)] = slot;
     }
     if (s!=k::status_ok)
@@ -236,7 +251,7 @@ __global__ void trace_paths_kernel(k::plt_scene scene, path_pool_t pool, const k
     if (i>=count) return;
 
     const k::u32 slot = queue[i];
-    const k::forward_path p = load_vectors(pool.paths+slot);
+    const k::path_state p = load_vectors(pool.paths+slot);
     const cuda_bvh_geometry_t geometry = { scene.bvh };
 
     k::traversal_t tr;
@@ -250,24 +265,23 @@ __global__ void trace_paths_kernel(k::plt_scene scene, path_pool_t pool, const k
 /** @brief Second part of a step of the `count` queued paths (`interact`), after `trace_paths_kernel`. */
 __global__ void __launch_bounds__(block_size, 4) interact_paths_kernel(k::plt_scene scene, path_pool_t pool,
                                         const k::u32* queue, k::u32 count,
-                                        double* film, k::u32* next_queue, k::u32 free_top,
+                                        cuda_film_t film, k::u32* next_queue, k::u32 free_top,
                                         step_counters_t* counters, path_entry_t* overflow,
                                         std::uint32_t* status) {
     const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i>=count) return;
 
     const k::u32 slot = queue[i];
-    k::forward_path p = load_vectors(pool.paths+slot);
+    k::path_state p = load_vectors(pool.paths+slot);
     const k::u32 traced = pool.trace_results[slot];
     k::u32 s = traced & ~trace_found;
     bool goes_on = false;
     if (traced & trace_found) {
         const k::traversal_t tr = load_vectors(pool.traversals+slot);
         const cuda_bvh_geometry_t geometry = { scene.bvh };
-        cuda_film_t f = { film };
-        goes_on = k::interact(scene, geometry, f, pool.scratch(slot), tr, p, s);
+        goes_on = k::interact(scene, geometry, film, pool.scratch(slot), tr, p, s);
     }
-    finish_step(pool, slot, p, goes_on, s, next_queue, free_top, counters, overflow, status);
+    finish_step(scene, film, pool, slot, p, goes_on, s, next_queue, free_top, counters, overflow, status);
 }
 
 /**
@@ -277,22 +291,21 @@ __global__ void __launch_bounds__(block_size, 4) interact_paths_kernel(k::plt_sc
  */
 __global__ void __launch_bounds__(block_size, 4) step_paths_kernel(k::plt_scene scene, path_pool_t pool,
                                         const k::u32* queue, k::u32 count, k::u32 max_steps,
-                                        double* film, k::u32* next_queue, k::u32 free_top,
+                                        cuda_film_t film, k::u32* next_queue, k::u32 free_top,
                                         step_counters_t* counters, path_entry_t* overflow,
                                         std::uint32_t* status) {
     const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i>=count) return;
 
     const k::u32 slot = queue[i];
-    k::forward_path p = load_vectors(pool.paths+slot);
+    k::path_state p = load_vectors(pool.paths+slot);
     const cuda_bvh_geometry_t geometry = { scene.bvh };
-    cuda_film_t f = { film };
 
     k::u32 s = k::status_ok;
     bool goes_on = true;
     for (k::u32 n=0; n<max_steps && goes_on; ++n)
-        goes_on = k::step_forward_path(scene, geometry, f, pool.scratch(slot), p, s);
-    finish_step(pool, slot, p, goes_on, s, next_queue, free_top, counters, overflow, status);
+        goes_on = k::step_path(scene, geometry, film, pool.scratch(slot), p, s);
+    finish_step(scene, film, pool, slot, p, goes_on, s, next_queue, free_top, counters, overflow, status);
 }
 
 /**
@@ -303,36 +316,32 @@ __global__ void __launch_bounds__(block_size, 4) step_paths_kernel(k::plt_scene 
  */
 __global__ void __launch_bounds__(block_size, 3) run_paths_kernel(k::plt_scene scene, path_pool_t pool,
                                         std::uint64_t base, k::u32 count, const path_entry_t* list,
-                                        std::uint32_t seed, double* film, step_counters_t* counters,
+                                        std::uint32_t seed, cuda_film_t film, step_counters_t* counters,
                                         path_entry_t* overflow, std::uint32_t* status) {
     const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i>=count) return;
 
     const path_entry_t e = list ? list[base+i] : path_entry_t{ base+i, 0, seed };
-    k::forward_path p = k::start_forward_path(scene, k::rng::for_path(e.seed, k::u32(e.path), k::u32(e.path>>32)),
-                                              e.skip);
+    k::path_state p = k::start_path(scene, k::rng::for_path(e.seed, k::u32(e.path), k::u32(e.path>>32)),
+                                    e.path, e.skip);
     const cuda_bvh_geometry_t geometry = { scene.bvh };
-    cuda_film_t f = { film };
 
     k::u32 s = k::status_ok;
-    while (k::step_forward_path(scene, geometry, f, pool.scratch(i), p, s)) {}
+    while (k::step_path(scene, geometry, film, pool.scratch(i), p, s)) {}
 
-    if (s & k::status_scratch_overflow) {
-        overflow[atomicAdd(&counters->overflowed, 1u)] = { e.path, p.splats, e.seed };
-        s &= ~k::status_scratch_overflow;
-    }
+    end_path(scene, film, p, s, counters, overflow);
     if (s!=k::status_ok)
         atomicOr(status, s);
 }
 
 /**
- * @brief Forward plt_path on the GPU, as a wavefront: a pool of paths in
- *        flight, advanced a step at a time, so that warps run paths still
- *        going (most paths end after a step or two), with the traversals in a
- *        kernel of their own. Ended paths' slots are refilled with new paths.
- *        Paths in flight carry over from one `trace` to the next, so that the
- *        GPU does not idle while a pass's last, longest, paths finish.
- *        Ray-traced paths, whose steps are cheap, run whole, one per thread.
+ * @brief plt_path on the GPU, as a wavefront: a pool of paths in flight,
+ *        advanced a step at a time, so that warps run paths still going (most
+ *        paths end after a step or two), with the traversals in a kernel of
+ *        their own. Ended paths' slots are refilled with new paths. Paths in
+ *        flight carry over from one `trace` to the next, so that the GPU does
+ *        not idle while a pass's last, longest, paths finish. Ray-traced
+ *        paths, whose steps are cheap, run whole, one per thread.
  */
 class cuda_plt_path_renderer_t final : public backend_renderer_t {
 public:
@@ -349,6 +358,10 @@ public:
         film_size = std::size_t(scene.film.width) * scene.film.height * scene.film.components;
         film.resize(film_size);
         check(cudaMemset(film.get(), 0, film_size*sizeof(double)), "clearing the film");
+        if (scene.params.backward!=0) {
+            film_weights.resize(film_size);
+            check(cudaMemset(film_weights.get(), 0, film_size*sizeof(double)), "clearing the film");
+        }
         const std::uint32_t zero = 0;
         status_word.upload(&zero, 1);
         counters.resize(1);
@@ -405,9 +418,14 @@ public:
         return read_status();
     }
 
-    void read_film(double* out) override {
+    void read_film(double* values, double* weights) override {
         set_device(ordinal);
-        film.download(out, film_size);
+        film.download(values, film_size);
+        if (weights) {
+            if (params.params.backward==0)
+                throw std::logic_error("forward transport accumulates no film weights");
+            film_weights.download(weights, film_size);
+        }
     }
 
 private:
@@ -461,6 +479,10 @@ private:
         };
     }
 
+    [[nodiscard]] cuda_film_t film_view() const noexcept {
+        return { film.get(), film_weights.get() };
+    }
+
     /**
      * @brief Starts `source`'s paths (with `seed`) and steps the paths in
      *        flight, until all started and at most `keep` remain in flight.
@@ -475,7 +497,7 @@ private:
                 check(cudaMemset(counters.get(), 0, sizeof(step_counters_t)), "clearing the step counters");
                 run_paths_kernel<<<grid_size(n), block_size>>>(
                         params, pool, source.list ? source.started : source.first+source.started, n, source.list,
-                        seed, film.get(), counters.get(), overflow.get(), status_word.get());
+                        seed, film_view(), counters.get(), overflow.get(), status_word.get());
                 check(cudaGetLastError(), "launching the path kernel");
                 source.started += n;
                 collect_overflowed();
@@ -504,14 +526,14 @@ private:
             auto* next_queue = queues[1-wf.q].get();
             if (all_started && wf.queued<=tail_size) {
                 step_paths_kernel<<<grid_size(wf.queued), block_size>>>(
-                        params, pool, queue, wf.queued, k::max_path_iterations+1, film.get(),
+                        params, pool, queue, wf.queued, k::max_path_iterations+1, film_view(),
                         next_queue, wf.free_top, counters.get(), overflow.get(), status_word.get());
                 check(cudaGetLastError(), "launching the path step kernel");
             } else {
                 trace_paths_kernel<<<grid_size(wf.queued), block_size>>>(params, pool, queue, wf.queued);
                 check(cudaGetLastError(), "launching the path tracing kernel");
                 interact_paths_kernel<<<grid_size(wf.queued), block_size>>>(
-                        params, pool, queue, wf.queued, film.get(),
+                        params, pool, queue, wf.queued, film_view(),
                         next_queue, wf.free_top, counters.get(), overflow.get(), status_word.get());
                 check(cudaGetLastError(), "launching the path interaction kernel");
             }
@@ -550,12 +572,13 @@ private:
     device_buffer_t<k::point_emitter> emitters;
     device_buffer_t<k::real>          emitter_cdf;
     device_buffer_t<double>           film;
+    device_buffer_t<double>           film_weights;     // backward transport
     std::size_t film_size = 0;
     device_buffer_t<std::uint32_t>    status_word;
 
     // the path pool (`main`, or a pool re-tracing overflowed paths)
     wavefront_t main;
-    device_buffer_t<k::forward_path>   paths;
+    device_buffer_t<k::path_state>     paths;
     device_buffer_t<k::traversal_t>    traversals;
     device_buffer_t<k::u32>            trace_results;
     device_buffer_t<k::u32>            free_slots;
