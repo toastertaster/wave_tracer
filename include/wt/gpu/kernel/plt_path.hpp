@@ -51,7 +51,11 @@ constexpr u32 status_iteration_limit = 4;
  */
 constexpr u32 max_path_iterations = 1u<<14;
 
-/** @brief A path's scratch memory. */
+/**
+ * @brief A path's scratch memory: `tri_capacity` triangles, `edge_capacity`
+ *        aperture entries, and `edges` of 3*`tri_capacity` entries (the
+ *        edges of as many triangles, before duplicates are dropped).
+ */
 struct path_scratch {
     WT_GPU_GLOBAL u32* tris;
     WT_GPU_GLOBAL u32* edges;
@@ -286,7 +290,8 @@ struct alignas(16) traversal_t {
     // ballistic: the triangle hit
     u32 tri;
     real baryx, baryy;
-    // diffusive: the triangles, in the scratch memory
+    // the triangles in the scratch memory: diffusive, those intersected;
+    // ballistic, those around the intersection (see `trace_step`)
     u32 tri_count;
 };
 
@@ -401,36 +406,45 @@ WT_GPU_FN primary_t find_closest_triangle(const WT_GPU_THREAD plt_scene& scene,
     return ret;
 }
 
+/** @brief Sorts `v[0..n-1]` ascending (Shell sort, with Ciura's gaps extended by 2.25×). */
+WT_GPU_FN void shell_sort(WT_GPU_GLOBAL u32* v, u32 n) {
+    const u32 gaps[] = { 79749, 35444, 15753, 7001, 3112, 1383, 701, 301, 132, 57, 23, 10, 4, 1 };
+    for (const u32 gap : gaps) {
+        for (u32 i=gap; i<n; ++i) {
+            const u32 x = v[i];
+            u32 j = i;
+            for (; j>=gap && v[j-gap]>x; j-=gap)
+                v[j] = v[j-gap];
+            v[j] = x;
+        }
+    }
+}
+
 /**
  * @brief The edges of `tris` (`cone_work_to_intersection_record`), sorted and
- *        unique as the CPU's set. Returns false if they do not fit.
+ *        unique as the CPU's set, into `edges` (which holds 3*`tri_count`
+ *        entries). Returns false if more than `capacity` remain.
+ *        (Collecting all and sorting once is much faster than inserting each
+ *        into a sorted list.)
  */
 WT_GPU_FN bool collect_edges(const WT_GPU_THREAD plt_scene& scene,
                              const WT_GPU_GLOBAL u32* tris, u32 tri_count,
                              WT_GPU_GLOBAL u32* edges, u32 capacity, WT_GPU_THREAD u32& count) {
-    count = 0;
+    u32 n = 0;
     for (u32 i=0; i<tri_count; ++i) {
         const tri_shading sh = scene.tris[tris[i]];
-        for (int j=0; j<3; ++j) {
-            const u32 e = sh.edges[j];
-            if (e==no_edge) continue;
-
-            // insert into the sorted list
-            u32 lo = 0, hi = count;
-            while (lo<hi) {
-                const u32 mid = (lo+hi)/2;
-                if (edges[mid]<e) lo = mid+1;
-                else hi = mid;
-            }
-            if (lo<count && edges[lo]==e) continue;
-            if (count==capacity) return false;
-            for (u32 k=count; k>lo; --k)
-                edges[k] = edges[k-1];
-            edges[lo] = e;
-            ++count;
-        }
+        for (int j=0; j<3; ++j)
+            if (sh.edges[j]!=no_edge)
+                edges[n++] = sh.edges[j];
     }
-    return true;
+    shell_sort(edges, n);
+
+    // drop duplicates
+    count = 0;
+    for (u32 i=0; i<n; ++i)
+        if (count==0 || edges[i]!=edges[count-1])
+            edges[count++] = edges[i];
+    return count<=capacity;
 }
 
 
@@ -609,10 +623,12 @@ WT_GPU_FN forward_path start_forward_path(const WT_GPU_THREAD plt_scene& scene, 
 }
 
 /**
- * @brief A path step's first part: traces the beam to its next interaction
- *        (into `tr`, its triangles into the scratch memory). Returns whether
- *        the path goes on (it found an interaction); adds status flags to
- *        `status`. `interact` continues the step.
+ * @brief A path step's first part, its BVH queries: traces the beam to its
+ *        next interaction (into `tr`), and finds the triangles around a
+ *        ballistic intersection, whose edges may diffract the beam (into the
+ *        scratch memory). Returns whether the path goes on (it found an
+ *        interaction); adds status flags to `status`. `interact` continues the
+ *        step.
  */
 template <typename Geometry>
 WT_GPU_FN bool trace_step(const WT_GPU_THREAD plt_scene& scene,
@@ -629,12 +645,28 @@ WT_GPU_FN bool trace_step(const WT_GPU_THREAD plt_scene& scene,
         return false;
     }
 
-    cone envelope = p.b.envelope;
+    const bool ray_trace = opts.ray_tracing_only!=0;
+    const WT_GPU_THREAD beam& b = p.b;
+    cone envelope = b.envelope;
     envelope.r.o = offseted_ray_origin(scene, p.prev_geo, envelope.r);
-    tr = traverse(geometry, envelope, two_pi/opts.k, opts.ray_tracing_only!=0, scratch, status);
-    if (status & status_scratch_overflow)
+    tr = traverse(geometry, envelope, two_pi/opts.k, ray_trace, scratch, status);
+    if ((status & status_scratch_overflow) || !tr.hit)
         return false;
-    return tr.hit;
+
+    // the triangles around a ballistic intersection (diffusive traversals found theirs)
+    if (tr.ballistic && !b.is_ray() && !ray_trace) {
+        const real dist = tr.dist;
+        const real zdist = b.envelope.axes(dist).x * 2;
+        tri_sink sink = { scratch.tris, scratch.tri_capacity, 0 };
+        const cone_hit ch = geometry.intersect_cone(b.envelope, range{ dist - zdist/2, dist + zdist/2 }, 1, sink);
+        status |= ch.status;
+        if (ch.tri_count>scratch.tri_capacity) {
+            status |= status_scratch_overflow;
+            return false;
+        }
+        tr.tri_count = ch.tri_count;
+    }
+    return true;
 }
 
 /**
@@ -711,20 +743,9 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
         s.fp = b.surface_footprint_static(s.geo, dist_to_interaction);
     }
 
-    // edges: around a ballistic intersection, or those of the diffusive intersection's triangles
+    // edges: of the triangles around a ballistic intersection, or of the diffusive intersection's
     u32 edge_count = 0;
-    if (is_ballistic && !b.is_ray() && !ray_trace) {
-        const real zdist = b.envelope.axes(dist_to_interaction).x * 2;
-        tri_sink sink = { scratch.tris, scratch.tri_capacity, 0 };
-        const cone_hit ch = geometry.intersect_cone(
-                b.envelope, range{ dist_to_interaction - zdist/2, dist_to_interaction + zdist/2 }, 1, sink);
-        status |= ch.status;
-        if (ch.tri_count>scratch.tri_capacity ||
-            !collect_edges(scene, scratch.tris, ch.tri_count, scratch.edges, scratch.edge_capacity, edge_count)) {
-            status |= status_scratch_overflow;
-            return false;
-        }
-    } else if (!is_ballistic && opts.fsd!=0) {
+    if ((is_ballistic && !b.is_ray() && !ray_trace) || (!is_ballistic && opts.fsd!=0)) {
         if (!collect_edges(scene, scratch.tris, tr.tri_count, scratch.edges, scratch.edge_capacity, edge_count)) {
             status |= status_scratch_overflow;
             return false;

@@ -32,7 +32,6 @@ namespace wt::gpu {
 /** @brief The BVH, as uploaded to a device. The root is node 0. */
 struct bvh_arrays_t {
     std::vector<kernel::bvh_node> nodes;
-    std::vector<kernel::bvh_leaf> leaves;
     std::vector<kernel::bvh_tri>  tris;
 };
 

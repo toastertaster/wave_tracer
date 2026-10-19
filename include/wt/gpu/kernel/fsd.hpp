@@ -179,36 +179,51 @@ WT_GPU_FN bool diffraction_point_dir(const WT_GPU_THREAD wedge& w, vec3 src, vec
  * UTD
  */
 
-#if defined(__METAL_VERSION__)
-using erf_real = float;     // TODO: Metal has no 64-bit floating point; this loses accuracy
-#else
-using erf_real = double;
-#endif
-
 /**
- * @brief erfc(z) for |z|<3, by the Taylor series of erf. Its terms cancel to
- *        three orders of magnitude, so it sums in double precision. (The CPU
- *        uses libcerf.)
+ * @brief The Faddeeva function w(z) = exp(-z²) erfc(-iz), for Im z>=0, by
+ *        Weideman's rational approximation ("Computation of the complex error
+ *        function", SIAM J. Numer. Anal. 31, 1994) with N=16 terms (N=32 with
+ *        64-bit `real`): relative error below 2e-7 (4e-14) where `utd_F` uses
+ *        it. Unlike erf's Taylor series, its terms do not cancel, so it is
+ *        accurate in single precision. (The CPU uses libcerf.)
  */
-WT_GPU_FN complex erfc_small(complex zf) {
-    const erf_real zr = zf.re, zi = zf.im;
-    // -z²
-    const erf_real mz2r = zi*zi - zr*zr, mz2i = -2*zr*zi;
+WT_GPU_FN complex faddeeva_w(complex z) {
+#if defined(WT_GPU_DBL_PRECISION)
+    const real L = real(4.7568284600108841);
+    const real a[] = {
+        real(-1.3025521217935973e-12), real(3.7394878860119718e-12), real(8.0338825869663566e-12),
+        real(-2.1542198580526417e-11), real(-5.5438313661948513e-11), real(1.1658270182568486e-10),
+        real(4.1537828038284985e-10), real(-5.2310059756033311e-10), real(-3.2080143402835049e-09),
+        real(8.1249405814443065e-10), real(2.3797564793759385e-08), real(2.2930441309632066e-08),
+        real(-1.4813078776099164e-07), real(-4.1840763650990986e-07), real(4.2558331246611569e-07),
+        real(4.4015317307161128e-06), real(6.8210319430633826e-06), real(-2.1409619203438535e-05),
+        real(-0.00013075449254629223), real(-0.00024532980270344784), real(0.00039259136069980105),
+        real(0.0045195411053481349), real(0.019006155784844603), real(0.057304403529835582),
+        real(0.14060716226893638), real(0.29544451071508593), real(0.54601397206393254),
+        real(0.90192548936479922), real(1.3455441692345438), real(1.825669629632481),
+        real(2.2635372999002663), real(2.5722534081245687),
+    };
+#else
+    const real L = real(3.363585661014858);
+    const real a[] = {
+        real(9.939322541158483e-07), real(3.9812875769242029e-06), real(-5.5842334096278812e-06),
+        real(-2.7346404625247511e-05), real(2.1709867932803717e-05), real(0.00021071056396561316),
+        real(8.7031584284871788e-05), real(-0.0015276597401226166), real(-0.0038810151890231043),
+        real(0.003682567317091906), real(0.05182240243160996), real(0.19124172674669423),
+        real(0.46929090090360304), real(0.88644783020505402), real(1.3622408222719586),
+        real(1.7483958860819619),
+    };
+#endif
+    constexpr real inv_sqrt_pi = real(0.56418958354775628695);
 
-    // erf(z) = 2/√π Σ z (-z²)^n / (n! (2n+1))
-    erf_real tr = zr, ti = zi;      // z (-z²)^n / n!
-    erf_real sr = zr, si = zi;
-    for (int n=1; n<64; ++n) {
-        const erf_real nr = (tr*mz2r - ti*mz2i) / n;
-        const erf_real ni = (tr*mz2i + ti*mz2r) / n;
-        tr = nr; ti = ni;
-        const erf_real k = erf_real(1)/(2*n+1);
-        sr += tr*k; si += ti*k;
-        if (tr*tr+ti*ti < erf_real(1e-34)*(sr*sr+si*si))
-            break;
-    }
-    const erf_real two_over_sqrt_pi = erf_real(1.12837916709551257390);
-    return { real(1 - two_over_sqrt_pi*sr), real(-two_over_sqrt_pi*si) };
+    // Z = (L+iz)/(L-iz) lies in the unit disc; w = 2p(Z)/(L-iz)² + 1/(√π (L-iz))
+    const complex iz = { -z.im, z.re };
+    const complex rden = complex{ 1,0 } / (complex{ L,0 } - iz);
+    const complex Z = (complex{ L,0 } + iz) * rden;
+    complex p = { 0,0 };
+    for (const real c : a)
+        p = p*Z + complex{ c,0 };
+    return (2*p*rden + complex{ inv_sqrt_pi,0 }) * rden;
 }
 
 /** @brief `utd::UTDa<sgn>` */
@@ -223,9 +238,10 @@ WT_GPU_FN complex utd_F(real x) {
 
     complex result;
     if (absx<6) {
+        // exp(i|x|) erfc(exp(iπ/4)√|x|) = w(exp(i3π/4)√|x|)
         const real sqrt_x = sqrt(absx);
-        const complex cerf = erfc_small(expi(pi_4) * sqrt_x);
-        result = complex{ 1,1 } * (sqrt_pi_2 * sqrt_x) * expi(absx) * cerf;
+        const complex w = faddeeva_w(complex{ -inv_sqrt_two*sqrt_x, inv_sqrt_two*sqrt_x });
+        result = complex{ 1,1 } * (sqrt_pi_2 * sqrt_x) * w;
     } else {
         // fast approximation for large values
         const real r = 1/(2*absx);

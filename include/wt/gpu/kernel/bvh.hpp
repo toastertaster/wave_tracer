@@ -13,12 +13,14 @@
 
 /*
  * GPU copy of wave_tracer's 8-wide BVH (wt::ads::bvh8w_t) and its traversals,
- * ported from src/ads/bvh8w.cpp: same node layout and pointer encoding, same
- * visiting order (children sorted by entry distance), the same search-range
- * shrinking for cones and the same small-subtree shortcuts, so a query returns
- * what the CPU returns (up to floating-point rounding).
+ * ported from src/ads/bvh8w.cpp: same node layout, same visiting order
+ * (children sorted by entry distance), the same search-range shrinking for
+ * cones and the same small-subtree shortcuts, so a query returns what the CPU
+ * returns (up to floating-point rounding). Leaves are encoded in their parents'
+ * child pointers, rather than in an array of their own, which saves traversals
+ * a dependent load per leaf.
  *
- * Host code builds these arrays from a bvh8w_t (src/gpu/geometry_upload.cpp).
+ * Host code builds these arrays from a bvh8w_t (`flatten` in src/gpu/gpu.cpp).
  */
 
 namespace wt::gpu::kernel {
@@ -32,14 +34,10 @@ constexpr int bvh_width = 8;
 struct alignas(16) bvh_node {
     real minx[bvh_width], miny[bvh_width], minz[bvh_width];
     real maxx[bvh_width], maxy[bvh_width], maxz[bvh_width];
-    /** 0: empty; >0: internal node index+1; <0: -(leaf index+1). */
+    /** 0: empty; >0: internal node index+1; <0: a leaf (`bvh_leaf_ptr`). */
     i32 child[bvh_width];
     /** Triangles of the whole subtree (contiguous). */
     u32 tris_start, tris_count;
-};
-
-struct bvh_leaf {
-    u32 tris_ptr, count;
 };
 
 /** @brief Aligned, so that a triangle loads in a few vector loads. */
@@ -51,14 +49,25 @@ struct alignas(16) bvh_tri {
 /** @brief The uploaded BVH. The root is node 0. */
 struct bvh_view {
     const WT_GPU_GLOBAL bvh_node* nodes;
-    const WT_GPU_GLOBAL bvh_leaf* leaves;
     const WT_GPU_GLOBAL bvh_tri*  tris;
 };
 
 constexpr i32 bvh_root_ptr = 1;
 
+/** @brief Bits of a leaf pointer for its triangle count, less 1 (the rest hold its first triangle). */
+constexpr u32 bvh_leaf_count_bits = 4;
+constexpr u32 bvh_max_leaf_count = 1u<<bvh_leaf_count_bits;
+/** @brief Leaf pointers address triangles below this. */
+constexpr u32 bvh_max_leaf_tris_ptr = 1u<<(31-bvh_leaf_count_bits);
+
+/** @brief The child pointer of a leaf of `count` (1 to `bvh_max_leaf_count`) triangles from `tris_ptr` (below `bvh_max_leaf_tris_ptr`). */
+WT_GPU_FN i32 bvh_leaf_ptr(u32 tris_ptr, u32 count) {
+    return -i32(1 + (tris_ptr<<bvh_leaf_count_bits | (count-1)));
+}
+
 WT_GPU_FN bool bvh_is_leaf(i32 ptr)  { return ptr<0; }
-WT_GPU_FN u32  bvh_leaf_index(i32 ptr) { return u32((-ptr)-1); }
+WT_GPU_FN u32  bvh_leaf_tris_ptr(i32 ptr) { return u32(-(ptr+1)) >> bvh_leaf_count_bits; }
+WT_GPU_FN u32  bvh_leaf_count(i32 ptr) { return (u32(-(ptr+1)) & (bvh_max_leaf_count-1)) + 1; }
 WT_GPU_FN u32  bvh_node_index(i32 ptr) { return u32(ptr-1); }
 
 /** @brief Four consecutive children of a node. */
@@ -191,8 +200,7 @@ WT_GPU_FN bool traverse_ray(bvh_view bvh, const WT_GPU_THREAD ray& r, range rng,
     while (s>0) {
         const i32 ptr = stack[s-1].ptr;
         if (bvh_is_leaf(ptr)) {
-            const bvh_leaf leaf = bvh.leaves[bvh_leaf_index(ptr)];
-            const bool found = gather_tris_ray<shadow>(bvh, r, leaf.tris_ptr, leaf.count, rng, best);
+            const bool found = gather_tris_ray<shadow>(bvh, r, bvh_leaf_tris_ptr(ptr), bvh_leaf_count(ptr), rng, best);
             --s;
             if (found) {
                 if constexpr (shadow) return true;
@@ -329,8 +337,7 @@ WT_GPU_FN void traverse_cone(bvh_view bvh, const WT_GPU_THREAD cone& cn,
     while (s>0) {
         const i32 ptr = stack[s-1].ptr;
         if (bvh_is_leaf(ptr)) {
-            const bvh_leaf leaf = bvh.leaves[bvh_leaf_index(ptr)];
-            const bool found = gather_tris_cone(bvh, cn, leaf.tris_ptr, leaf.count, rng, rec, sink);
+            const bool found = gather_tris_cone(bvh, cn, bvh_leaf_tris_ptr(ptr), bvh_leaf_count(ptr), rng, rec, sink);
             --s;
             if (found) {
                 // unwind irrelevant nodes
@@ -400,8 +407,7 @@ WT_GPU_FN u32 intersect_ball(bvh_view bvh, ball bl, WT_GPU_THREAD tri_sink& sink
     while (s>0) {
         const i32 ptr = stack[s-1];
         if (bvh_is_leaf(ptr)) {
-            const bvh_leaf leaf = bvh.leaves[bvh_leaf_index(ptr)];
-            detail::gather_tris_ball(bvh, bl, leaf.tris_ptr, leaf.count, sink);
+            detail::gather_tris_ball(bvh, bl, bvh_leaf_tris_ptr(ptr), bvh_leaf_count(ptr), sink);
             --s;
             continue;
         }

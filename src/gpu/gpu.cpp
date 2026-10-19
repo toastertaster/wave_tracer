@@ -35,16 +35,19 @@ bvh_arrays_t flatten(const ads::bvh8w_t& bvh) {
             const auto mx = vec3_t{ u::to_m(n.max.read(c)) };
             k.minx[c] = real(mn.x); k.miny[c] = real(mn.y); k.minz[c] = real(mn.z);
             k.maxx[c] = real(mx.x); k.maxy[c] = real(mx.y); k.maxz[c] = real(mx.z);
-            k.child[c] = n.child_ptrs[c];
+            // leaves are encoded in the pointer (bvh_leaf_ptr)
+            const auto ptr = n.child_ptrs[c];
+            if (ptr<0) {
+                const auto& l = bvh.leaf_node(ads::idx_t(-ptr-1));
+                if (l.count<1 || l.count>kernel::bvh_max_leaf_count || l.tris_ptr>=kernel::bvh_max_leaf_tris_ptr)
+                    throw gpu_error_t("the BVH's leaves do not fit the GPU's encoding");
+                k.child[c] = kernel::bvh_leaf_ptr(l.tris_ptr, l.count);
+            } else {
+                k.child[c] = ptr;
+            }
         }
         k.tris_start = n.tris_start;
         k.tris_count = n.tris_count;
-    }
-
-    arrays.leaves.resize(bvh.leaf_nodes_count());
-    for (std::size_t i=0; i<arrays.leaves.size(); ++i) {
-        const auto& l = bvh.leaf_node(ads::idx_t(i));
-        arrays.leaves[i] = { l.tris_ptr, l.count };
     }
 
     arrays.tris.resize(bvh.triangles_count());

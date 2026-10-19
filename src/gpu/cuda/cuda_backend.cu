@@ -137,7 +137,7 @@ struct path_pool_t {
     __device__ k::path_scratch scratch(k::u32 slot) const {
         return {
             tris + std::size_t(slot)*tri_capacity,
-            edges + std::size_t(slot)*edge_capacity,
+            edges + std::size_t(slot)*3*tri_capacity,
             aperture + std::size_t(slot)*edge_capacity,
             tri_capacity, edge_capacity,
         };
@@ -413,7 +413,7 @@ private:
         queues[0].resize(slots);
         queues[1].resize(slots);
         scratch_tris.resize(std::size_t(slots)*capacity);
-        scratch_edges.resize(std::size_t(slots)*capacity);
+        scratch_edges.resize(std::size_t(slots)*3*capacity);
         scratch_aperture.resize(std::size_t(slots)*capacity);
         overflow.resize(slots);
 
@@ -530,7 +530,6 @@ public:
     {
         set_device(ordinal);
         nodes.upload(bvh.nodes.data(), bvh.nodes.size());
-        leaves.upload(bvh.leaves.data(), bvh.leaves.size());
         tris.upload(bvh.tris.data(), bvh.tris.size());
         tri_count = bvh.tris.size();
 #if defined(WT_GPU_USE_OPTIX)
@@ -615,13 +614,12 @@ public:
 
 private:
     [[nodiscard]] k::bvh_view view() const noexcept {
-        return { nodes.get(), leaves.get(), tris.get() };
+        return { nodes.get(), tris.get() };
     }
 
     int ordinal;
 
     device_buffer_t<k::bvh_node> nodes;
-    device_buffer_t<k::bvh_leaf> leaves;
     device_buffer_t<k::bvh_tri>  tris;
     std::size_t tri_count = 0;
 
