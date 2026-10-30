@@ -459,6 +459,31 @@ WT_GPU_FN bool sample_bsdf(const WT_GPU_THREAD material& m, vec3 wi, bool backwa
             out.discrete = false;
         }
         out.eta = is_reflection ? real(1) : f.eta_12;
+    } else if (m.type==material_dielectric) {
+        // dielectric_t::sample: Fresnel reflection or refraction, by the transmissivity
+        const fresnel_t f = fresnel(m.eta, wi);
+        const real T = (f.Ts+f.Tp)/2;
+        const bool is_reflection = rnd.r()>=T;
+        const real pdf = is_reflection ? 1-T : T;
+        const real scale = is_reflection ? m.reflection_scale : m.transmission_scale;
+        if (scale==real(0))
+            return false;
+
+        mueller_block M;
+        if (is_reflection) {
+            wo = { -wi.x, -wi.y, wi.z };
+            M = mueller_fresnel(complex{ f.rs,0 }, complex{ f.rp,0 }) * scale;
+        } else {
+            // J = eta² for refraction in backward transport
+            wo = f.t;
+            M = mueller_fresnel(complex{ f.ts,0 }, complex{ f.tp,0 }) *
+                (f.Z * scale * (backward ? sqr(f.eta_12) : real(1)));
+        }
+        out.M = (M * m.scale) / pdf;
+        out.pdf = pdf;
+        out.discrete = true;
+        // (the CPU's, also of reflections)
+        out.eta = f.eta_12;
     } else {
         return false;
     }

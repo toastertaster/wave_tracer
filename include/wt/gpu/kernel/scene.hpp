@@ -144,6 +144,8 @@ constexpr u32 material_absorbing = 0;
 constexpr u32 material_specular = 1;
 /** @brief `diffuse_t`: Lambertian reflection. */
 constexpr u32 material_diffuse = 2;
+/** @brief `dielectric_t`: Fresnel reflection and refraction at a smooth dielectric interface. */
+constexpr u32 material_dielectric = 3;
 
 constexpr u32 profile_dirac = 0;          // `surface_profile::dirac_t`: smooth
 constexpr u32 profile_fractal = 1;        // `surface_profile::fractal_t`
@@ -160,7 +162,7 @@ struct material {
     u32 delta_only;             // `bsdf_t::is_delta_only`: no evaluation, nor next-event estimation
     real scale;                 // product of the `scale_t` wrappers' scales
     u32 scale_texture;
-    // specular
+    // specular and dielectric (whose `eta` is real)
     u32 has_transmission;       // `IOR_has_transmission(eta)` of src/bsdf/surface_spm.cpp
     complex eta;                // `surface_spm_t::IOR(k)`: exterior over interior refractive index
     real reflection_scale;      // `surface_spm_t::reflectivity_scale(k)`

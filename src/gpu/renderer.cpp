@@ -34,6 +34,7 @@
 #include <wt/bsdf/two_sided.hpp>
 #include <wt/bsdf/composite.hpp>
 #include <wt/bsdf/diffuse.hpp>
+#include <wt/bsdf/dielectric.hpp>
 #include <wt/bsdf/scale.hpp>
 #include <wt/bsdf/surface_spm.hpp>
 #include <wt/bsdf/normalmap.hpp>
@@ -652,6 +653,14 @@ kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k, co
         m.reflection_scale = real(spm->reflectivity_scale(k));
         m.transmission_scale = real(spm->transmissivity_scale(k));
         compile_surface_profile(*spm, k, textures, m);
+        return m;
+    }
+
+    if (const auto* dielectric = dynamic_cast<const bsdf::dielectric_t*>(b); dielectric) {
+        m.type = kernel::material_dielectric;
+        m.eta = { real(dielectric->IOR(k)), 0 };
+        m.reflection_scale = real(dielectric->reflectivity_scale(k));
+        m.transmission_scale = real(dielectric->transmissivity_scale(k));
         return m;
     }
 

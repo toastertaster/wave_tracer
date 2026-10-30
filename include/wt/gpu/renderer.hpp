@@ -26,8 +26,8 @@
  *   - point, spot and directional emitters, and area emitters of a constant
  *     radiance;
  *   - surface_spm BSDFs, smooth (Dirac surface profile) or rough (fractal
- *     or gaussian surface profiles), and diffuse BSDFs, optionally wrapped
- *     in twosided, composite, scale and normalmap BSDFs;
+ *     or gaussian surface profiles), dielectric and diffuse BSDFs,
+ *     optionally wrapped in twosided, composite, scale and normalmap BSDFs;
  *   - constant and bitmap textures, transformed, or scaled by constant
  *     textures, for diffuse reflectances, BSDF scales, surface roughness
  *     (perceptual) and normal maps (see `kernel::texture`);
