@@ -70,7 +70,8 @@ struct plt_scene_t {
     std::vector<kernel::material_shading> material_shadings;   // per material
     std::vector<kernel::texture> textures;
     std::vector<kernel::bitmap> bitmaps;
-    std::vector<float> texels;
+    std::vector<std::uint32_t> texels;         // `kernel::bitmap`s' texels
+    std::vector<kernel::real> texel_luts;
     std::uint32_t emitter_count;
     std::uint32_t material_count;
     std::uint32_t samples_per_emitter;         // in each spectral table

@@ -471,6 +471,7 @@ public:
         textures.upload(scene.textures.data(), scene.textures.size());
         bitmaps.upload(scene.bitmaps.data(), scene.bitmaps.size());
         texels.upload(scene.texels.data(), scene.texels.size());
+        texel_luts.upload(scene.texel_luts.data(), scene.texel_luts.size());
 
         // a polarimetric film's components have four values (Stokes parameters), and one weight
         weights_size = std::size_t(scene.film.width) * scene.film.height * scene.film.components;
@@ -503,6 +504,7 @@ public:
         params.textures = textures.get();
         params.bitmaps = bitmaps.get();
         params.texels = texels.get();
+        params.texel_luts = texel_luts.get();
         params.emitter_count = scene.emitter_count;
         params.material_count = scene.material_count;
         params.samples_per_emitter = scene.samples_per_emitter;
@@ -878,7 +880,8 @@ private:
     device_buffer_t<k::material_shading> material_shadings;
     device_buffer_t<k::texture>       textures;
     device_buffer_t<k::bitmap>        bitmaps;
-    device_buffer_t<float>            texels;
+    device_buffer_t<k::u32>           texels;
+    device_buffer_t<k::real>          texel_luts;
     device_buffer_t<double>           film;
     device_buffer_t<double>           film_weights;     // block splats
     device_buffer_t<double>           light_film;       // plt_bdpt's direct splats

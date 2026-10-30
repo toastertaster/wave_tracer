@@ -49,10 +49,25 @@ WT_GPU_FN i32 wrap_coord(u32 wrap, i32 coord, u32 dim) {
 }
 
 /**
+ * @brief Component `i` (of the bitmap's, row by row) of `bm`'s texels: their
+ *        stored value, decoded to a linear value (`texel_native`). `alpha`:
+ *        of an alpha channel, which colour encodings leave linear.
+ */
+WT_GPU_FN real texel_component(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_THREAD bitmap& bm, u64 i,
+                               bool alpha) {
+    if (bm.format==texel_float32)
+        return real(float_from_bits(scene.texels[bm.offset + i]));
+    const u32 lut = alpha ? bm.alpha_lut : bm.colour_lut;
+    if (bm.format==texel_unorm8)
+        return scene.texel_luts[lut + ((scene.texels[bm.offset + i/4] >> (8*u32(i%4))) & 0xffu)];
+    return scene.texel_luts[lut + ((scene.texels[bm.offset + i/2] >> (16*u32(i%2))) & 0xffffu)];
+}
+
+/**
  * @brief `texture2d_tmpl_t::texel_native`: a texel at an image coordinate, in
  *        the bitmap's layout (its components first, the rest 0).
  */
-WT_GPU_FN vec4 texel(const WT_GPU_GLOBAL float* texels, const WT_GPU_THREAD bitmap& bm, i32 x, i32 y) {
+WT_GPU_FN vec4 texel(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_THREAD bitmap& bm, i32 x, i32 y) {
     x = wrap_coord(bm.uwrap, x, bm.width);
     y = wrap_coord(bm.vwrap, y, bm.height);
     if (x<0 || y<0) {
@@ -64,12 +79,12 @@ WT_GPU_FN vec4 texel(const WT_GPU_GLOBAL float* texels, const WT_GPU_THREAD bitm
         return t;
     }
 
-    const WT_GPU_GLOBAL float* p = texels + bm.offset + (u64(y)*bm.width + u64(x))*bm.components;
+    const u64 i = (u64(y)*bm.width + u64(x))*bm.components;
     return {
-        real(p[0]),
-        bm.components>1 ? real(p[1]) : real(0),
-        bm.components>2 ? real(p[2]) : real(0),
-        bm.components>3 ? real(p[3]) : real(0),
+        texel_component(scene, bm, i, false),
+        bm.components>1 ? texel_component(scene, bm, i+1, bm.layout==layout_LA) : real(0),
+        bm.components>2 ? texel_component(scene, bm, i+2, false) : real(0),
+        bm.components>3 ? texel_component(scene, bm, i+3, true) : real(0),
     };
 }
 
@@ -92,7 +107,7 @@ WT_GPU_FN vec4 bicubic_filter(real x, vec4 p0, vec4 p1, vec4 p2, vec4 p3) {
  * @brief `texture2d_tmpl_t::filter` (`bitmap_t::get_RGBA`): the bitmap
  *        filtered at `uv`, clamped, in RGBA.
  */
-WT_GPU_FN vec4 filter_bitmap(const WT_GPU_GLOBAL float* texels, const WT_GPU_THREAD bitmap& bm, vec2 uv) {
+WT_GPU_FN vec4 filter_bitmap(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_THREAD bitmap& bm, vec2 uv) {
     // flip v
     uv.y = 1-uv.y;
     const vec2 dim = { real(bm.width), real(bm.height) };
@@ -100,25 +115,25 @@ WT_GPU_FN vec4 filter_bitmap(const WT_GPU_GLOBAL float* texels, const WT_GPU_THR
 
     vec4 v;
     if (bm.filter==filter_nearest) {
-        v = texel(texels, bm, i32(round(xy.x)), i32(round(xy.y)));
+        v = texel(scene, bm, i32(round(xy.x)), i32(round(xy.y)));
     } else {
         const real fx = floor(xy.x), fy = floor(xy.y);
         const i32 ix = i32(fx), iy = i32(fy);
         const vec2 f = { xy.x-fx, xy.y-fy };
         if (bm.filter==filter_bilinear) {
-            const vec4 t00 = texel(texels, bm, ix,   iy);
-            const vec4 t01 = texel(texels, bm, ix,   iy+1);
-            const vec4 t10 = texel(texels, bm, ix+1, iy);
-            const vec4 t11 = texel(texels, bm, ix+1, iy+1);
+            const vec4 t00 = texel(scene, bm, ix,   iy);
+            const vec4 t01 = texel(scene, bm, ix,   iy+1);
+            const vec4 t10 = texel(scene, bm, ix+1, iy);
+            const vec4 t11 = texel(scene, bm, ix+1, iy+1);
             v = mix(mix(t00, t10, f.x), mix(t01, t11, f.x), f.y);
         } else {
             vec4 ts[4];
             for (i32 y=0; y<4; ++y)
                 ts[y] = bicubic_filter(f.x,
-                                       texel(texels, bm, ix-1, iy+y-1),
-                                       texel(texels, bm, ix,   iy+y-1),
-                                       texel(texels, bm, ix+1, iy+y-1),
-                                       texel(texels, bm, ix+2, iy+y-1));
+                                       texel(scene, bm, ix-1, iy+y-1),
+                                       texel(scene, bm, ix,   iy+y-1),
+                                       texel(scene, bm, ix+1, iy+y-1),
+                                       texel(scene, bm, ix+2, iy+y-1));
             v = bicubic_filter(f.y, ts[0], ts[1], ts[2], ts[3]);
         }
     }
@@ -145,7 +160,7 @@ WT_GPU_FN vec4 texture_rgba(const WT_GPU_THREAD plt_scene& scene, u32 index, vec
         t.M[0]*uv.x + t.M[1]*uv.y + t.t[0],
         t.M[2]*uv.x + t.M[3]*uv.y + t.t[1],
     };
-    return filter_bitmap(scene.texels, bm, tuv);
+    return filter_bitmap(scene, bm, tuv);
 }
 
 /** @brief `RGB_to_spectral::uplift` of `rgb`, with the bases' values `basis` (`spectral_sample::uplift`). */

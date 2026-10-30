@@ -10,11 +10,14 @@
 #include <wt/gpu/renderer.hpp>
 #include <wt/gpu/backend.hpp>
 
+#include <bit>
 #include <format>
 #include <functional>
+#include <limits>
 #include <map>
 #include <optional>
 #include <random>
+#include <utility>
 #include <vector>
 
 #include <wt/ads/bvh8w/bvh8w.hpp>
@@ -335,7 +338,8 @@ public:
 
     std::vector<kernel::texture> textures;
     std::vector<kernel::bitmap> bitmaps;
-    std::vector<float> texels;
+    std::vector<std::uint32_t> texels;
+    std::vector<real> texel_luts;
 
 private:
     /** @brief A texture in the form of `kernel::texture`: factor * bitmap(M*uv + t), or a constant (no bitmap). */
@@ -415,7 +419,10 @@ private:
         register_texture(texture, normalmap);
     }
 
-    /** @brief A bitmap's texels, converted to linear floating point (as `texture2d_tmpl_t::texel_native`). */
+    /**
+     * @brief A bitmap, its texels as the CPU stores them (see `kernel::bitmap`): unorm integers, whose
+     *        decoding tables it shares with other bitmaps of their width and colour encoding, or floats.
+     */
     std::uint32_t bitmap_index(const texture::bitmap_t& bitmap, const bsdf::bsdf_t& of) {
         const auto& tex = *bitmap.get_texture();
         if (const auto it = bitmap_of.find(&tex); it!=bitmap_of.end())
@@ -429,12 +436,20 @@ private:
         const auto dim = tex.dimensions();
         const std::uint32_t components = tex.components();
         const std::uint64_t count = std::uint64_t(dim.x)*dim.y*components;
-        if (texels.size()+count > std::uint64_t(1)<<32)
-            throw gpu_error_t("GPU rendering supports bitmaps of up to 2^32 texel components in all");
+
+        // the texture2d_loader's texel types: unorm8 and unorm16 (PNG), f_t (EXR)
+        const auto component_bytes = tex.component_bytes();
+        const auto format = component_bytes==1 ? kernel::texel_unorm8 :
+                            component_bytes==2 ? kernel::texel_unorm16 : kernel::texel_float32;
+        const std::uint32_t per_word = format==kernel::texel_unorm8 ? 4 : format==kernel::texel_unorm16 ? 2 : 1;
+        const std::uint64_t words = (count + per_word-1) / per_word;
+        if (texels.size()+words > std::uint64_t(1)<<32)
+            throw gpu_error_t("GPU rendering supports bitmaps of up to 16 GiB in all");
 
         const auto& config = tex.get_config();
         kernel::bitmap bm{};
         bm.offset = std::uint32_t(texels.size());
+        bm.format = format;
         bm.width = dim.x;
         bm.height = dim.y;
         bm.layout = layout==pixel_layout_e::L ? kernel::layout_L :
@@ -453,20 +468,30 @@ private:
         bm.outside_u = outside(config.uwrap) ? real(tex.texel({ -1,0 }).x) : real(0);
         bm.outside_v = outside(config.vwrap) ? real(tex.texel({ 0,-1 }).x) : real(0);
 
-        // texels in the bitmap's layout, from RGBA (`convert_pixel_layout`)
-        texels.reserve(texels.size()+count);
-        for (std::uint32_t y=0; y<dim.y; ++y)
-        for (std::uint32_t x=0; x<dim.x; ++x) {
-            const auto rgba = tex.texel({ std::int32_t(x), std::int32_t(y) });
-            if (layout==pixel_layout_e::L) {
-                texels.push_back(float(rgba.x));
-            } else if (layout==pixel_layout_e::LA) {
-                texels.push_back(float(rgba.x));
-                texels.push_back(float(rgba.w));
-            } else {
-                for (std::uint32_t c=0; c<components; ++c)
-                    texels.push_back(float(rgba[c]));
+        // the texels, row by row, from the storage's tiles (`texture2d_tmpl_t::texel_native`), each
+        // component in its (lowest unused) bits of a word
+        const auto& storage = tex.get_storage();
+        const auto pack = [&]<typename T>(const auto encode) {
+            const auto* data = reinterpret_cast<const T*>(storage.data.get());
+            texels.resize(texels.size()+words, 0);
+            std::uint64_t i = 0;
+            for (std::uint32_t y=0; y<dim.y; ++y)
+            for (std::uint32_t x=0; x<dim.x; ++x)
+            for (std::uint32_t c=0; c<components; ++c, ++i) {
+                const T v = data[std::size_t(storage.texel_offset({ x,y }))*components + c];
+                texels[bm.offset + i/per_word] |= encode(v) << (32/per_word * (i%per_word));
             }
+        };
+        if (format==kernel::texel_unorm8) {
+            pack.template operator()<std::uint8_t>([](std::uint8_t v) { return std::uint32_t(v); });
+            bm.colour_lut = decoding_lut<std::uint8_t>(tex.colour_encoding());
+            bm.alpha_lut = decoding_lut<std::uint8_t>(bitmap::colour_encoding_type_e::linear);
+        } else if (format==kernel::texel_unorm16) {
+            pack.template operator()<std::uint16_t>([](std::uint16_t v) { return std::uint32_t(v); });
+            bm.colour_lut = decoding_lut<std::uint16_t>(tex.colour_encoding());
+            bm.alpha_lut = decoding_lut<std::uint16_t>(bitmap::colour_encoding_type_e::linear);
+        } else {
+            pack.template operator()<f_t>([](f_t v) { return std::bit_cast<std::uint32_t>(float(v)); });
         }
 
         const auto index = std::uint32_t(bitmaps.size());
@@ -475,8 +500,25 @@ private:
         return index;
     }
 
+    /**
+     * @brief The table of the linear values of unorm texels of type `T` in colour encoding `ce`
+     *        (`colour_encoding_t::to_linear_fp`; linear: `to_fp`, as of alpha): its offset in `texel_luts`.
+     */
+    template <typename T>
+    std::uint32_t decoding_lut(const bitmap::colour_encoding_t ce) {
+        const auto key = std::make_pair(sizeof(T), ce.gamma);
+        if (const auto it = luts.find(key); it!=luts.end())
+            return it->second;
+        const auto offset = std::uint32_t(texel_luts.size());
+        for (std::uint32_t i=0; i<=std::numeric_limits<T>::max(); ++i)
+            texel_luts.push_back(real(ce.to_linear_fp(T(i))));
+        luts.emplace(key, offset);
+        return offset;
+    }
+
     std::map<const texture::texture_t*, std::uint32_t> registered;
     std::map<const bitmap::texture2d_t*, std::uint32_t> bitmap_of;
+    std::map<std::pair<std::size_t, f_t>, std::uint32_t> luts;     // decoding tables, by texel size and gamma
 };
 
 /** @brief The surface profile of a `surface_spm_t` at wavenumber `k` (see `kernel::material`). */
@@ -628,6 +670,7 @@ std::vector<const bsdf::bsdf_t*> compile_geometry(const scene_t& scene, const ad
     out.textures = textures.textures;
     out.bitmaps = textures.bitmaps;
     out.texels = std::move(textures.texels);
+    out.texel_luts = std::move(textures.texel_luts);
 
     // shading data in the BVH's triangle order (see flatten() in src/gpu/gpu.cpp)
     const auto edge_id = [](const ads::tuid_t e) { return e ? std::uint32_t(e.uid) : kernel::no_edge; };

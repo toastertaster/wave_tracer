@@ -78,13 +78,27 @@ constexpr u32 clamp_none = 0;             // `bitmap::texel_clamp_mode_e`
 constexpr u32 clamp_non_negative = 1;
 constexpr u32 clamp_non_positive = 2;
 
+constexpr u32 texel_float32 = 0;          // 32-bit floating point, linear (of EXR files)
+constexpr u32 texel_unorm8 = 1;           // 8-bit unsigned normalized integers (of 8-bit PNG files)
+constexpr u32 texel_unorm16 = 2;          // 16-bit ... (of 16-bit PNG files)
+
 /**
- * @brief A bitmap (`bitmap::texture2d_t`): its texels, linear floating point
- *        in the bitmap's own layout (`components` per texel, row by row), are
- *        `plt_scene::texels[offset ..]`.
+ * @brief A bitmap (`bitmap::texture2d_t`): its texels' components, in the
+ *        bitmap's own layout (`components` per texel, row by row), packed
+ *        in 32-bit words from `plt_scene::texels[offset]` on, as the CPU
+ *        stores them (`format`): floats (as their bits), or unsigned
+ *        normalized integers (lowest bits first), which decode to linear
+ *        values through tables (see `plt_scene::texel_luts`).
  */
 struct bitmap {
     u32 offset;
+    u32 format;
+    /**
+     * @brief unorm texels: the tables of their components' linear values
+     *        (`colour_encoding_t::to_linear_fp`; alpha: `to_fp`), from
+     *        `plt_scene::texel_luts[colour_lut]` and `[alpha_lut]` on.
+     */
+    u32 colour_lut, alpha_lut;
     u32 width, height;
     u32 layout;
     u32 components;
@@ -366,7 +380,8 @@ struct plt_scene {
     const WT_GPU_GLOBAL material_shading* material_shadings;
     const WT_GPU_GLOBAL texture* textures;
     const WT_GPU_GLOBAL bitmap* bitmaps;
-    const WT_GPU_GLOBAL float* texels;
+    const WT_GPU_GLOBAL u32* texels;
+    const WT_GPU_GLOBAL real* texel_luts;           // decoding tables of unorm texels (see `bitmap`)
 
     sensor_desc sensor;
     film_desc film;

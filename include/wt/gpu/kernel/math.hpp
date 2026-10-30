@@ -55,6 +55,17 @@ WT_GPU_FN double k_floor(double x) { return floor(x); }
 WT_GPU_FN float  k_round(float x)  { return roundf(x); }
 WT_GPU_FN double k_round(double x) { return round(x); }
 
+/** @brief The float whose bits are `b`. */
+WT_GPU_FN float float_from_bits(u32 b) {
+#if defined(__CUDA_ARCH__)
+    return __uint_as_float(b);
+#elif defined(__METAL_VERSION__)
+    return as_type<float>(b);
+#else
+    return __builtin_bit_cast(float, b);
+#endif
+}
+
 WT_GPU_FN real inf() {
 #if defined(__METAL_VERSION__)
     return INFINITY;
