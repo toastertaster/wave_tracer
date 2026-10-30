@@ -52,6 +52,75 @@ struct edge {
     u32 tri1, tri2; // BVH triangles; tri2 is no_triangle for an edge of one triangle
 };
 
+/** @brief UV coordinates of a BVH triangle's vertices (`mesh::triangle_t::uv`, or 0). */
+struct tri_uv {
+    vec2 uv[3];
+};
+
+constexpr u32 no_texture = 0xffffffffu;
+
+constexpr u32 layout_L = 0;               // `bitmap::pixel_layout_e`
+constexpr u32 layout_LA = 1;
+constexpr u32 layout_RGB = 2;
+constexpr u32 layout_RGBA = 3;
+
+constexpr u32 filter_nearest = 0;         // `bitmap::texture_filter_type_e`
+constexpr u32 filter_bilinear = 1;
+constexpr u32 filter_bicubic = 2;
+
+constexpr u32 wrap_black = 0;             // `bitmap::texture_wrap_mode_e`
+constexpr u32 wrap_white = 1;
+constexpr u32 wrap_clamp = 2;
+constexpr u32 wrap_repeat = 3;
+constexpr u32 wrap_mirror = 4;
+
+constexpr u32 clamp_none = 0;             // `bitmap::texel_clamp_mode_e`
+constexpr u32 clamp_non_negative = 1;
+constexpr u32 clamp_non_positive = 2;
+
+/**
+ * @brief A bitmap (`bitmap::texture2d_t`): its texels, linear floating point
+ *        in the bitmap's own layout (`components` per texel, row by row), are
+ *        `plt_scene::texels[offset ..]`.
+ */
+struct bitmap {
+    u32 offset;
+    u32 width, height;
+    u32 layout;
+    u32 components;
+    u32 filter;
+    u32 uwrap, vwrap;
+    u32 clamp;
+    /**
+     * @brief The value of texels outside the bitmap, with black or white
+     *        wrapping, in u and in v (the CPU's `texel_native`).
+     */
+    real outside_u, outside_v;
+};
+
+/**
+ * @brief A texture that varies over surfaces: a bitmap, looked up at affinely
+ *        transformed UV coordinates (`texture::transform_t`). Its value at a
+ *        wavenumber is a constant factor (of the constant textures that scale
+ *        it, see `material`) times the bitmap's: the bitmap's luminance, or
+ *        its RGB colour uplifted to the wavenumber (`bitmap_t::f`).
+ */
+struct texture {
+    u32 bitmap;
+    u32 rgb;                    // the bitmap is RGB or RGBA: its colour is uplifted
+    real M[4];                  // row-major: looked up at M*uv + t
+    real t[2];
+};
+
+/**
+ * @brief What of a material does not depend on the wavenumber: its normal
+ *        map (`bsdf::normalmap_t`), which perturbs the shading frame.
+ */
+struct material_shading {
+    u32 normalmap;              // texture, or no_texture
+    u32 normalmap_flip;         // flip the normal map's x and y
+};
+
 /** @brief No BSDF at the spectral sample's wavenumber: paths end here (`composite_t` without a matching bin). */
 constexpr u32 material_absorbing = 0;
 /**
@@ -59,18 +128,24 @@ constexpr u32 material_absorbing = 0;
  *        surface profile, scattering about them.
  */
 constexpr u32 material_specular = 1;
-/** @brief `diffuse_t` with a constant reflectance: Lambertian reflection. */
+/** @brief `diffuse_t`: Lambertian reflection. */
 constexpr u32 material_diffuse = 2;
 
 constexpr u32 profile_dirac = 0;          // `surface_profile::dirac_t`: smooth
 constexpr u32 profile_fractal = 1;        // `surface_profile::fractal_t`
 constexpr u32 profile_gaussian = 2;       // `surface_profile::gaussian_t`
 
+/**
+ * @brief A material at a spectral sample's wavenumber. Values with a texture
+ *        (other than no_texture) are a constant factor, to be multiplied by
+ *        the texture's value where a path hits (see `resolve_material`).
+ */
 struct material {
     u32 type;
     u32 two_sided;              // wrapped in `two_sided_t`
     u32 delta_only;             // `bsdf_t::is_delta_only`: no evaluation, nor next-event estimation
-    real scale;                 // product of the `scale_t` wrappers' (constant) scales
+    real scale;                 // product of the `scale_t` wrappers' scales
+    u32 scale_texture;
     // specular
     u32 has_transmission;       // `IOR_has_transmission(eta)` of src/bsdf/surface_spm.cpp
     complex eta;                // `surface_spm_t::IOR(k)`: exterior over interior refractive index
@@ -89,8 +164,15 @@ struct material {
     real gamma;
     real s2;
     real sigma2_norm;
+    /**
+     * @brief A textured roughness (of a roughness-parametrized profile): the
+     *        parameters above derive from it where a path hits.
+     */
+    real roughness;
+    u32 roughness_texture;
     // diffuse
-    real reflectance;           // `diffuse_t`'s reflectance, clamped to [0,1]
+    real reflectance;           // `diffuse_t`'s reflectance, clamped to [0,1] (once textured)
+    u32 reflectance_texture;
 };
 
 constexpr u32 emitter_point = 0;          // `emitter::point_t`
@@ -205,6 +287,11 @@ struct spectral_sample {
     real sensor_tan_alpha;
     real sensor_x0;
     film_response response;
+    /**
+     * @brief `RGB_to_spectral::uplift` at the wavenumber: the spectral value
+     *        of the white, cyan, magenta, yellow, red, green and blue bases.
+     */
+    real uplift[7];
 };
 
 /** @brief `integrator::plt_path_t::options_t`, and how the scene is rendered. */
@@ -241,6 +328,13 @@ struct plt_scene {
     // area emitters' triangles (BVH triangles), and each emitter's inclusive CDF of them by area
     const WT_GPU_GLOBAL u32* area_tris;
     const WT_GPU_GLOBAL real* area_cdf;
+
+    // textures: the triangles' UVs (null if no material has textures), materials' shading
+    const WT_GPU_GLOBAL tri_uv* tri_uvs;
+    const WT_GPU_GLOBAL material_shading* material_shadings;
+    const WT_GPU_GLOBAL texture* textures;
+    const WT_GPU_GLOBAL bitmap* bitmaps;
+    const WT_GPU_GLOBAL float* texels;
 
     sensor_desc sensor;
     film_desc film;

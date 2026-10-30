@@ -13,6 +13,7 @@
 #include "fsd.hpp"
 #include "rng.hpp"
 #include "scene.hpp"
+#include "texture.hpp"
 
 /*
  * plt_path on the GPU: a port of `integrate_forward`, `integrate_backward` and
@@ -1335,6 +1336,13 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
         s.shading = build_shading_frame(normalize(primary.baryx*sh.n[0] + primary.baryy*sh.n[1] + bz*sh.n[2]),
                                         sh.dpdu);
         s.fp = b.surface_footprint_static(s.geo, dist_to_interaction);
+
+        // textures (scenes without have no UVs)
+        if (scene.tri_uvs) {
+            const material_shading ms = scene.material_shadings[sh.material];
+            if (ms.normalmap!=no_texture || is_textured(mat))
+                apply_textures(scene, p.spectral, ms, primary.tri, primary.baryx, primary.baryy, sh.dpdu, s.shading, mat);
+        }
     }
 
     // edges: of the triangles around a ballistic intersection, or of the diffusive intersection's

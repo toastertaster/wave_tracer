@@ -66,6 +66,11 @@ struct plt_path_scene_t {
     std::vector<kernel::real> emitter_cdf;
     std::vector<std::uint32_t> area_tris;      // area emitters' triangles (see `kernel::plt_scene`)
     std::vector<kernel::real> area_cdf;
+    std::vector<kernel::tri_uv> tri_uvs;       // per BVH triangle, if any material has textures
+    std::vector<kernel::material_shading> material_shadings;   // per material
+    std::vector<kernel::texture> textures;
+    std::vector<kernel::bitmap> bitmaps;
+    std::vector<float> texels;
     std::uint32_t emitter_count;
     std::uint32_t material_count;
     std::uint32_t samples_per_emitter;         // in each spectral table

@@ -385,6 +385,11 @@ public:
         emitter_cdf.upload(scene.emitter_cdf.data(), scene.emitter_cdf.size());
         area_tris.upload(scene.area_tris.data(), scene.area_tris.size());
         area_cdf.upload(scene.area_cdf.data(), scene.area_cdf.size());
+        tri_uvs.upload(scene.tri_uvs.data(), scene.tri_uvs.size());
+        material_shadings.upload(scene.material_shadings.data(), scene.material_shadings.size());
+        textures.upload(scene.textures.data(), scene.textures.size());
+        bitmaps.upload(scene.bitmaps.data(), scene.bitmaps.size());
+        texels.upload(scene.texels.data(), scene.texels.size());
 
         film_size = std::size_t(scene.film.width) * scene.film.height * scene.film.components;
         film.resize(film_size);
@@ -406,6 +411,11 @@ public:
         params.emitter_cdf = emitter_cdf.get();
         params.area_tris = area_tris.get();
         params.area_cdf = area_cdf.get();
+        params.tri_uvs = tri_uvs.get();
+        params.material_shadings = material_shadings.get();
+        params.textures = textures.get();
+        params.bitmaps = bitmaps.get();
+        params.texels = texels.get();
         params.emitter_count = scene.emitter_count;
         params.material_count = scene.material_count;
         params.samples_per_emitter = scene.samples_per_emitter;
@@ -711,6 +721,11 @@ private:
     device_buffer_t<k::real>          emitter_cdf;
     device_buffer_t<k::u32>           area_tris;
     device_buffer_t<k::real>          area_cdf;
+    device_buffer_t<k::tri_uv>        tri_uvs;
+    device_buffer_t<k::material_shading> material_shadings;
+    device_buffer_t<k::texture>       textures;
+    device_buffer_t<k::bitmap>        bitmaps;
+    device_buffer_t<float>            texels;
     device_buffer_t<double>           film;
     device_buffer_t<double>           film_weights;     // backward transport
     std::size_t film_size = 0;

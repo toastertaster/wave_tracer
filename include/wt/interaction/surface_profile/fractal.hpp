@@ -138,6 +138,10 @@ public:
     [[nodiscard]] inline auto parameters(const texture_query_t& query) const noexcept { return fractal_params(query); }
     /** @brief Log-log slope of the fractal profile. */
     [[nodiscard]] inline f_t get_gamma() const noexcept { return gamma; }
+    /** @brief The roughness texture of a profile parametrized by perceptual roughness, or nullptr. */
+    [[nodiscard]] inline const texture::texture_t* roughness_texture() const noexcept {
+        return roughness_parametrized ? roughness_tex.get() : nullptr;
+    }
     /** @brief Whether the profile's textures are constant (the same everywhere on the surface). */
     [[nodiscard]] inline bool has_constant_textures() const noexcept {
         return roughness_parametrized ?

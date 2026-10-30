@@ -74,6 +74,9 @@ public:
     [[nodiscard]] inline const auto* get_nested_texture() const noexcept {
         return tex.get();
     }
+    /** @brief The UV transform: the nested texture is sampled at `get_matrix()*uv + get_translation()`. */
+    [[nodiscard]] inline const auto& get_matrix() const noexcept { return M; }
+    [[nodiscard]] inline const auto& get_translation() const noexcept { return translate; }
     
     /**
      * @brief Returns TRUE for textures that make use of the surface interaction footprint data.

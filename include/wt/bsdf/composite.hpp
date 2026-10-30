@@ -55,6 +55,11 @@ public:
     composite_t(composite_t&&) = default;
 
     /**
+     * @brief The nested BSDFs, by the spectral ranges they apply to.
+     */
+    [[nodiscard]] inline const auto& nested_bsdfs() const noexcept { return bsdfs; }
+
+    /**
      * @brief The BSDF of the spectral range containing wavenumber ``k``, or nullptr if no range does.
      */
     [[nodiscard]] inline const bsdf_t* bsdf_for(wavenumber_t k) const noexcept {

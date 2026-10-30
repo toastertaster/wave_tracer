@@ -17,6 +17,8 @@
  *   - no C++ standard library, no exceptions, RTTI, virtual functions, derived
  *     classes, new/delete, thread_local or recursion;
  *   - plain structs and templates only;
+ *   - functions are WT_GPU_FN, or WT_GPU_NOINLINE_FN to keep a rarely taken
+ *     path's code and registers out of its callers (CUDA's __noinline__);
  *   - pointers to GPU buffers are declared with WT_GPU_GLOBAL (Metal's `device`
  *     address space), and reference parameters to local variables with
  *     WT_GPU_THREAD (Metal's `thread`); Metal requires an explicit address
@@ -31,15 +33,18 @@
 
 #if defined(__CUDACC__)
     #define WT_GPU_FN __host__ __device__ inline
+    #define WT_GPU_NOINLINE_FN __host__ __device__ __noinline__
     #define WT_GPU_GLOBAL
     #define WT_GPU_THREAD
 #elif defined(__METAL_VERSION__)
     #include <metal_stdlib>
     #define WT_GPU_FN inline
+    #define WT_GPU_NOINLINE_FN inline
     #define WT_GPU_GLOBAL device
     #define WT_GPU_THREAD thread
 #else
     #define WT_GPU_FN inline
+    #define WT_GPU_NOINLINE_FN inline
     #define WT_GPU_GLOBAL
     #define WT_GPU_THREAD
 #endif

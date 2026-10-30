@@ -13,6 +13,7 @@
 #include <format>
 #include <functional>
 #include <map>
+#include <optional>
 #include <random>
 #include <vector>
 
@@ -30,10 +31,15 @@
 #include <wt/bsdf/diffuse.hpp>
 #include <wt/bsdf/scale.hpp>
 #include <wt/bsdf/surface_spm.hpp>
+#include <wt/bsdf/normalmap.hpp>
 #include <wt/interaction/surface_profile/dirac.hpp>
 #include <wt/interaction/surface_profile/fractal.hpp>
 #include <wt/interaction/surface_profile/gaussian.hpp>
 #include <wt/texture/constant.hpp>
+#include <wt/texture/bitmap.hpp>
+#include <wt/texture/scale.hpp>
+#include <wt/texture/transform.hpp>
+#include <wt/spectrum/colourspace/RGB/RGB_to_spectral.hpp>
 #include <wt/sensor/sensor/perspective.hpp>
 #include <wt/sensor/sensor/virtual_plane_sensor.hpp>
 #include <wt/sensor/film/film_storage.hpp>
@@ -227,8 +233,234 @@ bool ior_has_transmission(const c_t ior) noexcept {
     return m::sqr(m::abs(ior.imag())) / std::norm(ior) <= f_t(1e-2);
 }
 
+/**
+ * @brief The textures of the scene's materials that vary over surfaces (see
+ *        `kernel::texture`): bitmaps, at transformed UVs, scaled by constant
+ *        textures. Materials register theirs (`register_bsdf`) before they
+ *        are compiled at any wavenumber.
+ */
+class textures_t {
+public:
+    /** @brief A texture at a wavenumber: a constant factor, times the value of `texture` (unless no_texture). */
+    struct compiled_t {
+        f_t factor;
+        std::uint32_t texture;
+    };
+
+    /** @brief Registers the textures of `bsdf` and the BSDFs it nests, refusing those the GPU cannot look up. */
+    void register_bsdf(const bsdf::bsdf_t& bsdf) {
+        if (const auto* two_sided = dynamic_cast<const bsdf::two_sided_t*>(&bsdf); two_sided) {
+            register_bsdf(*two_sided->nested_bsdf());
+        } else if (const auto* composite = dynamic_cast<const bsdf::composite_t*>(&bsdf); composite) {
+            for (const auto& nested : composite->nested_bsdfs())
+                register_bsdf(*nested.second);
+        } else if (const auto* scale = dynamic_cast<const bsdf::scale_t*>(&bsdf); scale) {
+            register_texture(*scale->scale_texture(), bsdf);
+            register_bsdf(*scale->nested_bsdf());
+        } else if (const auto* normalmap = dynamic_cast<const bsdf::normalmap_t*>(&bsdf); normalmap) {
+            register_normalmap(*normalmap);
+            register_bsdf(*normalmap->nested_bsdf());
+        } else if (const auto* diffuse = dynamic_cast<const bsdf::diffuse_t*>(&bsdf); diffuse) {
+            register_texture(*diffuse->reflectance(), bsdf);
+        } else if (const auto* spm = dynamic_cast<const bsdf::surface_spm_t*>(&bsdf); spm) {
+            if (const auto* roughness = roughness_texture(*spm); roughness)
+                register_texture(*roughness, bsdf);
+        }
+        // compile_bsdf refuses other BSDFs
+    }
+
+    /**
+     * @brief The normal map of a material (`kernel::material_shading`): of a
+     *        `normalmap_t` that the BSDF's shading frame comes from.
+     */
+    [[nodiscard]] kernel::material_shading shading_of(const bsdf::bsdf_t& bsdf) const {
+        kernel::material_shading ret{ .normalmap = kernel::no_texture, .normalmap_flip = 0 };
+        // the BSDFs that pass shading_frame on to the nested BSDF (composite_t does not)
+        const bsdf::bsdf_t* b = &bsdf;
+        for (;;) {
+            if (const auto* two_sided = dynamic_cast<const bsdf::two_sided_t*>(b); two_sided) {
+                b = two_sided->nested_bsdf().get();
+            } else if (const auto* scale = dynamic_cast<const bsdf::scale_t*>(b); scale) {
+                b = scale->nested_bsdf().get();
+            } else if (const auto* normalmap = dynamic_cast<const bsdf::normalmap_t*>(b); normalmap) {
+                if (ret.normalmap!=kernel::no_texture)
+                    throw gpu_error_t(std::format(
+                        "GPU rendering does not support nested normal maps (BSDF <{}>)", bsdf.get_id()));
+                ret.normalmap = registered.at(normalmap->normalmap_texture().get());
+                ret.normalmap_flip = normalmap->is_flipped() ? 1 : 0;
+                b = normalmap->nested_bsdf().get();
+            } else {
+                return ret;
+            }
+        }
+    }
+
+    /** @brief A registered texture at wavenumber `k`. */
+    [[nodiscard]] compiled_t compile(const texture::texture_t& texture, const wavenumber_t k,
+                                     const bsdf::bsdf_t& of) const {
+        const auto c = canonical(texture, k, of);
+        return { c.factor, c.bitmap ? registered.at(&texture) : kernel::no_texture };
+    }
+
+    /** @brief The roughness texture of a roughness-parametrized fractal or gaussian surface profile, or nullptr. */
+    [[nodiscard]] static const texture::texture_t* roughness_texture(const bsdf::surface_spm_t& spm) noexcept {
+        const auto* profile = spm.surface_profile().get();
+        if (const auto* fractal = dynamic_cast<const surface_profile::fractal_t*>(profile); fractal)
+            return fractal->roughness_texture();
+        if (const auto* gaussian = dynamic_cast<const surface_profile::gaussian_t*>(profile); gaussian)
+            return gaussian->roughness_texture();
+        return nullptr;
+    }
+
+    std::vector<kernel::texture> textures;
+    std::vector<kernel::bitmap> bitmaps;
+    std::vector<float> texels;
+
+private:
+    /** @brief A texture in the form of `kernel::texture`: factor * bitmap(M*uv + t), or a constant (no bitmap). */
+    struct canonical_t {
+        f_t factor = 1;
+        const texture::bitmap_t* bitmap = nullptr;
+        mat2_t M = mat2_t{ 1 };
+        vec2_t t = vec2_t{ 0 };
+    };
+
+    /** @brief `texture` in canonical form; its factor at wavenumber `k`, or 1 without. */
+    static canonical_t canonical(const texture::texture_t& texture, const std::optional<wavenumber_t> k,
+                                 const bsdf::bsdf_t& of) {
+        if (const auto* constant = dynamic_cast<const texture::constant_t*>(&texture); constant)
+            return { .factor = k ? constant->get_spectrum()->f(*k) : f_t(1) };
+        if (const auto* bitmap = dynamic_cast<const texture::bitmap_t*>(&texture); bitmap)
+            return { .bitmap = bitmap };
+        if (const auto* transform = dynamic_cast<const texture::transform_t*>(&texture); transform) {
+            // the nested texture's lookup at transform's M*uv + t
+            auto c = canonical(*transform->get_nested_texture(), k, of);
+            c.t = c.M*transform->get_translation() + c.t;
+            c.M = c.M*transform->get_matrix();
+            return c;
+        }
+        if (const auto* scale = dynamic_cast<const texture::scale_t*>(&texture); scale) {
+            auto a = canonical(*scale->get_nested_texture(), k, of);
+            auto b = canonical(*scale->get_scale_texture(), k, of);
+            if (a.bitmap && b.bitmap)
+                throw gpu_error_t(std::format(
+                    "GPU rendering does not support scale textures of two bitmaps yet (BSDF <{}>)", of.get_id()));
+            if (b.bitmap) {
+                b.factor *= a.factor;
+                return b;
+            }
+            a.factor *= b.factor;
+            return a;
+        }
+        throw gpu_error_t(std::format(
+            "GPU rendering supports only bitmap, constant, scale and transform textures so far; "
+            "BSDF <{}> has a '{}' texture", of.get_id(), type_of(texture)));
+    }
+
+    void register_texture(const texture::texture_t& texture, const bsdf::bsdf_t& of) {
+        if (registered.contains(&texture))
+            return;
+        const auto c = canonical(texture, std::nullopt, of);
+        if (!c.bitmap)
+            return;
+
+        // glm matrices are column-major
+        kernel::texture t{};
+        t.bitmap = bitmap_index(*c.bitmap, of);
+        t.rgb = c.bitmap->is_RGB() ? 1 : 0;
+        t.M[0] = real(c.M[0][0]); t.M[1] = real(c.M[1][0]);
+        t.M[2] = real(c.M[0][1]); t.M[3] = real(c.M[1][1]);
+        t.t[0] = real(c.t.x); t.t[1] = real(c.t.y);
+        registered.emplace(&texture, std::uint32_t(textures.size()));
+        textures.push_back(t);
+    }
+
+    /** @brief The texture that `texture`'s transforms, if any, transform. */
+    static const texture::texture_t* innermost(const texture::texture_t& texture) noexcept {
+        const auto* t = &texture;
+        while (const auto* transform = dynamic_cast<const texture::transform_t*>(t))
+            t = transform->get_nested_texture();
+        return t;
+    }
+
+    void register_normalmap(const bsdf::normalmap_t& normalmap) {
+        // normalmap_t::shading_frame uses the texture's RGBA, of a bitmap (constant textures have none)
+        const auto& texture = *normalmap.normalmap_texture();
+        const auto c = canonical(texture, std::nullopt, normalmap);
+        if (!c.bitmap || !dynamic_cast<const texture::bitmap_t*>(innermost(texture)))
+            throw gpu_error_t(std::format(
+                "GPU rendering supports only bitmap (and transform) normal map textures (BSDF <{}>)",
+                normalmap.get_id()));
+        register_texture(texture, normalmap);
+    }
+
+    /** @brief A bitmap's texels, converted to linear floating point (as `texture2d_tmpl_t::texel_native`). */
+    std::uint32_t bitmap_index(const texture::bitmap_t& bitmap, const bsdf::bsdf_t& of) {
+        const auto& tex = *bitmap.get_texture();
+        if (const auto it = bitmap_of.find(&tex); it!=bitmap_of.end())
+            return it->second;
+
+        using bitmap::pixel_layout_e;
+        const auto layout = tex.pixel_layout();
+        if (layout==pixel_layout_e::Custom)
+            throw gpu_error_t(std::format(
+                "GPU rendering does not support bitmaps of a custom pixel layout (BSDF <{}>)", of.get_id()));
+        const auto dim = tex.dimensions();
+        const std::uint32_t components = tex.components();
+        const std::uint64_t count = std::uint64_t(dim.x)*dim.y*components;
+        if (texels.size()+count > std::uint64_t(1)<<32)
+            throw gpu_error_t("GPU rendering supports bitmaps of up to 2^32 texel components in all");
+
+        const auto& config = tex.get_config();
+        kernel::bitmap bm{};
+        bm.offset = std::uint32_t(texels.size());
+        bm.width = dim.x;
+        bm.height = dim.y;
+        bm.layout = layout==pixel_layout_e::L ? kernel::layout_L :
+                    layout==pixel_layout_e::LA ? kernel::layout_LA :
+                    layout==pixel_layout_e::RGB ? kernel::layout_RGB : kernel::layout_RGBA;
+        bm.components = components;
+        bm.filter = std::uint32_t(config.filter);
+        bm.uwrap = std::uint32_t(config.uwrap);
+        bm.vwrap = std::uint32_t(config.vwrap);
+        bm.clamp = std::uint32_t(config.texel_clamp_mode);
+        // the black or white texels outside the bitmap (texel() returns them in RGBA)
+        using bitmap::texture_wrap_mode_e;
+        const auto outside = [](texture_wrap_mode_e wrap) {
+            return wrap==texture_wrap_mode_e::black || wrap==texture_wrap_mode_e::white;
+        };
+        bm.outside_u = outside(config.uwrap) ? real(tex.texel({ -1,0 }).x) : real(0);
+        bm.outside_v = outside(config.vwrap) ? real(tex.texel({ 0,-1 }).x) : real(0);
+
+        // texels in the bitmap's layout, from RGBA (`convert_pixel_layout`)
+        texels.reserve(texels.size()+count);
+        for (std::uint32_t y=0; y<dim.y; ++y)
+        for (std::uint32_t x=0; x<dim.x; ++x) {
+            const auto rgba = tex.texel({ std::int32_t(x), std::int32_t(y) });
+            if (layout==pixel_layout_e::L) {
+                texels.push_back(float(rgba.x));
+            } else if (layout==pixel_layout_e::LA) {
+                texels.push_back(float(rgba.x));
+                texels.push_back(float(rgba.w));
+            } else {
+                for (std::uint32_t c=0; c<components; ++c)
+                    texels.push_back(float(rgba[c]));
+            }
+        }
+
+        const auto index = std::uint32_t(bitmaps.size());
+        bitmaps.push_back(bm);
+        bitmap_of.emplace(&tex, index);
+        return index;
+    }
+
+    std::map<const texture::texture_t*, std::uint32_t> registered;
+    std::map<const bitmap::texture2d_t*, std::uint32_t> bitmap_of;
+};
+
 /** @brief The surface profile of a `surface_spm_t` at wavenumber `k` (see `kernel::material`). */
-void compile_surface_profile(const bsdf::surface_spm_t& spm, const wavenumber_t k, kernel::material& m) {
+void compile_surface_profile(const bsdf::surface_spm_t& spm, const wavenumber_t k, const textures_t& textures,
+                             kernel::material& m) {
     const auto& profile = *spm.surface_profile();
     if (dynamic_cast<const surface_profile::dirac_t*>(&profile)) {
         m.profile = kernel::profile_dirac;
@@ -240,46 +472,48 @@ void compile_surface_profile(const bsdf::surface_spm_t& spm, const wavenumber_t 
     if (!fractal && !gaussian)
         throw gpu_error_t(std::format(
             "GPU rendering does not support '{}' surface profiles yet (BSDF <{}>)", type_of(profile), spm.get_id()));
-    if (fractal ? !fractal->has_constant_textures() : !gaussian->has_constant_textures())
+    m.profile = fractal ? kernel::profile_fractal : kernel::profile_gaussian;
+    if (fractal)
+        m.gamma = real(fractal->get_gamma());
+
+    // a textured roughness: the kernel derives the parameters where paths hit (`set_profile_roughness`)
+    if (const auto* roughness = textures_t::roughness_texture(spm); roughness) {
+        const auto r = textures.compile(*roughness, k, spm);
+        if (r.texture!=kernel::no_texture) {
+            m.roughness = real(r.factor);
+            m.roughness_texture = r.texture;
+            return;
+        }
+    } else if (fractal ? !fractal->has_constant_textures() : !gaussian->has_constant_textures()) {
         throw gpu_error_t(std::format(
-            "GPU rendering supports only constant surface roughness so far; BSDF <{}> has a textured '{}' "
-            "surface profile", spm.get_id(), type_of(profile)));
+            "GPU rendering supports textured surface profiles only of a (perceptual) roughness; BSDF <{}> has a "
+            "textured '{}' surface profile", spm.get_id(), type_of(profile)));
+    }
 
     // constant textures: any query will do
     const auto query = texture::texture_query_t{ .uv = {}, .k = k };
     const auto k_mm = f_t(k * u::mm);
     if (fractal) {
         const auto params = fractal->parameters(query);
-        m.profile = kernel::profile_fractal;
         m.K = real(u::to_num(k*k * params.T));
-        m.gamma = real(fractal->get_gamma());
         m.sigma2_norm = real(params.sigma2_norm);
         m.alpha_k = real(params.alpha * m::sqr(k_mm));
     } else {
         const auto params = gaussian->parameters(query);
-        m.profile = kernel::profile_gaussian;
         m.s2 = real(u::to_num(params.sigma2 / (k*k)));
         m.sigma2_norm = real(params.sigma2_norm);
         m.alpha_k = real(params.alpha * m::sqr(k_mm));
     }
 }
 
-kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k) {
+kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k, const textures_t& textures) {
     kernel::material m{};
     m.type = kernel::material_absorbing;
     m.scale = 1;
+    m.scale_texture = m.roughness_texture = m.reflectance_texture = kernel::no_texture;
 
-    // the value of a texture, which must be constant (the GPU has no texture lookups)
-    const auto constant_texture = [&](const texture::texture_t& texture, const bsdf::bsdf_t& of) {
-        const auto* constant = dynamic_cast<const texture::constant_t*>(&texture);
-        if (!constant)
-            throw gpu_error_t(std::format(
-                "GPU rendering supports only constant textures so far; BSDF <{}> has a '{}' texture",
-                of.get_id(), type_of(texture)));
-        return constant->get_spectrum()->f(k);
-    };
-
-    // unwrap the BSDFs that select, reorient or scale another
+    // unwrap the BSDFs that select, reorient or scale another (normal maps perturb the shading frame instead,
+    // see `textures_t::shading_of`)
     const bsdf::bsdf_t* b = &bsdf;
     for (;;) {
         if (const auto* two_sided = dynamic_cast<const bsdf::two_sided_t*>(b); two_sided) {
@@ -291,8 +525,18 @@ kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k) {
             if (!b)
                 return m;
         } else if (const auto* scale = dynamic_cast<const bsdf::scale_t*>(b); scale) {
-            m.scale *= real(constant_texture(*scale->scale_texture(), *scale));
+            const auto s = textures.compile(*scale->scale_texture(), k, *scale);
+            m.scale *= real(s.factor);
+            if (s.texture!=kernel::no_texture) {
+                if (m.scale_texture!=kernel::no_texture)
+                    throw gpu_error_t(std::format(
+                        "GPU rendering supports one textured scale BSDF per material so far (BSDF <{}>)",
+                        bsdf.get_id()));
+                m.scale_texture = s.texture;
+            }
             b = scale->nested_bsdf().get();
+        } else if (const auto* normalmap = dynamic_cast<const bsdf::normalmap_t*>(b); normalmap) {
+            b = normalmap->nested_bsdf().get();
         } else {
             break;
         }
@@ -302,7 +546,10 @@ kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k) {
 
     if (const auto* diffuse = dynamic_cast<const bsdf::diffuse_t*>(b); diffuse) {
         m.type = kernel::material_diffuse;
-        m.reflectance = real(m::clamp01<f_t>(constant_texture(*diffuse->reflectance(), *diffuse)));
+        const auto r = textures.compile(*diffuse->reflectance(), k, *diffuse);
+        // diffuse_t clamps the reflectance; the kernel clamps a textured one where paths hit
+        m.reflectance_texture = r.texture;
+        m.reflectance = real(r.texture==kernel::no_texture ? m::clamp01<f_t>(r.factor) : r.factor);
         return m;
     }
 
@@ -313,7 +560,7 @@ kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k) {
         m.eta = { real(eta.real()), real(eta.imag()) };
         m.reflection_scale = real(spm->reflectivity_scale(k));
         m.transmission_scale = real(spm->transmissivity_scale(k));
-        compile_surface_profile(*spm, k, m);
+        compile_surface_profile(*spm, k, textures, m);
         return m;
     }
 
@@ -322,12 +569,13 @@ kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k) {
 }
 
 /**
- * @brief Compiles the geometry, with the emitters of shapes `shape_emitter`;
- *        returns the materials' BSDFs (compiled for each spectral sample).
+ * @brief Compiles the geometry, with the emitters of shapes `shape_emitter`,
+ *        and the materials' textures into `textures`; returns the materials'
+ *        BSDFs (compiled for each spectral sample).
  */
 std::vector<const bsdf::bsdf_t*> compile_geometry(const scene_t& scene, const ads::bvh8w_t& bvh,
                                                   const std::vector<std::uint32_t>& shape_emitter,
-                                                  plt_path_scene_t& out) {
+                                                  textures_t& textures, plt_path_scene_t& out) {
     std::vector<const bsdf::bsdf_t*> bsdfs;
     std::map<const bsdf::bsdf_t*, std::uint32_t> material_of;
     std::vector<std::uint32_t> shape_material(scene.shapes().size());
@@ -339,6 +587,26 @@ std::vector<const bsdf::bsdf_t*> compile_geometry(const scene_t& scene, const ad
         shape_material[i] = it->second;
     }
     out.material_count = std::uint32_t(bsdfs.size());
+
+    // the textures, and the triangles' UVs if any
+    for (const auto* bsdf : bsdfs)
+        textures.register_bsdf(*bsdf);
+    for (const auto* bsdf : bsdfs)
+        out.material_shadings.push_back(textures.shading_of(*bsdf));
+    if (!textures.textures.empty()) {
+        out.tri_uvs.resize(bvh.triangles_count());
+        for (std::size_t i=0; i<out.tri_uvs.size(); ++i) {
+            const auto& t = bvh.tri(ads::tuid_t{ ads::idx_t(i) });
+            const auto& mesh_tri = scene.shapes()[t.shape_idx]->get_mesh().triangle(t.shape_tri_idx);
+            for (int v=0; v<3; ++v) {
+                const auto uv = mesh_tri.uv ? (*mesh_tri.uv)[v] : vec2_t{ 0 };
+                out.tri_uvs[i].uv[v] = { real(uv.x), real(uv.y) };
+            }
+        }
+    }
+    out.textures = textures.textures;
+    out.bitmaps = textures.bitmaps;
+    out.texels = std::move(textures.texels);
 
     // shading data in the BVH's triangle order (see flatten() in src/gpu/gpu.cpp)
     const auto edge_id = [](const ads::tuid_t e) { return e ? std::uint32_t(e.uid) : kernel::no_edge; };
@@ -500,10 +768,11 @@ public:
     spectral_tables_t(const scene_t& scene, const sensor::sensor_t& sensor, const bool backward,
                       sensor_spectral_t sensor_spectral,
                       std::vector<const emitter::emitter_t*> emitters,
-                      std::vector<const bsdf::bsdf_t*> bsdfs)
+                      std::vector<const bsdf::bsdf_t*> bsdfs,
+                      textures_t textures)
         : scene(scene), sensor(sensor), backward(backward),
           sensor_spectral(std::move(sensor_spectral)),
-          emitters(std::move(emitters)), bsdfs(std::move(bsdfs))
+          emitters(std::move(emitters)), bsdfs(std::move(bsdfs)), textures(std::move(textures))
     {
         const bool single_wavelength = sensor.sensitivity_spectrum().wavenumber_range().length()==zero;
         per_emitter = single_wavelength ? 1 :
@@ -568,13 +837,18 @@ private:
         const auto components = film.pixel_layout().components;
         for (std::uint32_t c=0; c<4; ++c)
             s.response.c[c] = c<components ? real(film.response()->f(c, k)) : real(0);
+        // RGB uplift: the white, cyan, magenta, yellow, red, green and blue bases
+        const auto lambda = wavenum_to_wavelen(k);
+        const vec3_t bases[7] = { { 1,1,1 }, { 0,1,1 }, { 1,0,1 }, { 1,1,0 }, { 1,0,0 }, { 0,1,0 }, { 0,0,1 } };
+        for (int i=0; i<7; ++i)
+            s.uplift[i] = real(colourspace::RGB_to_spectral::uplift(bases[i], lambda));
         current.samples.push_back(s);
 
         for (const auto* e : emitters)
             current.emissions.push_back(compile_emission(*e, k, recp));
 
         for (const auto* bsdf : bsdfs)
-            current.materials.push_back(compile_bsdf(*bsdf, k));
+            current.materials.push_back(compile_bsdf(*bsdf, k, textures));
     }
 
     /** @brief An emitter's `kernel::emission` at wavenumber `k`, times the spectral sampling weight `recp`. */
@@ -622,6 +896,7 @@ private:
     sensor_spectral_t sensor_spectral;
     std::vector<const emitter::emitter_t*> emitters;
     std::vector<const bsdf::bsdf_t*> bsdfs;
+    textures_t textures;
 
     std::uint32_t per_emitter;
     bool fixed;
@@ -644,10 +919,11 @@ renderer_t::renderer_t(const device_t& device,
     auto sensor_spectral = compile_sensor(sensor, backward, compiled);
     std::vector<std::uint32_t> shape_emitter;
     auto emitters = compile_emitters(scene, sensor, *bvh, compiled, shape_emitter);
-    auto bsdfs = compile_geometry(scene, *bvh, shape_emitter, compiled);
+    textures_t textures;
+    auto bsdfs = compile_geometry(scene, *bvh, shape_emitter, textures, compiled);
     // the first pass's table: compiles the BSDFs, refusing those the GPU does not support
     spectra = std::make_unique<spectral_tables_t>(scene, sensor, backward, std::move(sensor_spectral),
-                                                  std::move(emitters), std::move(bsdfs));
+                                                  std::move(emitters), std::move(bsdfs), std::move(textures));
     compiled.samples_per_emitter = spectra->samples_per_emitter();
 
     paths_per_spe = std::uint64_t(compiled.film.width) * compiled.film.height;

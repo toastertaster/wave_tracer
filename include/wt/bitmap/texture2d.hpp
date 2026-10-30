@@ -91,6 +91,11 @@ public:
     [[nodiscard]] virtual texture_filter_type_e get_tex_filter() const noexcept = 0;
 
     /**
+     * @brief Returns the texture filtering configuration (filter, wrap and clamp modes).
+     */
+    [[nodiscard]] inline const texture2d_config_t& get_config() const noexcept { return config; }
+
+    /**
      * @brief Returns the pixel layout.
      */
     [[nodiscard]] inline const auto pixel_layout() const noexcept { return storage.layout.layout; }
