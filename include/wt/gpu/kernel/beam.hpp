@@ -375,6 +375,10 @@ struct operator_rows {
     WT_GPU_FN stokes observe_unpolarized(stokes r0, real I) const {
         return { r0.s0*I, r[0].s0*I, r[1].s0*I, r[2].s0*I };
     }
+    /** @brief The operator (of first row `r0`) times Stokes parameters `S` (in its incident frame). */
+    WT_GPU_FN stokes observe(stokes r0, stokes S) const {
+        return { dot(r0,S), dot(r[0],S), dot(r[1],S), dot(r[2],S) };
+    }
 };
 template <>
 struct operator_rows<false> {
@@ -383,6 +387,7 @@ struct operator_rows<false> {
     WT_GPU_FN void add(const WT_GPU_THREAD operator_rows&, frame, frame) {}
     WT_GPU_FN void compose(mueller_block, frame, frame) {}
     WT_GPU_FN real observe_unpolarized(stokes r0, real I) const { return r0.s0*I; }
+    WT_GPU_FN real observe(stokes r0, stokes S) const { return dot(r0,S); }
 };
 
 /**
@@ -411,6 +416,14 @@ struct beam_t {
      */
     WT_GPU_FN observed_t<Polarimetric> observe_unpolarized(real I) const {
         return rows.observe_unpolarized(S, I);
+    }
+    /**
+     * @brief Backward transport: what the beam's sensor observes of a forward
+     *        beam, of opposite direction, of Stokes parameters `So` in frame
+     *        `f` (`integrate_beams`).
+     */
+    WT_GPU_FN observed_t<Polarimetric> observe(stokes So, frame f) const {
+        return rows.observe(S, reorient(So, f, Sframe));
     }
 
     /** @brief Scales the radiometric data. */
@@ -481,6 +494,23 @@ struct beam_t {
             const frame SPout = sp_frame(s, wo);
             S = reorient(M * reorient(S, Sframe, SPin), SPout, new_frame);
             Sframe = new_frame;
+        }
+    }
+
+    /**
+     * @brief The radiometric part of `transform_surface_interaction`, for
+     *        plt_bdpt's connections, which observe the scattered beam but do
+     *        not trace it: as `apply_bsdf`, but forward, `S` ends in the sp
+     *        frame of `wo`, rather than in the frame of a new envelope. (Both
+     *        frames have the normal `wo`: what a sensor observes of the beam is
+     *        the same.) The envelope is left as it was.
+     */
+    WT_GPU_FN void scatter(const WT_GPU_THREAD surface& s, vec3 wo, mueller_block M, bool backward) {
+        if (backward) {
+            apply_bsdf(s, wo, M, true);
+        } else {
+            S = M * reorient(S, Sframe, sp_frame(s, Sframe.n));
+            Sframe = sp_frame(s, wo);
         }
     }
 

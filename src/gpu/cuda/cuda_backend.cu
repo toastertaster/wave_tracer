@@ -25,6 +25,7 @@
 
 #include <wt/gpu/backend.hpp>
 #include <wt/gpu/kernel/plt_path.hpp>
+#include <wt/gpu/kernel/plt_bdpt.hpp>
 #include "cuda_util.hpp"
 
 #if defined(WT_GPU_OPTIX) && !defined(WT_GPU_DBL_PRECISION)
@@ -88,10 +89,10 @@ __global__ void intersect_balls_kernel(k::bvh_view bvh, const k::ball* queries, 
 
 
 /*
- * plt_path
+ * plt_path and plt_bdpt
  */
 
-/** @brief Geometry queries for the path tracer: the CUDA BVH traversals. */
+/** @brief Geometry queries for the path tracers: the CUDA BVH traversals. */
 struct cuda_bvh_geometry_t {
     k::bvh_view bvh;
 
@@ -107,7 +108,10 @@ struct cuda_bvh_geometry_t {
     }
 };
 
-/** @brief The film, and its reconstruction weights (backward transport), accumulated in double precision. */
+/**
+ * @brief A film image, and its reconstruction weights (of block splats),
+ *        accumulated in double precision.
+ */
 struct cuda_film_t {
     double* values;
     double* weights;
@@ -132,10 +136,10 @@ struct path_entry_t {
 };
 
 /**
- * @brief Paths in flight, each in a slot: its state and its scratch memory.
- *        Unused slots are on a stack, `free_slots`. `table_paths` (if not
- *        null) counts the paths in flight of each spectral table, of
- *        `table_size` samples.
+ * @brief Paths in flight, each in a slot: its state and its scratch memory
+ *        (plt_path), or its subpaths' vertices (plt_bdpt). Unused slots are
+ *        on a stack, `free_slots`. `table_paths` (if not null) counts the
+ *        paths in flight of each spectral table, of `table_size` samples.
  */
 struct path_pool_t {
     void* paths;                    // `k::path_state_t<P>` of the paths' sensor (see `states`)
@@ -148,6 +152,10 @@ struct path_pool_t {
     k::u32 tri_capacity, edge_capacity;
     k::u32* table_paths;
     k::u32 table_size;
+    // plt_bdpt: `vertex_capacity` vertices of each subpath
+    void* sensor_vertices;          // `k::bdpt_vertex<P>` of the paths' sensor (see `sensor_verts`)
+    k::bdpt_vertex<false>* emitter_vertices;
+    k::u32 vertex_capacity;
 
     /** @brief `count` paths start with spectral table `table` (the first thread of a launch counts them). */
     __device__ void paths_started(k::u32 table, k::u32 count) const {
@@ -163,6 +171,16 @@ struct path_pool_t {
     /** @brief The path states, of a polarimetric sensor (`P`) or not. */
     template <bool P>
     __device__ k::path_state_t<P>* states() const { return static_cast<k::path_state_t<P>*>(paths); }
+
+    /** @brief The sensor subpath vertices of a plt_bdpt path, of a polarimetric sensor (`P`) or not. */
+    template <bool P>
+    __device__ k::bdpt_vertex<P>* sensor_verts(k::u32 slot) const {
+        return static_cast<k::bdpt_vertex<P>*>(sensor_vertices) + std::size_t(slot)*vertex_capacity;
+    }
+    /** @brief The emitter subpath vertices of a plt_bdpt path. */
+    __device__ k::bdpt_vertex<false>* emitter_verts(k::u32 slot) const {
+        return emitter_vertices + std::size_t(slot)*vertex_capacity;
+    }
 
     __device__ k::path_scratch scratch(k::u32 slot) const {
         return {
@@ -217,13 +235,22 @@ __global__ void fill_free_slots_kernel(k::u32* free_slots, k::u32 count) {
  * (`k::path_state_t`).
  */
 
+/** @brief Path `base+i` with `seed` (and a spectral sample of its table), or `list[base+i]` if `list` is given. */
+__device__ path_entry_t path_entry(std::uint64_t base, k::u32 i, const path_entry_t* list, std::uint32_t seed) {
+    return list ? list[base+i] : path_entry_t{ base+i, 0, seed, k::choose_spectral };
+}
+
+/** @brief A path's random number generator: its index and seed determine it. */
+__device__ k::rng path_rng(const path_entry_t& e) {
+    return k::rng::for_path(e.seed, k::u32(e.path), k::u32(e.path>>32));
+}
+
 /** @brief Path `base+i` with `seed` and spectral table `table`, or `list[base+i]` if `list` is given. */
 template <bool P>
 __device__ k::path_state_t<P> start_path(const k::plt_scene& scene, std::uint64_t base, k::u32 i,
                                          const path_entry_t* list, std::uint32_t seed, k::u32 table) {
-    const path_entry_t e = list ? list[base+i] : path_entry_t{ base+i, 0, seed, k::choose_spectral };
-    const auto rnd = k::rng::for_path(e.seed, k::u32(e.path), k::u32(e.path>>32));
-    return k::start_path<P>(scene, rnd, e.path, e.skip, table, e.spectral);
+    const path_entry_t e = path_entry(base, i, list, seed);
+    return k::start_path<P>(scene, path_rng(e), e.path, e.skip, table, e.spectral);
 }
 
 /**
@@ -382,6 +409,38 @@ __global__ void __launch_bounds__(block_size, 3) run_paths_kernel(k::plt_scene s
 }
 
 /**
+ * @brief Traces `count` whole plt_bdpt paths (see `k::trace_bdpt_path`), one
+ *        per thread, path `i` with the vertices and scratch memory of slot
+ *        `i`, splatting into `film` and its light image `light`. Paths that
+ *        outgrow them, which splat nothing, are listed in `overflow`.
+ */
+template <bool P>
+__global__ void __launch_bounds__(block_size, 2) run_bdpt_paths_kernel(k::plt_scene scene, path_pool_t pool,
+                                        std::uint64_t base, k::u32 count, const path_entry_t* list,
+                                        std::uint32_t seed, k::u32 table, cuda_film_t film, cuda_film_t light,
+                                        step_counters_t* counters, path_entry_t* overflow,
+                                        std::uint32_t* status) {
+    const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i>=count) return;
+
+    pool.paths_started(table, count);
+    const path_entry_t e = path_entry(base, i, list, seed);
+    const cuda_bvh_geometry_t geometry = { scene.bvh };
+
+    k::u32 s = k::status_ok;
+    const k::u32 spectral = k::trace_bdpt_path(scene, geometry, film, light, pool.scratch(i),
+                                               pool.sensor_verts<P>(i), pool.emitter_verts(i), pool.vertex_capacity,
+                                               path_rng(e), e.path, table, e.spectral, s);
+    if (s & k::status_scratch_overflow) {
+        overflow[atomicAdd(&counters->overflowed, 1u)] = { e.path, 0, e.seed, spectral };
+        s &= ~k::status_scratch_overflow;
+    }
+    pool.path_ended(spectral);
+    if (s!=k::status_ok)
+        atomicOr(status, s);
+}
+
+/**
  * @brief plt_path on the GPU, as a wavefront: a pool of paths in flight,
  *        advanced a step at a time, so that warps run paths still going (most
  *        paths end after a step or two), with the traversals in a kernel of
@@ -389,10 +448,13 @@ __global__ void __launch_bounds__(block_size, 3) run_paths_kernel(k::plt_scene s
  *        flight carry over from one `trace` to the next, so that the GPU does
  *        not idle while a pass's last, longest, paths finish. Ray-traced
  *        paths, whose steps are cheap, run whole, one per thread.
+ *
+ *        plt_bdpt paths run whole, one per thread, a pool's worth (as many
+ *        as their vertices' memory allows) per launch.
  */
-class cuda_plt_path_renderer_t final : public backend_renderer_t {
+class cuda_plt_renderer_t final : public backend_renderer_t {
 public:
-    cuda_plt_path_renderer_t(int ordinal, k::bvh_view bvh, const plt_path_scene_t& scene)
+    cuda_plt_renderer_t(int ordinal, k::bvh_view bvh, const plt_scene_t& scene)
         : ordinal(ordinal),
           polarimetric(scene.film.polarimetric!=0),
           table_size(scene.emitter_count*scene.samples_per_emitter)
@@ -415,9 +477,13 @@ public:
         film_size = weights_size * (scene.film.polarimetric!=0 ? 4 : 1);
         film.resize(film_size);
         check(cudaMemset(film.get(), 0, film_size*sizeof(double)), "clearing the film");
-        if (scene.params.backward!=0) {
+        if (scene.params.block_splats()) {
             film_weights.resize(weights_size);
             check(cudaMemset(film_weights.get(), 0, weights_size*sizeof(double)), "clearing the film");
+        }
+        if (scene.params.bdpt!=0) {
+            light_film.resize(film_size);
+            check(cudaMemset(light_film.get(), 0, film_size*sizeof(double)), "clearing the film");
         }
         const std::uint32_t zero = 0;
         status_word.upload(&zero, 1);
@@ -454,7 +520,7 @@ public:
             spectra.materials.size()!=std::size_t(table_size)*params.material_count)
             throw std::logic_error("the spectral table does not match the compiled scene");
         if (main.slots==0)
-            begin(main, pool_size, initial_capacity);
+            begin(main, initial_capacity);
 
         // the next table slot, once the paths of the table it holds have ended
         const k::u32 slot = next_table;
@@ -497,9 +563,8 @@ public:
             retained = {};
             retained_index.clear();
 
-            // as many paths in flight as fit the scratch memory of the main pool
             wavefront_t retry;
-            begin(retry, k::u32(std::max<std::size_t>(1, std::size_t(pool_size)*initial_capacity/capacity)), capacity);
+            begin(retry, capacity);
             path_list.upload(pending.data(), pending.size());
             path_source_t source = { 0, pending.size(), path_list.get() };
             advance(retry, source, 0, 0, 0, /* count table paths */ false);
@@ -516,10 +581,17 @@ public:
         set_device(ordinal);
         film.download(values, film_size);
         if (weights) {
-            if (params.params.backward==0)
+            if (!params.params.block_splats())
                 throw std::logic_error("forward transport accumulates no film weights");
             film_weights.download(weights, weights_size);
         }
+    }
+
+    void read_light_film(double* values) override {
+        set_device(ordinal);
+        if (params.params.bdpt==0)
+            throw std::logic_error("only plt_bdpt accumulates a light image");
+        light_film.download(values, film_size);
     }
 
 private:
@@ -528,6 +600,10 @@ private:
     /** @brief Triangles and edges a path holds at first; paths needing more are re-traced. */
     static constexpr k::u32 initial_capacity = 64;
     static constexpr k::u32 max_capacity = 1u<<20;
+    /** @brief plt_bdpt: vertices a subpath holds at first (at `initial_capacity`; growing with it). */
+    static constexpr k::u32 initial_vertex_capacity = 16;
+    /** @brief plt_bdpt: memory for paths in flight, which bounds their count. */
+    static constexpr std::size_t bdpt_pool_bytes = std::size_t(512)<<20;
     /** @brief Paths in flight few enough to finish in one launch, rather than a launch per step. */
     static constexpr k::u32 tail_size = 1024;
     /**
@@ -559,8 +635,34 @@ private:
         spectral_table_t table;
     };
 
-    /** @brief Starts an empty pool of `slots` paths with `capacity` scratch triangles and edges each. */
-    void begin(wavefront_t& wf, k::u32 slots, k::u32 capacity) {
+    /** @brief plt_bdpt: the vertices a subpath holds, at `capacity`; at most as many as it makes. */
+    [[nodiscard]] k::u32 vertex_capacity(k::u32 capacity) const noexcept {
+        const auto max_vertices = std::uint64_t(params.params.max_depth) + 2;
+        return k::u32(std::min<std::uint64_t>(max_vertices, std::uint64_t(initial_vertex_capacity)*capacity/initial_capacity));
+    }
+
+    /**
+     * @brief Starts an empty pool of paths with `capacity` scratch triangles
+     *        and edges each: as many as the main pool has scratch memory for
+     *        (plt_bdpt: as many as `bdpt_pool_bytes` holds).
+     */
+    void begin(wavefront_t& wf, k::u32 capacity) {
+        if (params.params.bdpt!=0) {
+            const auto vertices = vertex_capacity(capacity);
+            const std::size_t sensor_vertex_size =
+                polarimetric ? sizeof(k::bdpt_vertex<true>) : sizeof(k::bdpt_vertex<false>);
+            const std::size_t slot_size =
+                vertices*(sensor_vertex_size + sizeof(k::bdpt_vertex<false>)) + capacity*sizeof(k::u32);
+            const auto slots = k::u32(std::clamp<std::size_t>(bdpt_pool_bytes/slot_size, 1, pool_size));
+            sensor_vertices.resize(std::size_t(slots)*vertices*sensor_vertex_size/sizeof(uint4));
+            emitter_vertices.resize(std::size_t(slots)*vertices);
+            scratch_tris.resize(std::size_t(slots)*capacity);
+            overflow.resize(slots);
+            wf = { slots, capacity, 0, slots, 0 };
+            return;
+        }
+
+        const auto slots = k::u32(std::max<std::size_t>(1, std::size_t(pool_size)*initial_capacity/capacity));
         const std::size_t state_size = polarimetric ? sizeof(k::path_state_t<true>) : sizeof(k::path_state_t<false>);
         paths.resize(std::size_t(slots)*state_size/sizeof(uint4));
         traversals.resize(slots);
@@ -584,11 +686,16 @@ private:
             scratch_tris.get(), scratch_edges.get(), scratch_aperture.get(),
             wf.capacity, wf.capacity,
             count_table_paths ? table_paths.get() : nullptr, table_size,
+            sensor_vertices.get(), emitter_vertices.get(), vertex_capacity(wf.capacity),
         };
     }
 
     [[nodiscard]] cuda_film_t film_view() const noexcept {
         return { film.get(), film_weights.get() };
+    }
+    /** @brief plt_bdpt's light image, of direct splats. */
+    [[nodiscard]] cuda_film_t light_view() const noexcept {
+        return { light_film.get(), nullptr };
     }
 
     /** @brief Room for `count` spectral samples on the device. Moves them: only when no paths are in flight. */
@@ -629,15 +736,21 @@ private:
     void advance(wavefront_t& wf, path_source_t& source, std::uint32_t seed, k::u32 table, k::u32 keep,
                  bool count_table_paths = true) {
         const path_pool_t pool = this->pool(wf, count_table_paths);
-        if (params.params.ray_tracing_only!=0) {
+        if (params.params.ray_tracing_only!=0 || params.params.bdpt!=0) {
             // whole paths, a pool's worth per launch (nothing remains in flight)
             while (source.started<source.count) {
                 const auto n = k::u32(std::min<std::uint64_t>(wf.slots, source.count-source.started));
+                const auto base = source.list ? source.started : source.first+source.started;
                 check(cudaMemset(counters.get(), 0, sizeof(step_counters_t)), "clearing the step counters");
                 dispatch([&](auto P) {
-                    run_paths_kernel<P.value><<<grid_size(n), block_size>>>(
-                            params, pool, source.list ? source.started : source.first+source.started, n, source.list,
-                            seed, table, film_view(), counters.get(), overflow.get(), status_word.get());
+                    if (params.params.bdpt!=0)
+                        run_bdpt_paths_kernel<P.value><<<grid_size(n), block_size>>>(
+                                params, pool, base, n, source.list, seed, table, film_view(), light_view(),
+                                counters.get(), overflow.get(), status_word.get());
+                    else
+                        run_paths_kernel<P.value><<<grid_size(n), block_size>>>(
+                                params, pool, base, n, source.list, seed, table, film_view(),
+                                counters.get(), overflow.get(), status_word.get());
                 });
                 check(cudaGetLastError(), "launching the path kernel");
                 source.started += n;
@@ -767,7 +880,8 @@ private:
     device_buffer_t<k::bitmap>        bitmaps;
     device_buffer_t<float>            texels;
     device_buffer_t<double>           film;
-    device_buffer_t<double>           film_weights;     // backward transport
+    device_buffer_t<double>           film_weights;     // block splats
+    device_buffer_t<double>           light_film;       // plt_bdpt's direct splats
     std::size_t film_size = 0;
     std::size_t weights_size = 0;
     device_buffer_t<std::uint32_t>    status_word;
@@ -792,6 +906,8 @@ private:
     device_buffer_t<k::u32>            scratch_tris;
     device_buffer_t<k::u32>            scratch_edges;
     device_buffer_t<k::aperture_entry> scratch_aperture;
+    device_buffer_t<uint4>             sensor_vertices;  // plt_bdpt (`path_pool_t::sensor_verts`)
+    device_buffer_t<k::bdpt_vertex<false>> emitter_vertices;
     device_buffer_t<step_counters_t>   counters;
     device_buffer_t<path_entry_t>      overflow;
     device_buffer_t<path_entry_t>      path_list;
@@ -889,11 +1005,10 @@ public:
         tri_lists.download(out_tris, count*capacity);
     }
 
-    [[nodiscard]] std::unique_ptr<backend_renderer_t> create_plt_path_renderer(
-            const plt_path_scene_t& scene) override {
+    [[nodiscard]] std::unique_ptr<backend_renderer_t> create_plt_renderer(const plt_scene_t& scene) override {
         if (scene.tris.size()!=tri_count)
             throw std::runtime_error("the compiled scene does not match the uploaded geometry");
-        return std::make_unique<cuda_plt_path_renderer_t>(ordinal, view(), scene);
+        return std::make_unique<cuda_plt_renderer_t>(ordinal, view(), scene);
     }
 
 private:

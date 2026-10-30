@@ -20,6 +20,7 @@
 #include <wt/ads/bvh8w/bvh8w.hpp>
 #include <wt/scene/scene.hpp>
 #include <wt/integrator/plt_path/plt_path.hpp>
+#include <wt/integrator/plt_bdpt/plt_bdpt.hpp>
 #include <wt/emitter/area.hpp>
 #include <wt/emitter/directional.hpp>
 #include <wt/emitter/point.hpp>
@@ -69,19 +70,39 @@ std::string type_of(const scene::scene_element_t& element) {
 }
 
 void compile_integrator(const scene_t& scene, const sensor::sensor_t& sensor,
-                        plt_path_scene_t& out) {
+                        plt_scene_t& out) {
     const auto& integrator = scene.integrator();
-    const auto* plt_path = dynamic_cast<const integrator::plt_path_t*>(&integrator);
-    if (!plt_path)
-        throw gpu_error_t(std::format(
-            "GPU rendering supports only the 'plt_path' integrator, not '{}'", type_of(integrator)));
+    auto& params = out.params;
+    params = {};
+    params.ray_tracing_only = sensor.ray_trace_only() ? 1 : 0;
 
-    const auto& opts = plt_path->get_options();
-    out.params.backward = opts.transport_direction==bsdf::transport_e::backward ? 1 : 0;
-    out.params.max_depth = opts.max_depth;
-    out.params.russian_roulette = opts.RR ? 1 : 0;
-    out.params.fsd = opts.FSD ? 1 : 0;
-    out.params.ray_tracing_only = sensor.ray_trace_only() ? 1 : 0;
+    if (const auto* plt_path = dynamic_cast<const integrator::plt_path_t*>(&integrator); plt_path) {
+        const auto& opts = plt_path->get_options();
+        params.backward = opts.transport_direction==bsdf::transport_e::backward ? 1 : 0;
+        params.max_depth = opts.max_depth;
+        params.russian_roulette = opts.RR ? 1 : 0;
+        params.fsd = opts.FSD ? 1 : 0;
+        return;
+    }
+
+    if (const auto* plt_bdpt = dynamic_cast<const integrator::plt_bdpt_t*>(&integrator); plt_bdpt) {
+        const auto& opts = plt_bdpt->get_options();
+        // the CPU's bdpt diffracts with Fraunhofer free-space diffraction, which the GPU does not implement
+        if (opts.FSD && !sensor.ray_trace_only())
+            throw gpu_error_t(std::format(
+                "GPU rendering does not support plt_bdpt's free-space diffraction yet; set the integrator's FSD "
+                "to false, or ray trace (integrator <{}>)", integrator.get_id()));
+        params.bdpt = 1;
+        params.max_depth = opts.max_depth;
+        params.russian_roulette = opts.RR ? 1 : 0;
+        params.mis = opts.MIS ? 1 : 0;
+        params.sensor_direct = opts.sensor_direct ? 1 : 0;
+        params.emitter_direct = opts.emitter_direct ? 1 : 0;
+        return;
+    }
+
+    throw gpu_error_t(std::format(
+        "GPU rendering supports only the 'plt_path' and 'plt_bdpt' integrators, not '{}'", type_of(integrator)));
 }
 
 /** @brief A direction transform (as `transform_t::operator()(dir3_t)` applies it, before normalizing), row-major. */
@@ -102,7 +123,7 @@ void compile_direction_transform(const transform_t& t, real (&out)[9]) {
  *        `shape_emitter[i]` is the emitter of scene shape i, or no_emitter.
  */
 std::vector<const emitter::emitter_t*> compile_emitters(const scene_t& scene, const sensor::sensor_t& sensor,
-                                                        const ads::bvh8w_t& bvh, plt_path_scene_t& out,
+                                                        const ads::bvh8w_t& bvh, plt_scene_t& out,
                                                         std::vector<std::uint32_t>& shape_emitter) {
     shape_emitter.assign(scene.shapes().size(), kernel::no_emitter);
     std::vector<const emitter::emitter_t*> emitters;
@@ -575,7 +596,7 @@ kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k, co
  */
 std::vector<const bsdf::bsdf_t*> compile_geometry(const scene_t& scene, const ads::bvh8w_t& bvh,
                                                   const std::vector<std::uint32_t>& shape_emitter,
-                                                  textures_t& textures, plt_path_scene_t& out) {
+                                                  textures_t& textures, plt_scene_t& out) {
     std::vector<const bsdf::bsdf_t*> bsdfs;
     std::map<const bsdf::bsdf_t*, std::uint32_t> material_of;
     std::vector<std::uint32_t> shape_material(scene.shapes().size());
@@ -656,7 +677,7 @@ struct sensor_spectral_t {
 };
 
 template <std::size_t Dims, bool polarimetric>
-void compile_film(const sensor::film_t<Dims, polarimetric>& film, plt_path_scene_t& out) {
+void compile_film(const sensor::film_t<Dims, polarimetric>& film, plt_scene_t& out) {
     const auto size = film.dimensions();
     const auto components = film.pixel_layout().components;
     if (components>4)
@@ -677,7 +698,16 @@ void compile_film(const sensor::film_t<Dims, polarimetric>& film, plt_path_scene
     fd.rf_sigma = real(film.reconstruction_filter_stddev());
 }
 
-sensor_spectral_t compile_sensor(const sensor::sensor_t& sensor, const bool backward, plt_path_scene_t& out) {
+/** @brief A row-major 4x4 matrix of a transform (glm matrices are column-major). */
+void compile_matrix(const transform_t& t, real (&out)[16]) {
+    const auto& m = t.matrix();
+    for (int r=0; r<4; ++r)
+    for (int c=0; c<4; ++c)
+        out[4*r+c] = real(m[c][r]);
+}
+
+sensor_spectral_t compile_sensor(const sensor::sensor_t& sensor, const kernel::plt_params& params,
+                                 plt_scene_t& out) {
     auto& s = out.sensor;
 
     if (const auto* plane = dynamic_cast<const sensor::virtual_plane_sensor_t*>(&sensor); plane) {
@@ -705,30 +735,22 @@ sensor_spectral_t compile_sensor(const sensor::sensor_t& sensor, const bool back
                  [plane](wavenumber_t k) { return plane->sourcing_geometry(k); } };
     }
 
-    // perspective_t::sample; forward transport cannot reach a point sensor
+    // perspective_t::sample, sample_direct and the densities; forward plt_path cannot reach a point sensor
     const auto perspective = [&]<bool polarimetric>(const sensor::perspective_t<polarimetric>& perspective) {
-        if (!backward)
+        if (!params.sensor_paths())
             throw gpu_error_t(std::format(
                 "GPU rendering supports perspective sensors only with backward plt_path "
-                "(direction=\"backward\"); sensor <{}>", sensor.get_id()));
+                "(direction=\"backward\") or plt_bdpt; sensor <{}>", sensor.get_id()));
         s.type = kernel::sensor_perspective;
         s.position = to_kernel(perspective.position());
-        // glm matrices are column-major
-        const auto& to_camera = perspective.film_to_camera_transform().matrix();
-        for (int r=0; r<4; ++r)
-        for (int c=0; c<4; ++c)
-            s.to_camera[4*r+c] = real(to_camera[c][r]);
-        // directions transform by the inverse transpose (transform_t::operator()(dir3_t))
-        const auto dir_to_world = perspective.to_world_transform().inverse_transpose();
-        for (int c=0; c<3; ++c) {
-            auto e = vec3_t{ 0 };
-            e[c] = 1;
-            const auto column = dir_to_world(e, transform_vector);
-            for (int r=0; r<3; ++r)
-                s.dir_to_world[3*r+c] = real(column[r]);
-        }
+        compile_matrix(perspective.film_to_camera_transform(), s.to_camera);
+        compile_matrix(perspective.film_to_camera_transform().inverse(), s.to_film);
+        compile_direction_transform(perspective.to_world_transform(), s.dir_to_world);
+        compile_direction_transform(perspective.to_world_transform().inverse(), s.dir_to_local);
         s.ddir_dx = to_kernel(perspective.direction_pdvx());
         s.ddir_dy = to_kernel(perspective.direction_pdvy());
+        s.recp_sa_scale = real(u::to_num(perspective.recp_solid_angle_density_for_sample(dir3_t{ 0,0,1 }) /
+                                         u::ang::sr));
         compile_film(perspective.film(), out);
         return sensor_spectral_t{ perspective.film().response(), perspective.film().pixel_layout().components,
                                   [p = &perspective](wavenumber_t k) { return p->sourcing_geometry(k); } };
@@ -773,12 +795,12 @@ public:
     /** @brief Draws per pass, over all emitters, for sensors sensitive to more than one wavelength. */
     static constexpr std::uint32_t samples_per_table = 4096;
 
-    spectral_tables_t(const scene_t& scene, const sensor::sensor_t& sensor, const bool backward,
+    spectral_tables_t(const scene_t& scene, const sensor::sensor_t& sensor, const kernel::plt_params& params,
                       sensor_spectral_t sensor_spectral,
                       std::vector<const emitter::emitter_t*> emitters,
                       std::vector<const bsdf::bsdf_t*> bsdfs,
                       textures_t textures)
-        : scene(scene), sensor(sensor), backward(backward),
+        : scene(scene), sensor(sensor), params(params),
           sensor_spectral(std::move(sensor_spectral)),
           emitters(std::move(emitters)), bsdfs(std::move(bsdfs)), textures(std::move(textures))
     {
@@ -815,14 +837,16 @@ private:
     /** @brief Appends the spectral sample of wavenumber sample `ws`, drawn for an emitter of probability `emitter_pdf`. */
     void compile(const wavenumber_sample_t& ws, const f_t emitter_pdf) {
         const auto k = ws.k;
+        const bool sensor_paths = params.sensor_paths();
 
         // spectral (importance) sampling weight: plt_path::integrate_forward (one over the probability of
-        // the emitter and wavenumber sampled), integrate_backward (of the wavenumber, over all emitters)
+        // the emitter and wavenumber sampled), integrate_backward and plt_bdpt (of the wavenumber, over all
+        // emitters)
         const auto recp_wpd = ws.wpd.is_discrete() ?
             f_t(1) / wavenumber_density_t{ ws.wpd.mass() * u::mm } :
             f_t(1) / ws.wpd.density();
         const wavenumber_t recp_spectral_pd =
-            !backward ? recp_wpd / emitter_pdf :
+            !sensor_paths ? recp_wpd / emitter_pdf :
             ws.wpd.is_discrete() ? recp_wpd :
             f_t(1) / scene.sum_spectral_pdf_for_all_emitters(&sensor, k);
         // a wavenumber no emitter emits at contributes nothing
@@ -831,7 +855,14 @@ private:
 
         kernel::spectral_sample s{};
         s.k = real(u::to_inv_m(k));
-        if (backward) {
+        if (params.bdpt!=0 && recp>zero) {
+            // plt_bdpt without MIS weighs by one over the wavenumber's density (of its emitter), rather than `recp`
+            const auto k_density = ws.wpd.is_discrete() ?
+                wavenumber_density_t{ ws.wpd.mass() / wavenumber_t::unit } :
+                ws.wpd.density();
+            s.no_mis_scale = real(u::to_num(f_t(1) / (k_density * recp)));
+        }
+        if (sensor_paths) {
             // the beams the sensor sources, which must be isotropic cones
             const auto sourcing = sensor_spectral.sourcing(k);
             if (sourcing.surface || sourcing.initial_spatial_lengths.x!=sourcing.initial_spatial_lengths.y)
@@ -898,7 +929,7 @@ private:
 
     const scene_t& scene;
     const sensor::sensor_t& sensor;
-    bool backward;
+    kernel::plt_params params;
     sensor_spectral_t sensor_spectral;
     std::vector<const emitter::emitter_t*> emitters;
     std::vector<const bsdf::bsdf_t*> bsdfs;
@@ -919,16 +950,16 @@ renderer_t::renderer_t(const device_t& device,
     if (!bvh)
         throw gpu_error_t("the GPU supports only the bvh8w acceleration structure");
 
-    plt_path_scene_t compiled;
+    plt_scene_t compiled;
     compile_integrator(scene, sensor, compiled);
-    backward = compiled.params.backward!=0;
-    auto sensor_spectral = compile_sensor(sensor, backward, compiled);
+    params = compiled.params;
+    auto sensor_spectral = compile_sensor(sensor, params, compiled);
     std::vector<std::uint32_t> shape_emitter;
     auto emitters = compile_emitters(scene, sensor, *bvh, compiled, shape_emitter);
     textures_t textures;
     auto bsdfs = compile_geometry(scene, *bvh, shape_emitter, textures, compiled);
     // the first pass's table: compiles the BSDFs, refusing those the GPU does not support
-    spectra = std::make_unique<spectral_tables_t>(scene, sensor, backward, std::move(sensor_spectral),
+    spectra = std::make_unique<spectral_tables_t>(scene, sensor, params, std::move(sensor_spectral),
                                                   std::move(emitters), std::move(bsdfs), std::move(textures));
     compiled.samples_per_emitter = spectra->samples_per_emitter();
 
@@ -938,7 +969,7 @@ renderer_t::renderer_t(const device_t& device,
 
     geometry = device.upload(ads);
     try {
-        backend = geometry->backend->create_plt_path_renderer(compiled);
+        backend = geometry->backend->create_plt_renderer(compiled);
     } catch (const gpu_error_t&) {
         throw;
     } catch (const std::exception& e) {
@@ -987,12 +1018,17 @@ void renderer_t::write_film(sensor::film_storage_handle_t& film) const {
         if (!storage || storage->pixel_layout().components*paths_per_spe!=film_elements)
             throw gpu_error_t("GPU rendering expected the sensor's 2D film");
 
-        // as the CPU's integrators write: backward, block splats; forward, direct splats
+        // as the CPU's integrators write: backward plt_path, block splats; forward, direct splats; plt_bdpt,
+        // both (the direct splats into a light image of their own)
         std::vector<double> values(film_elements * storage->values_per_component);
-        if (backward) {
+        if (params.block_splats()) {
             std::vector<double> weights(film_elements);
             backend->read_film(values.data(), weights.data());
             storage->set_image(values.data(), weights.data());
+            if (params.bdpt!=0) {
+                backend->read_light_film(values.data());
+                storage->set_light_image(values.data());
+            }
         } else {
             backend->read_film(values.data(), nullptr);
             storage->set_light_image(values.data());

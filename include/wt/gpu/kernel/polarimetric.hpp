@@ -39,6 +39,11 @@ struct stokes {
     WT_GPU_FN stokes& operator+=(stokes o) { return *this = *this + o; }
 };
 
+/** @brief A row vector (of a Mueller operator) times Stokes parameters `S`. */
+WT_GPU_FN real dot(stokes r, stokes S) {
+    return fma(r.s3, S.s3, fma(r.s2, S.s2, fma(r.s1, S.s1, r.s0*S.s0)));
+}
+
 /**
  * @brief `stokes_parameters_t::reorient`: re-expresses `S`, given in frame
  *        `cur`, in frame `nw` (both frames share their normal, up to sign).

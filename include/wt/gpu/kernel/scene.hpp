@@ -209,21 +209,23 @@ struct emitter {
 
 /**
  * @brief An emitter at a spectral sample's wavenumber, divided by the spectral
- *        sampling density (of `plt_path::integrate_forward` or `integrate_backward`).
+ *        sampling density (of `plt_path::integrate_forward`, or of
+ *        `integrate_backward` and plt_bdpt).
  */
 struct emission {
     // sourced beams: isotropic cones (`sourcing_geometry`)
     real tan_alpha;
     real x0;
     /**
-     * @brief Forward transport: Watts per unit of a sourced beam's relative
-     *        Stokes parameters (the sampled beam's flux, `emitter_t::sample`).
+     * @brief Forward transport and plt_bdpt's emitter subpaths: Watts per unit
+     *        of a sourced beam's relative Stokes parameters (the sampled beam's
+     *        flux, `emitter_t::sample`).
      */
     real flux;
     /**
-     * @brief Backward transport: the radiant intensity (W/sr) of point and
-     *        spot emitters, the irradiance (W/m²) of directional emitters, the
-     *        radiance (W/m²/sr) of area emitters.
+     * @brief Backward transport and plt_bdpt's sensor subpaths: the radiant
+     *        intensity (W/sr) of point and spot emitters, the irradiance (W/m²)
+     *        of directional emitters, the radiance (W/m²/sr) of area emitters.
      */
     real intensity;
 };
@@ -233,7 +235,7 @@ constexpr u32 sensor_perspective = 1;
 
 /**
  * @brief A `sensor::virtual_plane_sensor_t` (`type` sensor_virtual_plane), or
- *        a `sensor::perspective_t` (sensor_perspective; backward transport only).
+ *        a `sensor::perspective_t` (sensor_perspective; not for forward plt_path).
  *        The beams it sources depend on the wavenumber: see `spectral_sample`.
  */
 struct sensor_desc {
@@ -253,8 +255,15 @@ struct sensor_desc {
     // perspective
     vec3 position;
     real to_camera[16];         // `sensor_to_camera_trns`, row-major: film position to camera-space point
+    real to_film[16];           // its inverse (`point_on_film`)
     real dir_to_world[9];       // `sensor_transform`'s inverse transpose, row-major: directions to world
+    real dir_to_local[9];       // ... and of its inverse: directions to camera space
     vec3 ddir_dx, ddir_dy;      // `direction_pdvx/y()`
+    /**
+     * @brief `recp_solid_angle_density_for_sample(d)` over d.z³: the sensor's
+     *        area over the image plane's distance squared.
+     */
+    real recp_sa_scale;
 };
 
 /** @brief Largest supported film reconstruction filter radius, in elements. */
@@ -297,19 +306,37 @@ struct spectral_sample {
      *        of the white, cyan, magenta, yellow, red, green and blue bases.
      */
     real uplift[7];
+    /**
+     * @brief plt_bdpt without MIS: the spectral weight of a contribution
+     *        (`1/((s+t+1)*k_density)`, without the 1/(s+t+1)), over the one
+     *        the emissions include (see `emission`).
+     */
+    real no_mis_scale;
 };
 
-/** @brief `integrator::plt_path_t::options_t`, and how the scene is rendered. */
-struct plt_path_params {
+/**
+ * @brief The integrator, `integrator::plt_path_t` or `integrator::plt_bdpt_t`,
+ *        its options, and how the scene is rendered.
+ */
+struct plt_params {
+    u32 bdpt;                   // plt_bdpt (else plt_path)
     u32 max_depth;
     u32 russian_roulette;
     u32 fsd;
     u32 ray_tracing_only;       // `sensor_t::ray_trace_only()`
-    u32 backward;               // transport direction: paths start at the sensor
+    u32 backward;               // plt_path's transport direction: paths start at the sensor
+    u32 mis;                    // plt_bdpt: multiple importance sampling of the connection strategies
+    u32 sensor_direct;          // plt_bdpt: connects emitter subpaths to sampled sensor points
+    u32 emitter_direct;         // plt_bdpt: connects sensor subpaths to sampled emitter points
+
+    /** @brief Paths start at the sensor: the spectral weighting and sensor beams of backward transport. */
+    WT_GPU_FN bool sensor_paths() const { return backward!=0 || bdpt!=0; }
+    /** @brief Splats into sensor elements' blocks: the film's image, of values and reconstruction weights. */
+    WT_GPU_FN bool block_splats() const { return backward!=0 || bdpt!=0; }
 };
 
 /**
- * @brief Everything a plt_path kernel reads.
+ * @brief Everything a plt_path or plt_bdpt kernel reads.
  *
  * Spectral samples come in tables: a table holds `samples_per_emitter`
  * samples of each emitter, emitter `e`'s from `base + e*samples_per_emitter`
@@ -343,7 +370,7 @@ struct plt_scene {
 
     sensor_desc sensor;
     film_desc film;
-    plt_path_params params;
+    plt_params params;
 };
 
 }

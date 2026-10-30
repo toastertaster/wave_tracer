@@ -18,9 +18,11 @@
  * silently rendering on the CPU. Supported so far:
  *   - the plt_path integrator, forward and backward transport (beams,
  *     free-space diffraction, or ray tracing);
- *   - virtual_plane (coverage) sensors, and, with backward transport,
- *     perspective sensors, polarimetric or not, of any response:
- *     paths draw wavenumbers as the CPU's do (see `spectral_tables_t`);
+ *   - the plt_bdpt integrator (beams without free-space diffraction, or
+ *     ray tracing);
+ *   - virtual_plane (coverage) sensors, and perspective sensors (but with
+ *     forward plt_path), polarimetric or not, of any response: paths draw
+ *     wavenumbers as the CPU's do (see `spectral_tables_t`);
  *   - point, spot and directional emitters, and area emitters of a constant
  *     radiance;
  *   - surface_spm BSDFs, smooth (Dirac surface profile) or rough (fractal
@@ -36,6 +38,7 @@
 #include <memory>
 
 #include <wt/gpu/gpu.hpp>
+#include <wt/gpu/kernel/scene.hpp>
 
 namespace wt {
 
@@ -92,8 +95,8 @@ public:
     /**
      * @brief Writes the accumulated samples into `film`, a film storage the
      *        sensor created for the integrator's splats: block splats
-     *        (backward transport) or direct splats (forward). Paths in flight
-     *        are missing (see `render`).
+     *        (backward plt_path), direct splats (forward plt_path), or both
+     *        (plt_bdpt). Paths in flight are missing (see `render`).
      */
     void write_film(sensor::film_storage_handle_t& film) const;
 
@@ -102,7 +105,7 @@ private:
     std::unique_ptr<backend_renderer_t> backend;
     std::unique_ptr<spectral_tables_t> spectra;
 
-    bool backward;
+    kernel::plt_params params;
     std::uint64_t paths_per_spe;
     std::size_t film_elements;          // film elements' components
     bool polarimetric = false;          // ... each a Stokes parameters vector

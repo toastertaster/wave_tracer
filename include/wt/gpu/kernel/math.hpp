@@ -97,6 +97,7 @@ constexpr real pi_2 = real(1.57079632679489661923);
 constexpr real pi_4 = real(0.78539816339744830962);
 constexpr real inv_pi = real(0.31830988618379067154);
 constexpr real inv_two_pi = real(0.15915494309189533577);
+constexpr real inv_four_pi = real(0.07957747154594766788);
 constexpr real inv_sqrt_two = real(0.70710678118654752440);
 constexpr real inv_sqrt_two_pi = real(0.39894228040143267794);
 constexpr real sqrt_pi_2 = real(1.25331413731550025121);

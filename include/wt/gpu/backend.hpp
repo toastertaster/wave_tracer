@@ -54,12 +54,12 @@ struct ball_hit_t {
 };
 
 /**
- * @brief A scene compiled for plt_path rendering of one sensor (see
- *        wt/gpu/kernel/scene.hpp), but for what depends on the wavenumber:
- *        see `spectral_table_t`. The device pointers of `kernel::plt_scene`
- *        are filled in by the backend.
+ * @brief A scene compiled for plt_path or plt_bdpt rendering of one sensor
+ *        (see wt/gpu/kernel/scene.hpp), but for what depends on the
+ *        wavenumber: see `spectral_table_t`. The device pointers of
+ *        `kernel::plt_scene` are filled in by the backend.
  */
-struct plt_path_scene_t {
+struct plt_scene_t {
     std::vector<kernel::tri_shading> tris;     // per BVH triangle
     std::vector<kernel::edge> edges;
     std::vector<kernel::emitter> emitters;
@@ -76,7 +76,7 @@ struct plt_path_scene_t {
     std::uint32_t samples_per_emitter;         // in each spectral table
     kernel::sensor_desc sensor;
     kernel::film_desc film;
-    kernel::plt_path_params params;
+    kernel::plt_params params;
 };
 
 /**
@@ -114,12 +114,15 @@ public:
      * @brief Copies the film to `values`: element (x,y) component c at
      *        `values[(y*width + x)*components + c]` (of a polarimetric film,
      *        its Stokes parameters at `values[((y*width + x)*components + c)*4 + i]`);
-     *        and, for backward transport, the sums of the reconstruction
-     *        weights splatted with them to `weights` (one per component;
-     *        nullptr skips them). Paths in flight have not
+     *        and, of block splats (backward plt_path, plt_bdpt), the sums of
+     *        the reconstruction weights splatted with them to `weights` (one
+     *        per component; nullptr skips them). Paths in flight have not
      *        contributed all of their splats yet.
      */
     virtual void read_film(double* values, double* weights) = 0;
+
+    /** @brief plt_bdpt: copies the film's light image, of direct splats, to `values` (as `read_film`). */
+    virtual void read_light_film(double* values) = 0;
 };
 
 /**
@@ -148,9 +151,8 @@ public:
                                  std::uint32_t capacity,
                                  ball_hit_t* hits, std::uint32_t* tris) = 0;
 
-    /** @brief Uploads a scene compiled for this geometry, for rendering with plt_path. */
-    [[nodiscard]] virtual std::unique_ptr<backend_renderer_t> create_plt_path_renderer(
-            const plt_path_scene_t& scene) = 0;
+    /** @brief Uploads a scene compiled for this geometry, for rendering with plt_path or plt_bdpt. */
+    [[nodiscard]] virtual std::unique_ptr<backend_renderer_t> create_plt_renderer(const plt_scene_t& scene) = 0;
 };
 
 /** @brief A GPU backend on one device. */
