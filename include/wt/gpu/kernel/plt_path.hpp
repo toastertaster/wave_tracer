@@ -248,9 +248,130 @@ WT_GPU_FN sensor_hit_t virtual_plane_hit(const WT_GPU_THREAD sensor_desc& s,
 struct bsdf_sample_t {
     vec3 wo;
     mueller_block M;        // weighted BSDF: bsdf/pdf
-    real pdf;               // discrete probability (specular) or solid-angle density (diffuse)
+    real pdf;               // discrete probability (`discrete`), or solid-angle density
+    bool discrete;          // a delta lobe was sampled
     real eta;
 };
+
+/*
+ * Rough surface profiles (wt/interaction/surface_profile/{fractal,gaussian}.hpp):
+ * the PSD of the scattered lobe, its sampling and its density, in the
+ * dimensionless parameters of `material` (directions in the shading frame).
+ */
+
+/** @brief The profile's specular fraction (`surface_profile_t::alpha`), 1 for a smooth surface. */
+WT_GPU_FN real profile_alpha(const WT_GPU_THREAD material& m, vec3 wi, vec3 wo) {
+    if (m.profile==profile_dirac)
+        return 1;
+    return exp(-sqr(abs(wi.z)+abs(wo.z)) * m.alpha_k);
+}
+
+/** @brief The profile's PSD (`psd(params, z, k)`) at z = k*`v`, `v` the sum of the directions' xy. */
+WT_GPU_FN real profile_psd(const WT_GPU_THREAD material& m, vec2 v) {
+    const real v2 = dot(v,v);
+    if (m.profile==profile_fractal) {
+        const real x = 1 + m.K*v2;
+        const real p = m.gamma==real(3) ? x*x : pow(x, (m.gamma+1)/2);
+        return m.sigma2_norm * (inv_two_pi * (m.gamma-1) * m.K / p);
+    }
+    const real e = exp(-(v2/2 / m.s2));
+    return e<=epsilon ? real(0) : m.sigma2_norm * (inv_two_pi/m.s2 * e);
+}
+
+struct profile_sample_t {
+    vec3 wo;
+    real pdf, psd;
+};
+
+/** @brief `sample_boxmueller_truncated` of gaussian.hpp: a 2D point about `mean`, and its density. */
+WT_GPU_FN vec2 sample_boxmueller_truncated(vec2 u, vec2 mean, real sigma2, WT_GPU_THREAD real& pdf) {
+    const real l = sqrt(min(real(1), dot(mean,mean)));
+    const real coso = sqrt(max(real(0), 1-dot(mean,mean)));
+    const real phi_i = mean.x!=real(0) || mean.y!=real(0) ? atan2(mean.y,mean.x) : real(0);
+
+    const real s = exp(-real(.5)*sqr(1+l)/sigma2);
+    const real x = (1-s)*max(epsilon,u.x)+s;
+    const real r = sqrt(-2 * sigma2 * log(x));
+
+    const real max_phi = r<epsilon || l<epsilon ? pi :
+        max(real(1e-2), acos(clamp((sqr(r)+sqr(l)-1)/(2*r*l), real(-1), real(1))));
+    const real phi = phi_i + pi + max_phi*(2*u.y-1);
+
+    pdf = real(.5) * x/(max_phi*sigma2) * coso;
+    return vec2{ r*cos(phi), r*sin(phi) } + mean;
+}
+
+/** @brief `boxmueller_truncated_pdf` of gaussian.hpp */
+WT_GPU_FN real boxmueller_truncated_pdf(vec2 wo, vec2 mean, real sigma2) {
+    const real l = sqrt(min(real(1), dot(mean,mean)));
+    const real coso = sqrt(max(real(0), 1-dot(mean,mean)));
+
+    wo = wo - mean;
+    const real r2 = dot(wo,wo);
+    const real x = exp(real(-.5) * r2/sigma2);
+    const real r = sqrt(r2);
+    const real max_phi = r<epsilon || l<epsilon ? pi :
+        max(real(1e-2), acos(clamp((sqr(r)+sqr(l)-1)/(2*r*l), real(-1), real(1))));
+    return real(.5) * x/(max_phi*sigma2) * coso;
+}
+
+/** @brief `fractal_t::sample` or `gaussian_t::sample`: a scattered direction, in `wi`'s hemisphere. */
+WT_GPU_FN profile_sample_t sample_profile(const WT_GPU_THREAD material& m, vec3 wi, vec2 u) {
+    vec2 wo2;
+    real pdf, psd;
+    if (m.profile==profile_fractal) {
+        // "A Two-Scale Microfacet Reflectance Model Combining Reflection and Diffraction", Holzschuch & Pacanowski 2017
+        const real s = sqrt(max(real(0), 1-sqr(wi.z)));
+        const real phi_i = s>real(0) ? atan2(wi.y,wi.x) : real(0);
+        const real M = 1 - pow(1 + m.K*sqr(1+s), -(m.gamma-1)/2);
+        // the sampled spatial frequency over k
+        const real f_k = sqrt(pow(1-M*u.x, -2/(m.gamma-1))-1) / sqrt(m.K);
+        const real phi_max = f_k==real(0) || s==real(0) ? pi :
+            acos(clamp((sqr(f_k) + sqr(s) - 1)/(2*f_k*s), real(-1), real(1)));
+        const real phi_f = phi_i + (2*u.y-1)*phi_max;
+        const vec2 zeta_k = vec2{ cos(phi_f), sin(phi_f) } * f_k;
+        wo2 = zeta_k - vec2{ wi.x,wi.y };
+        const real z = sqrt(max(real(0), 1-dot(wo2,wo2)));
+        psd = profile_psd(m, zeta_k);
+        const real w = inv_pi * phi_max;
+        pdf = w>real(1e-2) ? z * psd / w : real(0);
+    } else {
+        const vec2 mean = -vec2{ wi.x,wi.y };
+        wo2 = sample_boxmueller_truncated(u, mean, m.s2, pdf);
+        psd = profile_psd(m, wo2-mean);
+    }
+    const real z = sqrt(max(real(0), 1-dot(wo2,wo2)));
+    return { vec3{ wo2.x, wo2.y, wi.z>=real(0) ? z : -z }, pdf, psd };
+}
+
+/** @brief `fractal_t::pdf` or `gaussian_t::pdf` */
+WT_GPU_FN real pdf_profile(const WT_GPU_THREAD material& m, vec3 wi, vec3 wo) {
+    if (m.profile==profile_fractal) {
+        const vec2 zeta_k = vec2{ wi.x,wi.y } + vec2{ wo.x,wo.y };
+        const real f_k = length(zeta_k);
+        const real s = sqrt(max(real(0), 1-sqr(wi.z)));
+        const real phi_max = f_k==real(0) || s==real(0) ? pi :
+            acos(clamp((sqr(f_k) + sqr(s) - 1)/(2*f_k*s), real(-1), real(1)));
+        const real w = inv_pi * phi_max;
+        return w>real(1e-2) ? 1/w * abs(wo.z) * profile_psd(m, zeta_k) : real(0);
+    }
+    return boxmueller_truncated_pdf(vec2{ wo.x,wo.y }, -vec2{ wi.x,wi.y }, m.s2);
+}
+
+/** @brief `flip_wo` of src/bsdf/surface_spm.cpp: a scattered direction refracted to the other side. */
+WT_GPU_FN vec3 flip_wo(vec3 wo, real eta) {
+    const real scale = wo.z>real(0) ? eta : 1/eta;
+    const vec2 xy = vec2{ wo.x,wo.y } * scale;
+    const real l2 = dot(xy,xy);
+    return l2>real(1) ? vec3{ 1,0,0 } :
+                        vec3{ xy.x, xy.y, (wo.z>real(0) ? real(-1) : real(1))*sqrt(max(real(0), 1-l2)) };
+}
+
+/** @brief The microfacet normal of a scattered pair (surface_spm_t): `wi`+`wo`, in `wi`'s hemisphere. */
+WT_GPU_FN vec3 half_vector(vec3 wi, vec3 wo) {
+    const vec3 h = wi + wo;
+    return normalize(wi.z<real(0) ? -h : h);
+}
 
 /**
  * @brief Samples a material's BSDF (`bsdf_t::sample`) for incident direction
@@ -271,13 +392,24 @@ WT_GPU_FN bool sample_bsdf(const WT_GPU_THREAD material& m, vec3 wi, bool backwa
         wo = cosine_hemisphere(rnd.r2());
         out.M = mueller_block::depolarizer(m.reflectance) * m.scale;
         out.pdf = inv_pi * wo.z;
+        out.discrete = false;
         out.eta = 1;
     } else if (m.type==material_specular) {
-        // surface_spm_t::sample with a Dirac surface profile: all scattering is specular (alpha=1)
-        if (wi.z==real(0))
+        // surface_spm_t::sample: the specular fraction `alpha` of the surface profile (1 if smooth) is
+        // specular, the rest scattered
+        const real alpha = profile_alpha(m, wi, wi);
+        const bool has_specular = alpha>real(0);
+        const bool has_scatter = alpha<real(1);
+        if (wi.z==real(0) || (!has_specular && !has_scatter))
             return false;
 
         real pdf = 1;
+        bool is_specular = has_specular;
+        if (has_specular && has_scatter) {
+            is_specular = alpha==real(1) || rnd.r()<alpha;
+            pdf = is_specular ? alpha : 1-alpha;
+        }
+
         const fresnel_t f = fresnel(m.eta, wi);
         const real pdf_transmission = (f.Ts+f.Tp)/2;
         bool is_reflection = true;
@@ -286,15 +418,27 @@ WT_GPU_FN bool sample_bsdf(const WT_GPU_THREAD material& m, vec3 wi, bool backwa
             pdf *= is_reflection ? 1-pdf_transmission : pdf_transmission;
         }
 
+        // J = eta² for refraction in backward transport
+        const real J = !is_reflection && backward ? sqr(f.eta_12) : real(1);
         const real scale = is_reflection ? m.reflection_scale : m.transmission_scale;
         if (scale==real(0) || (!is_reflection && m.has_transmission==0))
             return false;
 
-        // alpha * J * scale * F, with alpha = 1, and J = eta² for refraction in backward transport
-        const real J = !is_reflection && backward ? sqr(f.eta_12) : real(1);
-        wo = is_reflection ? vec3{ -wi.x, -wi.y, wi.z } : f.t;
-        out.M = (mueller_fresnel(m.eta, is_reflection, wi) * (J * scale * m.scale)) / pdf;
-        out.pdf = pdf;
+        if (is_specular) {
+            wo = is_reflection ? vec3{ -wi.x, -wi.y, wi.z } : f.t;
+            out.M = (mueller_fresnel(m.eta, is_reflection, wi) * (alpha * J * scale * m.scale)) / pdf;
+            out.pdf = pdf;
+            out.discrete = true;
+        } else {
+            // scattered by the surface profile, Fresnel about the microfacet normal
+            const profile_sample_t s = sample_profile(m, wi, rnd.r2());
+            const mueller_block F = mueller_fresnel(m.eta, is_reflection, wi, half_vector(wi, s.wo));
+            wo = is_reflection ? s.wo : flip_wo(s.wo, m.eta.re);
+            pdf *= s.pdf;
+            out.M = (F * ((1-alpha) * J * abs(wo.z) * s.psd * scale * m.scale)) / pdf;
+            out.pdf = pdf;
+            out.discrete = false;
+        }
         out.eta = is_reflection ? real(1) : f.eta_12;
     } else {
         return false;
@@ -309,7 +453,7 @@ WT_GPU_FN bool sample_bsdf(const WT_GPU_THREAD material& m, vec3 wi, bool backwa
  *        `wi` and `wo` (shading frame, pointing away from the surface). Zero
  *        for delta BSDFs, which `is_delta` tells.
  */
-WT_GPU_FN mueller_block eval_bsdf(const WT_GPU_THREAD material& m, vec3 wi, vec3 wo) {
+WT_GPU_FN mueller_block eval_bsdf(const WT_GPU_THREAD material& m, vec3 wi, vec3 wo, bool backward) {
     // two_sided_t
     if (m.two_sided!=0 && wi.z<real(0)) {
         wi.z = -wi.z;
@@ -317,6 +461,22 @@ WT_GPU_FN mueller_block eval_bsdf(const WT_GPU_THREAD material& m, vec3 wi, vec3
     }
     if (m.type==material_diffuse && wi.z>real(0) && wo.z>real(0))
         return mueller_block::depolarizer(wo.z * inv_pi * m.reflectance * m.scale);
+
+    if (m.type==material_specular && m.delta_only==0) {
+        // surface_spm_t::f: the scattered lobe
+        const bool is_reflection = wi.z*wo.z>=real(0);
+        if (wi.z==real(0) || wo.z==real(0) || (!is_reflection && m.has_transmission==0))
+            return mueller_block::depolarizer(0);
+
+        const vec3 abs_wo = is_reflection ? wo : flip_wo(wo, m.eta.re);
+        const real alpha = profile_alpha(m, wi, abs_wo);
+        const real J = !is_reflection && backward ? sqr(wi.z<real(0) ? 1/m.eta.re : m.eta.re) : real(1);
+        const real scale = is_reflection ? m.reflection_scale : m.transmission_scale;
+        // (the CPU evaluates Fresnel with the real part of the refractive index here)
+        const mueller_block F = mueller_fresnel(complex{ m.eta.re,0 }, is_reflection, wi, half_vector(wi, abs_wo));
+        const real psd = profile_psd(m, vec2{ wi.x,wi.y } + vec2{ abs_wo.x,abs_wo.y });
+        return F * ((1-alpha) * J * abs(wo.z) * psd * scale * m.scale);
+    }
     return mueller_block::depolarizer(0);
 }
 
@@ -329,12 +489,24 @@ WT_GPU_FN real pdf_bsdf(const WT_GPU_THREAD material& m, vec3 wi, vec3 wo) {
     }
     if (m.type==material_diffuse && wi.z>real(0) && wo.z>real(0))
         return inv_pi * wo.z;
+
+    if (m.type==material_specular && m.profile!=profile_dirac) {
+        // surface_spm_t::pdf
+        const bool is_reflection = wi.z*wo.z>=real(0);
+        if (wi.z==real(0) || wo.z==real(0) || (!is_reflection && m.has_transmission==0))
+            return 0;
+        const vec3 abs_wo = is_reflection ? wo : flip_wo(wo, m.eta.re);
+        const real alpha = profile_alpha(m, wi, wi);
+        const fresnel_t f = fresnel(complex{ m.eta.re,0 }, wi);
+        const real pdf_transmission = (f.Ts+f.Tp)/2;
+        return (1-alpha) * pdf_profile(m, wi, abs_wo) * (is_reflection ? 1-pdf_transmission : pdf_transmission);
+    }
     return 0;
 }
 
 /** @brief `bsdf_t::is_delta_only`: no BSDF evaluation or next-event estimation. */
 WT_GPU_FN bool is_delta(const WT_GPU_THREAD material& m) {
-    return m.type!=material_diffuse;
+    return m.delta_only!=0;
 }
 
 /*
@@ -999,7 +1171,7 @@ WT_GPU_FN real nee_backward(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_T
     if (wi.z*dot(wiworld, s.geo.n)<=real(0) || wo.z*dot(woworld, s.geo.n)<=real(0))
         return 0;
 
-    const mueller_block f = eval_bsdf(m, wi, wo);
+    const mueller_block f = eval_bsdf(m, wi, wo, true);
     if (f.m00==real(0))
         return 0;
 
@@ -1248,7 +1420,7 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
         p.prev_geo = { s.wp, geo_surface, s.tri };
         p.prev_beam = b;
         p.sampled_fsd = 0;
-        p.prev_dpd = is_delta(mat) ? real(0) : bs.pdf;
+        p.prev_dpd = bs.discrete ? real(0) : bs.pdf;
         b.transform_surface_interaction(s, woworld, bs.M, 1, backward);
         p.throughput *= bs.M.m00;
         if (bs.eta!=real(1))

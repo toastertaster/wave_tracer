@@ -54,20 +54,41 @@ struct edge {
 
 /** @brief No BSDF at the spectral sample's wavenumber: paths end here (`composite_t` without a matching bin). */
 constexpr u32 material_absorbing = 0;
-/** @brief `surface_spm_t` with a Dirac surface profile: specular reflection and refraction. */
+/**
+ * @brief `surface_spm_t`: specular reflection and refraction, and, with a rough
+ *        surface profile, scattering about them.
+ */
 constexpr u32 material_specular = 1;
 /** @brief `diffuse_t` with a constant reflectance: Lambertian reflection. */
 constexpr u32 material_diffuse = 2;
 
+constexpr u32 profile_dirac = 0;          // `surface_profile::dirac_t`: smooth
+constexpr u32 profile_fractal = 1;        // `surface_profile::fractal_t`
+constexpr u32 profile_gaussian = 2;       // `surface_profile::gaussian_t`
+
 struct material {
     u32 type;
     u32 two_sided;              // wrapped in `two_sided_t`
+    u32 delta_only;             // `bsdf_t::is_delta_only`: no evaluation, nor next-event estimation
     real scale;                 // product of the `scale_t` wrappers' (constant) scales
     // specular
     u32 has_transmission;       // `IOR_has_transmission(eta)` of src/bsdf/surface_spm.cpp
     complex eta;                // `surface_spm_t::IOR(k)`: exterior over interior refractive index
     real reflection_scale;      // `surface_spm_t::reflectivity_scale(k)`
     real transmission_scale;    // `surface_spm_t::transmissivity_scale(k)`
+    /**
+     * @brief The surface profile, with dimensionless parameters at the
+     *        wavenumber k (the CPU's mm-based parameters combine with k so):
+     *        the specular fraction is exp(-(|wi.z|+|wo.z|)² * `alpha_k`);
+     *        fractal: `K` = k²T, `gamma`; gaussian: `s2` = σ²/k²; both:
+     *        `sigma2_norm`, the PSD's normalization.
+     */
+    u32 profile;
+    real alpha_k;
+    real K;
+    real gamma;
+    real s2;
+    real sigma2_norm;
     // diffuse
     real reflectance;           // `diffuse_t`'s reflectance, clamped to [0,1]
 };

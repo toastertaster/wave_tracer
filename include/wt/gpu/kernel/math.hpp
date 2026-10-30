@@ -46,6 +46,8 @@ WT_GPU_FN float  k_atan2(float y, float x)  { return atan2f(y,x); }
 WT_GPU_FN double k_atan2(double y, double x) { return atan2(y,x); }
 WT_GPU_FN float  k_exp(float x)  { return expf(x); }
 WT_GPU_FN double k_exp(double x) { return exp(x); }
+WT_GPU_FN float  k_pow(float x, float y)  { return ::powf(x,y); }
+WT_GPU_FN double k_pow(double x, double y) { return ::pow(x,y); }
 WT_GPU_FN float  k_log(float x)  { return logf(x); }
 WT_GPU_FN double k_log(double x) { return log(x); }
 WT_GPU_FN float  k_floor(float x)  { return floorf(x); }
@@ -74,12 +76,20 @@ WT_GPU_FN real tan(real x) { return k_tan(x); }
 WT_GPU_FN real acos(real x) { return k_acos(x); }
 WT_GPU_FN real atan2(real y, real x) { return k_atan2(y,x); }
 WT_GPU_FN real exp(real x) { return k_exp(x); }
+WT_GPU_FN real pow(real x, real y) { return k_pow(x,y); }
 WT_GPU_FN real log(real x) { return k_log(x); }
 WT_GPU_FN real floor(real x) { return k_floor(x); }
 /** @brief Rounds half away from zero (glm::round, std::round). */
 WT_GPU_FN real round(real x) { return k_round(x); }
 /** @brief glm::mod: x - y*floor(x/y). */
 WT_GPU_FN real mod(real x, real y) { return x - y*floor(x/y); }
+
+/** @brief `limits<f_t>::epsilon()` */
+#if defined(WT_GPU_DBL_PRECISION)
+constexpr real epsilon = 2.220446049250313080847e-16;
+#else
+constexpr real epsilon = 1.1920928955078125e-07f;
+#endif
 
 constexpr real pi = real(3.14159265358979323846);
 constexpr real two_pi = real(6.28318530717958647692);
@@ -193,9 +203,10 @@ WT_GPU_FN vec3 cross(vec3 a, vec3 b) {
 WT_GPU_FN real length2(vec3 a) { return dot(a,a); }
 WT_GPU_FN real length2(vec2 a) { return dot(a,a); }
 WT_GPU_FN real length(vec3 a) { return sqrt(length2(a)); }
+WT_GPU_FN real length(vec2 a) { return sqrt(length2(a)); }
 // wt::m::normalize: v/length(v)
 WT_GPU_FN vec3 normalize(vec3 a) { return a / length(a); }
-WT_GPU_FN vec2 normalize(vec2 a) { return a / sqrt(length2(a)); }
+WT_GPU_FN vec2 normalize(vec2 a) { return a / length(a); }
 
 // glm::sign
 WT_GPU_FN real sign(real x) { return real(real(0)<x) - real(x<real(0)); }

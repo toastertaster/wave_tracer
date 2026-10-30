@@ -151,19 +151,22 @@ struct fresnel_t {
     real Ts, Tp;
 };
 
+/** @brief The surface normal of the local shading frame. */
+constexpr vec3 local_normal = { 0,0,1 };
+
 /**
- * @brief `wt::fresnel(eta_12, w)` (normal (0,0,1), `w` pointing away from the
- *        surface). The CPU discards the imaginary part of `eta_12` after
+ * @brief `wt::fresnel(eta_12, w, n)` (`w` pointing away from the surface of
+ *        normal `n`). The CPU discards the imaginary part of `eta_12` after
  *        refraction, so all results are real.
  */
-WT_GPU_FN fresnel_t fresnel(complex eta_12, vec3 w) {
+WT_GPU_FN fresnel_t fresnel(complex eta_12, vec3 w, vec3 n = local_normal) {
     if (eta_12==complex{ 1,0 })
         return { -w, 1, 1, 0,0, 1,1, 1,1 };
 
-    const real abs_cosi = abs(w.z);
+    const real wn = dot(w, n);
+    const real abs_cosi = abs(wn);
 
-    // refract(real(eta_12), w)
-    const real wn = w.z;
+    // refract(real(eta_12), w, n)
     const real eta = wn>real(0) ? eta_12.re : real(1)/eta_12.re;
     const real cost2 = 1 - sqr(eta) * (1-sqr(wn));
 
@@ -171,7 +174,7 @@ WT_GPU_FN fresnel_t fresnel(complex eta_12, vec3 w) {
         return { { 0,0,1 }, eta, 1, 1,1, 0,0, 0,0 };
 
     const real cost = sqrt(cost2);
-    const vec3 t = normalize(vec3{ -eta*w.x, -eta*w.y, eta*(wn-w.z) } - cost*vec3{ 0,0,wn>=real(0) ? real(1) : real(-1) });
+    const vec3 t = normalize(eta*(wn*n - w) - cost*(wn>=real(0) ? n : -n));
 
     const real rs = (eta * abs_cosi - cost) / (eta * abs_cosi + cost);
     const real rp = (abs_cosi - eta * cost) / (abs_cosi + eta * cost);
@@ -182,10 +185,10 @@ WT_GPU_FN fresnel_t fresnel(complex eta_12, vec3 w) {
     return { t, eta, Z, rs, rp, ts, tp, min(real(1), Z*sqr(ts)), min(real(1), Z*sqr(tp)) };
 }
 
-/** @brief `wt::fresnel_reflection(eta_12, w)` (normal (0,0,1)): conductor reflection coefficients rs, rp. */
-WT_GPU_FN void fresnel_reflection(complex eta_12, vec3 w,
+/** @brief `wt::fresnel_reflection(eta_12, w, n)`: conductor reflection coefficients rs, rp. */
+WT_GPU_FN void fresnel_reflection(complex eta_12, vec3 w, vec3 n,
                                   WT_GPU_THREAD complex& rs, WT_GPU_THREAD complex& rp) {
-    const real wn = w.z;
+    const real wn = dot(w, n);
     if (eta_12==complex{ 1,0 } || wn<real(0)) {
         rs = rp = complex{ 0,0 };
         return;
@@ -199,14 +202,14 @@ WT_GPU_FN void fresnel_reflection(complex eta_12, vec3 w,
     rp = (i - eta_12*t) / (i + eta_12*t);
 }
 
-/** @brief `mueller_operator_t::fresnel(eta_12, reflection, w)` */
-WT_GPU_FN mueller_block mueller_fresnel(complex eta_12, bool reflection, vec3 w) {
+/** @brief `mueller_operator_t::fresnel(eta_12, reflection, w, n)` */
+WT_GPU_FN mueller_block mueller_fresnel(complex eta_12, bool reflection, vec3 w, vec3 n = local_normal) {
     if (reflection) {
         complex rs, rp;
-        fresnel_reflection(eta_12, w, rs, rp);
+        fresnel_reflection(eta_12, w, n, rs, rp);
         return mueller_fresnel(rs, rp);
     }
-    const fresnel_t f = fresnel(eta_12, w);
+    const fresnel_t f = fresnel(eta_12, w, n);
     return mueller_fresnel(complex{ f.ts,0 }, complex{ f.tp,0 }) * f.Z;
 }
 

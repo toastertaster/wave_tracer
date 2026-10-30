@@ -23,7 +23,8 @@
  *     paths draw wavenumbers as the CPU's do (see `spectral_tables_t`);
  *   - point, spot and directional emitters, and area emitters of a constant
  *     radiance;
- *   - surface_spm BSDFs with a Dirac surface profile (specular), and diffuse
+ *   - surface_spm BSDFs, smooth (Dirac surface profile) or rough (fractal
+ *     or gaussian surface profiles of a constant roughness), and diffuse
  *     BSDFs with a constant reflectance, optionally wrapped in twosided,
  *     composite and (constant) scale BSDFs;
  *   - the bvh8w acceleration structure.

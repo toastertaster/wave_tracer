@@ -31,6 +31,8 @@
 #include <wt/bsdf/scale.hpp>
 #include <wt/bsdf/surface_spm.hpp>
 #include <wt/interaction/surface_profile/dirac.hpp>
+#include <wt/interaction/surface_profile/fractal.hpp>
+#include <wt/interaction/surface_profile/gaussian.hpp>
 #include <wt/texture/constant.hpp>
 #include <wt/sensor/sensor/perspective.hpp>
 #include <wt/sensor/sensor/virtual_plane_sensor.hpp>
@@ -225,6 +227,43 @@ bool ior_has_transmission(const c_t ior) noexcept {
     return m::sqr(m::abs(ior.imag())) / std::norm(ior) <= f_t(1e-2);
 }
 
+/** @brief The surface profile of a `surface_spm_t` at wavenumber `k` (see `kernel::material`). */
+void compile_surface_profile(const bsdf::surface_spm_t& spm, const wavenumber_t k, kernel::material& m) {
+    const auto& profile = *spm.surface_profile();
+    if (dynamic_cast<const surface_profile::dirac_t*>(&profile)) {
+        m.profile = kernel::profile_dirac;
+        return;
+    }
+
+    const auto* fractal = dynamic_cast<const surface_profile::fractal_t*>(&profile);
+    const auto* gaussian = dynamic_cast<const surface_profile::gaussian_t*>(&profile);
+    if (!fractal && !gaussian)
+        throw gpu_error_t(std::format(
+            "GPU rendering does not support '{}' surface profiles yet (BSDF <{}>)", type_of(profile), spm.get_id()));
+    if (fractal ? !fractal->has_constant_textures() : !gaussian->has_constant_textures())
+        throw gpu_error_t(std::format(
+            "GPU rendering supports only constant surface roughness so far; BSDF <{}> has a textured '{}' "
+            "surface profile", spm.get_id(), type_of(profile)));
+
+    // constant textures: any query will do
+    const auto query = texture::texture_query_t{ .uv = {}, .k = k };
+    const auto k_mm = f_t(k * u::mm);
+    if (fractal) {
+        const auto params = fractal->parameters(query);
+        m.profile = kernel::profile_fractal;
+        m.K = real(u::to_num(k*k * params.T));
+        m.gamma = real(fractal->get_gamma());
+        m.sigma2_norm = real(params.sigma2_norm);
+        m.alpha_k = real(params.alpha * m::sqr(k_mm));
+    } else {
+        const auto params = gaussian->parameters(query);
+        m.profile = kernel::profile_gaussian;
+        m.s2 = real(u::to_num(params.sigma2 / (k*k)));
+        m.sigma2_norm = real(params.sigma2_norm);
+        m.alpha_k = real(params.alpha * m::sqr(k_mm));
+    }
+}
+
 kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k) {
     kernel::material m{};
     m.type = kernel::material_absorbing;
@@ -259,6 +298,8 @@ kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k) {
         }
     }
 
+    m.delta_only = b->is_delta_only(k) ? 1 : 0;
+
     if (const auto* diffuse = dynamic_cast<const bsdf::diffuse_t*>(b); diffuse) {
         m.type = kernel::material_diffuse;
         m.reflectance = real(m::clamp01<f_t>(constant_texture(*diffuse->reflectance(), *diffuse)));
@@ -266,17 +307,13 @@ kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k) {
     }
 
     if (const auto* spm = dynamic_cast<const bsdf::surface_spm_t*>(b); spm) {
-        if (!dynamic_cast<const surface_profile::dirac_t*>(spm->surface_profile().get()))
-            throw gpu_error_t(std::format(
-                "GPU rendering supports only smooth (Dirac surface profile) surface_spm BSDFs so far; "
-                "BSDF <{}> has a '{}' surface profile", spm->get_id(), type_of(*spm->surface_profile())));
-
         const auto eta = spm->IOR(k);
         m.type = kernel::material_specular;
         m.has_transmission = ior_has_transmission(eta) ? 1 : 0;
         m.eta = { real(eta.real()), real(eta.imag()) };
         m.reflection_scale = real(spm->reflectivity_scale(k));
         m.transmission_scale = real(spm->transmissivity_scale(k));
+        compile_surface_profile(*spm, k, m);
         return m;
     }
 
