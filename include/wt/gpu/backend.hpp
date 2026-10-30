@@ -112,9 +112,11 @@ public:
 
     /**
      * @brief Copies the film to `values`: element (x,y) component c at
-     *        `values[(y*width + x)*components + c]`; and, for backward transport,
-     *        the sums of the reconstruction weights splatted with them to
-     *        `weights` (likewise; nullptr skips them). Paths in flight have not
+     *        `values[(y*width + x)*components + c]` (of a polarimetric film,
+     *        its Stokes parameters at `values[((y*width + x)*components + c)*4 + i]`);
+     *        and, for backward transport, the sums of the reconstruction
+     *        weights splatted with them to `weights` (one per component;
+     *        nullptr skips them). Paths in flight have not
      *        contributed all of their splats yet.
      */
     virtual void read_film(double* values, double* weights) = 0;

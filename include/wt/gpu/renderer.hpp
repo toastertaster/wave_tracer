@@ -19,7 +19,7 @@
  *   - the plt_path integrator, forward and backward transport (beams,
  *     free-space diffraction, or ray tracing);
  *   - virtual_plane (coverage) sensors, and, with backward transport,
- *     non-polarimetric perspective sensors, of any (scalar) response:
+ *     perspective sensors, polarimetric or not, of any response:
  *     paths draw wavenumbers as the CPU's do (see `spectral_tables_t`);
  *   - point, spot and directional emitters, and area emitters of a constant
  *     radiance;
@@ -104,7 +104,8 @@ private:
 
     bool backward;
     std::uint64_t paths_per_spe;
-    std::size_t film_values;
+    std::size_t film_elements;          // film elements' components
+    bool polarimetric = false;          // ... each a Stokes parameters vector
     bool warned_iteration_limit = false;
 
     void check_status(std::uint32_t status);

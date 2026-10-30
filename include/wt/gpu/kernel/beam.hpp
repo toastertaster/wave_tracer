@@ -339,20 +339,85 @@ WT_GPU_FN vec3 offseted_ray_origin(vec3 a, vec3 b, vec3 c, vec3 ng, ray r) {
  * Beams
  */
 
+/** @brief What a sensor observes: Stokes parameters (polarimetric), or radiant flux. */
+template <bool Polarimetric> struct observed { using type = stokes; };
+template <> struct observed<false> { using type = real; };
+template <bool Polarimetric> using observed_t = typename observed<Polarimetric>::type;
+
+/**
+ * @brief Backward transport for a polarimetric sensor (`Polarimetric`): the
+ *        rows of a beam's Mueller operator but the first (see `beam_t`).
+ *        Otherwise nothing.
+ */
+template <bool Polarimetric>
+struct operator_rows {
+    stokes r[3];
+
+    /** @brief Rows 1 to 3 of the identity operator, times `s`. */
+    WT_GPU_FN void identity(real s) {
+        r[0] = { 0,s,0,0 };
+        r[1] = { 0,0,s,0 };
+        r[2] = { 0,0,0,s };
+    }
+    WT_GPU_FN void scale(real s) {
+        for (int i=0; i<3; ++i)
+            r[i] = r[i]*s;
+    }
+    WT_GPU_FN void add(const WT_GPU_THREAD operator_rows& o, frame of, frame f) {
+        for (int i=0; i<3; ++i)
+            r[i] = r[i] + row_change_incident_frame(o.r[i], of, f);
+    }
+    WT_GPU_FN void compose(mueller_block M, frame in, frame out) {
+        for (int i=0; i<3; ++i)
+            r[i] = row_compose(r[i], M, in, out);
+    }
+    /** @brief The operator (of first row `r0`) times unpolarized Stokes parameters of intensity `I`. */
+    WT_GPU_FN stokes observe_unpolarized(stokes r0, real I) const {
+        return { r0.s0*I, r[0].s0*I, r[1].s0*I, r[2].s0*I };
+    }
+};
+template <>
+struct operator_rows<false> {
+    WT_GPU_FN void identity(real) {}
+    WT_GPU_FN void scale(real) {}
+    WT_GPU_FN void add(const WT_GPU_THREAD operator_rows&, frame, frame) {}
+    WT_GPU_FN void compose(mueller_block, frame, frame) {}
+    WT_GPU_FN real observe_unpolarized(stokes r0, real I) const { return r0.s0*I; }
+};
+
 /**
  * @brief A beam (`beam_t`): an elliptic-cone envelope and radiometric data.
  *        Forward transport: a Stokes parameters vector, relative to the flux
  *        of the emitter sample that sourced the beam (the path tracer applies
  *        it when it splats). Backward transport: the first row of the beam's
  *        Mueller operator, times its scale (see polarimetric.hpp), in the
- *        operator's incident frame. Interactions transform the two differently
- *        (`backward` arguments).
+ *        operator's incident frame; for a polarimetric sensor
+ *        (`Polarimetric`), its other rows too (`rows`). Interactions transform
+ *        the two differently (`backward` arguments).
  */
-struct beam {
+template <bool Polarimetric>
+struct beam_t {
     cone envelope;
     stokes S;                   // Stokes parameters, or Mueller operator row
     frame Sframe;               // frame of `S`
     real self_intersection_distance;
+    operator_rows<Polarimetric> rows;
+
+    /**
+     * @brief Backward transport: what the beam's sensor observes of
+     *        unpolarized radiation of intensity `I` (`integrate_beams`): the
+     *        operator's first column times `I` (polarimetric), or its first
+     *        element.
+     */
+    WT_GPU_FN observed_t<Polarimetric> observe_unpolarized(real I) const {
+        return rows.observe_unpolarized(S, I);
+    }
+
+    /** @brief Scales the radiometric data. */
+    WT_GPU_FN void scale(real s) {
+        S = S*s;
+        rows.scale(s);
+    }
 
     WT_GPU_FN vec3 dir() const { return envelope.r.d; }
     WT_GPU_FN vec3 origin() const { return envelope.r.o; }
@@ -362,8 +427,9 @@ struct beam {
      * @brief `beam_t::operator+=`: adds another beam's radiometric data,
      *        reoriented (forward), or with its incident frame changed (backward).
      */
-    WT_GPU_FN void add(const WT_GPU_THREAD beam& o, bool backward) {
+    WT_GPU_FN void add(const WT_GPU_THREAD beam_t& o, bool backward) {
         S = S + (backward ? row_change_incident_frame(o.S, o.Sframe, Sframe) : reorient(o.S, o.Sframe, Sframe));
+        rows.add(o.rows, o.Sframe, Sframe);
     }
 
     /** @brief `beam_generic_t::footprint` (beam local frame) */
@@ -407,6 +473,7 @@ struct beam {
             const frame SPin  = sp_frame(s, wo);
             const frame SPout = sp_frame(s, Sframe.n);
             S = row_compose(S, M, Sframe, SPout);
+            rows.compose(M, Sframe, SPout);
             Sframe = SPin;
         } else {
             const frame new_frame = envelope.frame();
@@ -424,7 +491,7 @@ struct beam {
      */
     WT_GPU_FN void transform_region_interaction(vec3 wp, real dist, vec3 wo, real weight) {
         envelope = cone_through_ellipsoid(footprint3(dist), envelope.frame(), make_ray(wp, wo), envelope.tan_alpha);
-        S = S*weight;
+        scale(weight);
         Sframe = envelope.frame();
         // no surface, no clip
         self_intersection_distance = 0;

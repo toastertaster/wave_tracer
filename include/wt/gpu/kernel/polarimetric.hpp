@@ -23,8 +23,9 @@
  * Forward transport carries a Stokes parameters vector. Backward transport
  * carries a Mueller operator (`beam_radiometric_data_t<backward>`), composed
  * with each interaction's to the right; a scalar film observes only its first
- * row (times its scale), which therefore composes on its own: the GPU keeps
- * just that row (`row_*` functions).
+ * row (times its scale), and a polarimetric film, of unpolarized emitters, its
+ * first column. Each row composes on its own: the GPU keeps just the first row
+ * for a scalar film, all four for a polarimetric one (`row_*` functions).
  */
 
 namespace wt::gpu::kernel {
@@ -35,6 +36,7 @@ struct stokes {
 
     WT_GPU_FN stokes operator*(real s) const { return { s0*s, s1*s, s2*s, s3*s }; }
     WT_GPU_FN stokes operator+(stokes o) const { return { s0+o.s0, s1+o.s1, s2+o.s2, s3+o.s3 }; }
+    WT_GPU_FN stokes& operator+=(stokes o) { return *this = *this + o; }
 };
 
 /**
@@ -121,7 +123,7 @@ WT_GPU_FN stokes row_change_incident_frame(stokes r, frame old_f, frame new_f) {
     return ret;
 }
 
-/** @brief `compose(M1, M2, M1in, M2out)` of the row vector `r` (M1's first row). */
+/** @brief `compose(M1, M2, M1in, M2out)` of the row vector `r` (a row of M1). */
 WT_GPU_FN stokes row_compose(stokes r, mueller_block M2, frame M1in, frame M2out) {
     // R = handness_flip * rotation
     if (handness(M1in)!=handness(M2out)) {

@@ -261,13 +261,18 @@ struct sensor_desc {
 constexpr i32 max_rf_radius = 8;
 
 /**
- * @brief A `sensor::film_t` (2D, scalar). Elements are accumulated by the
+ * @brief A `sensor::film_t` (2D, scalar or polarimetric). Elements are accumulated by the
  *        backend. The sensor's response depends on the wavenumber: see
  *        `spectral_sample`.
  */
 struct film_desc {
     u32 width, height;
     u32 components;
+    /**
+     * @brief Elements' components are Stokes parameters vectors (4 values)
+     *        rather than scalars: paths run as `path_state_t<true>`.
+     */
+    u32 polarimetric;
     i32 rf_radius;              // Gaussian reconstruction filter radius, in elements
     real rf_sigma;              // ... and standard deviation
 };

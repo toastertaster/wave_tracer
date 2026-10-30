@@ -168,12 +168,18 @@ WT_GPU_FN void splat(const WT_GPU_THREAD film_desc& film, film_response response
 
 /**
  * @brief `film_t::splat` (block splats, backward transport): splats `watts`
- *        and the reconstruction filter's weights around element (ex,ey); the
- *        film develops their ratio. Every sample splats, zero or not.
+ *        (Stokes parameters: of a polarimetric film, all four; of a scalar
+ *        one, the intensity) and the reconstruction filter's weights around
+ *        element (ex,ey); the film develops their ratio. Every sample splats,
+ *        zero or not.
  */
-template <typename Film>
+WT_GPU_FN stokes as_stokes(stokes S) { return S; }
+WT_GPU_FN stokes as_stokes(real I) { return { I,0,0,0 }; }
+
+template <typename Film, typename Observed>
 WT_GPU_FN void splat_weighted(const WT_GPU_THREAD film_desc& film, film_response response, WT_GPU_THREAD Film& sink,
-                              u32 ex, u32 ey, vec2 offset, real watts) {
+                              u32 ex, u32 ey, vec2 offset, Observed observed) {
+    const stokes watts = as_stokes(observed);
     const i32 r = film.rf_radius;
 
     real wx[2*max_rf_radius+1], wy[2*max_rf_radius+1];
@@ -187,11 +193,14 @@ WT_GPU_FN void splat_weighted(const WT_GPU_THREAD film_desc& film, film_response
         tw += max(real(0), wx[x+r]*wy[y+r]);
     const real recp_tw = tw>real(0) ? real(1)/tw : real(0);
 
+    const u32 n = film.polarimetric!=0 ? 4 : 1;
     for (u32 c=0; c<film.components; ++c) {
-        real val = watts * response.c[c];
+        stokes val = watts * response.c[c];
         // avoid NaNs, infs and negatives (but sum up the weights)
-        if (!(val>=real(0)) || !isfinite(val))
-            val = 0;
+        const bool finite = isfinite(val.s0) && (n==1 || (isfinite(val.s1) && isfinite(val.s2) && isfinite(val.s3)));
+        if (!(val.s0>=real(0)) || !finite)
+            val = { 0,0,0,0 };
+        const real v[4] = { val.s0, val.s1, val.s2, val.s3 };
 
         for (i32 y=-r; y<=r; ++y)
         for (i32 x=-r; x<=r; ++x) {
@@ -200,7 +209,8 @@ WT_GPU_FN void splat_weighted(const WT_GPU_THREAD film_desc& film, film_response
                 continue;
             const real w = max(real(0), wx[x+r]*wy[y+r]) * recp_tw;
             const u32 idx = (u32(py)*film.width + u32(px))*film.components + c;
-            sink.add(idx, w*val);
+            for (u32 i=0; i<n; ++i)
+                sink.add(idx*n + i, w*v[i]);
             sink.add_weight(idx, w);
         }
     }
@@ -221,8 +231,9 @@ struct sensor_hit_t {
  * @brief `virtual_plane_sensor_t::Si`: where the beam's central ray crosses
  *        the sensor's front within `rng` (distance from the beam origin).
  */
+template <bool P>
 WT_GPU_FN sensor_hit_t virtual_plane_hit(const WT_GPU_THREAD sensor_desc& s,
-                                         const WT_GPU_THREAD beam& b, range rng) {
+                                         const WT_GPU_THREAD beam_t<P>& b, range rng) {
     const sensor_hit_t none = { 0, 0, { 0,0 }, false };
 
     // check side
@@ -855,11 +866,14 @@ WT_GPU_FN sensor_direct_t sensor_sample_direct(const WT_GPU_THREAD sensor_desc& 
 /**
  * @brief A path between steps: its beam and walk data (`path_walk_data_t`).
  *        Its aperture, when it has one, is in the path's scratch memory.
- *        Aligned for 16-byte copies to and from memory.
+ *        Aligned for 16-byte copies to and from memory. `Polarimetric`: of a
+ *        polarimetric sensor (backward transport), whose beams keep their
+ *        whole Mueller operators, and which observes Stokes parameters.
  */
-struct alignas(16) path_state {
-    beam b;
-    beam prev_beam;
+template <bool Polarimetric>
+struct alignas(16) path_state_t {
+    beam_t<Polarimetric> b;
+    beam_t<Polarimetric> prev_beam;
     vertex_geo prev_geo;
     rng rnd;
     real throughput;
@@ -879,7 +893,7 @@ struct alignas(16) path_state {
     // backward transport
     u32 ex, ey;             // the sensor element, and offset, sampled
     vec2 offset;
-    real L;                 // radiant flux gathered so far
+    observed_t<Polarimetric> L;     // radiant flux gathered so far (Stokes parameters, if polarimetric)
 
     /** @brief Splats a sensor connection (forward transport), unless an earlier attempt made it. */
     template <typename Film>
@@ -905,9 +919,10 @@ WT_GPU_FN vec3 point_on_sensor(const WT_GPU_THREAD sensor_desc& s, vec2 film_pos
  *        of `spec`; its radiometric data is the sampled importance (`Se`)
  *        over the sampling densities.
  */
+template <bool P>
 WT_GPU_FN void sample_sensor(const WT_GPU_THREAD sensor_desc& s, const WT_GPU_THREAD spectral_sample& spec,
                              u32 ex, u32 ey, WT_GPU_THREAD rng& rnd,
-                             WT_GPU_THREAD beam& b, WT_GPU_THREAD vec2& offset) {
+                             WT_GPU_THREAD beam_t<P>& b, WT_GPU_THREAD vec2& offset) {
     ray r;
     real scale;
     if (s.type==sensor_perspective) {
@@ -935,7 +950,9 @@ WT_GPU_FN void sample_sensor(const WT_GPU_THREAD sensor_desc& s, const WT_GPU_TH
     }
 
     b.envelope = make_isotropic_cone(r, spec.sensor_tan_alpha, spec.sensor_x0);
-    b.S = { scale,0,0,0 };      // the identity operator, scaled
+    // the identity operator, scaled (its first row; and the others, for a polarimetric sensor)
+    b.S = { scale,0,0,0 };
+    b.rows.identity(scale);
     b.Sframe = b.envelope.frame();
     b.self_intersection_distance = 0;
 }
@@ -1025,9 +1042,10 @@ WT_GPU_FN u32 spectral_sample_for_path(u64 path, u32 count) {
  *        elements. `rnd` is the path's generator; `skip` the splats an
  *        earlier, overflowed, attempt at this path made.
  */
-WT_GPU_FN path_state start_path(const WT_GPU_THREAD plt_scene& scene, rng rnd, u64 path, u32 skip,
-                                u32 table, u32 spectral) {
-    path_state p;
+template <bool P>
+WT_GPU_FN path_state_t<P> start_path(const WT_GPU_THREAD plt_scene& scene, rng rnd, u64 path, u32 skip,
+                                     u32 table, u32 spectral) {
+    path_state_t<P> p;
     const u32 ei = sample_emitter(scene, rnd.r());
     p.spectral = spectral!=choose_spectral ? spectral :
         table + ei*scene.samples_per_emitter + spectral_sample_for_path(path, scene.samples_per_emitter);
@@ -1040,7 +1058,7 @@ WT_GPU_FN path_state start_path(const WT_GPU_THREAD plt_scene& scene, rng rnd, u
         p.ey = element / scene.film.width;
         sample_sensor(scene.sensor, spec, p.ex, p.ey, rnd, p.b, p.offset);
         p.prev_geo = { p.b.origin(), geo_point, 0 };
-        p.L = 0;
+        p.L = {};
         p.flux = 0;
     } else {
         // source a beam (`emitter_t::sample`)
@@ -1071,6 +1089,7 @@ WT_GPU_FN path_state start_path(const WT_GPU_THREAD plt_scene& scene, rng rnd, u
 
         p.b.envelope = make_isotropic_cone(r, es.tan_alpha, es.x0);
         p.b.S = { scale,0,0,0 };
+        p.b.rows.identity(scale);
         p.b.Sframe = p.b.envelope.frame();
         p.b.self_intersection_distance = 0;
         // The CPU starts from the beam's origin, a point, even on an area emitter; but there, a GPU ray
@@ -1081,7 +1100,7 @@ WT_GPU_FN path_state start_path(const WT_GPU_THREAD plt_scene& scene, rng rnd, u
         p.flux = es.flux;
         p.ex = p.ey = 0;
         p.offset = { 0,0 };
-        p.L = 0;
+        p.L = {};
     }
 
     p.prev_beam = p.b;
@@ -1102,9 +1121,9 @@ WT_GPU_FN path_state start_path(const WT_GPU_THREAD plt_scene& scene, rng rnd, u
  *        radiant flux it gathered into its sensor element
  *        (`plt_path::splat_backward`), unless an earlier attempt did.
  */
-template <typename Film>
+template <bool P, typename Film>
 WT_GPU_FN void end_path(const WT_GPU_THREAD plt_scene& scene, WT_GPU_THREAD Film& film,
-                        WT_GPU_THREAD path_state& p) {
+                        WT_GPU_THREAD path_state_t<P>& p) {
     if (scene.params.backward!=0 && p.splats++>=p.skip)
         splat_weighted(scene.film, scene.spectra[p.spectral].response, film, p.ex, p.ey, p.offset, p.L);
 }
@@ -1112,13 +1131,14 @@ WT_GPU_FN void end_path(const WT_GPU_THREAD plt_scene& scene, WT_GPU_THREAD Film
 /**
  * @brief `nee_backward`: next-event estimation from the surface `s` of a
  *        non-delta material: connects to a sampled emitter (at spectral
- *        sample `spectral`), and returns the radiant flux the beam `b`
- *        observes through the connection, MIS-weighted against sampling
- *        the BSDF for area emitters (the others are sampled discretely).
+ *        sample `spectral`), and returns the radiant flux (Stokes
+ *        parameters) the beam `b` observes through the connection,
+ *        MIS-weighted against sampling the BSDF for area emitters (the others
+ *        are sampled discretely).
  */
-template <typename Geometry>
-WT_GPU_FN real nee_backward(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_THREAD Geometry& geometry,
-                            u32 spectral, const WT_GPU_THREAD beam& b, const WT_GPU_THREAD surface& s,
+template <bool P, typename Geometry>
+WT_GPU_FN observed_t<P> nee_backward(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_THREAD Geometry& geometry,
+                            u32 spectral, const WT_GPU_THREAD beam_t<P>& b, const WT_GPU_THREAD surface& s,
                             const WT_GPU_THREAD material& m, WT_GPU_THREAD rng& rnd,
                             WT_GPU_THREAD u32& status) {
     // scene_t::sample_emitter_direct: the emitter's `sample_direct`, divided by the emitter's sampling
@@ -1164,26 +1184,26 @@ WT_GPU_FN real nee_backward(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_T
         pd_direct = dpd * em.pmf;
     }
     if (I==real(0))
-        return 0;
+        return {};
 
     const vec3 wiworld = -b.dir();
     const vec3 wi = s.shading.to_local(wiworld);
     const vec3 wo = s.shading.to_local(woworld);
     if (wi.z*dot(wiworld, s.geo.n)<=real(0) || wo.z*dot(woworld, s.geo.n)<=real(0))
-        return 0;
+        return {};
 
     const mueller_block f = eval_bsdf(m, wi, wo, true);
     if (f.m00==real(0))
-        return 0;
+        return {};
 
     if (shadowed(scene, geometry, vertex_geo{ s.wp, geo_surface, s.tri }, emitter_geo, status))
-        return 0;
+        return {};
 
     // integrate_beams over the beam after the interaction, and the unpolarized emitted beam
-    beam nee = b;
+    beam_t<P> nee = b;
     nee.apply_bsdf(s, woworld, f, true);
     const real mis = pd_direct>real(0) ? mis_power(pd_direct, pdf_bsdf(m, wi, wo)) : real(1);
-    return nee.S.s0 * I * mis;
+    return nee.observe_unpolarized(I * mis);
 }
 
 /**
@@ -1192,13 +1212,14 @@ WT_GPU_FN real nee_backward(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_T
  *        MIS-weighted against next-event estimation if the beam's direction
  *        was sampled from a density `prev_dpd` (`area_t::Li`, `pdf_position`).
  */
-WT_GPU_FN real emission_hit(const WT_GPU_THREAD plt_scene& scene, u32 spectral, u32 ei, real prev_dpd,
-                            const WT_GPU_THREAD beam& b, const WT_GPU_THREAD surface& s) {
+template <bool P>
+WT_GPU_FN observed_t<P> emission_hit(const WT_GPU_THREAD plt_scene& scene, u32 spectral, u32 ei, real prev_dpd,
+                                     const WT_GPU_THREAD beam_t<P>& b, const WT_GPU_THREAD surface& s) {
     const WT_GPU_GLOBAL emitter& em = scene.emitters[ei];
     const real dn = dot(-b.dir(), s.geo.n);
     if (dn<=real(0))
-        return 0;
-    const real L = b.S.s0 * scene.emissions[spectral*scene.emitter_count + ei].intensity;
+        return {};
+    const real L = scene.emissions[spectral*scene.emitter_count + ei].intensity;
 
     real mis = 1;
     if (prev_dpd>real(0)) {
@@ -1207,7 +1228,7 @@ WT_GPU_FN real emission_hit(const WT_GPU_THREAD plt_scene& scene, u32 spectral, 
         const real pd_nee = (1/em.area) * l2 / abs(dn);
         mis = mis_power(prev_dpd, pd_nee * em.pmf);
     }
-    return L * mis;
+    return b.observe_unpolarized(L * mis);
 }
 
 /**
@@ -1218,11 +1239,11 @@ WT_GPU_FN real emission_hit(const WT_GPU_THREAD plt_scene& scene, u32 spectral, 
  *        interaction); adds status flags to `status`. `interact` continues the
  *        step.
  */
-template <typename Geometry>
+template <bool P, typename Geometry>
 WT_GPU_FN bool trace_step(const WT_GPU_THREAD plt_scene& scene,
                           const WT_GPU_THREAD Geometry& geometry,
                           const WT_GPU_THREAD path_scratch& scratch,
-                          const WT_GPU_THREAD path_state& p,
+                          const WT_GPU_THREAD path_state_t<P>& p,
                           WT_GPU_THREAD traversal_t& tr,
                           WT_GPU_THREAD u32& status) {
     const plt_path_params opts = scene.params;
@@ -1234,7 +1255,7 @@ WT_GPU_FN bool trace_step(const WT_GPU_THREAD plt_scene& scene,
     }
 
     const bool ray_trace = opts.ray_tracing_only!=0;
-    const WT_GPU_THREAD beam& b = p.b;
+    const WT_GPU_THREAD beam_t<P>& b = p.b;
     cone envelope = b.envelope;
     envelope.r.o = offseted_ray_origin(scene, p.prev_geo, envelope.r);
     tr = traverse(geometry, envelope, two_pi/scene.spectra[p.spectral].k, ray_trace, scratch, status);
@@ -1264,13 +1285,13 @@ WT_GPU_FN bool trace_step(const WT_GPU_THREAD plt_scene& scene,
  *        and samples the interaction. Returns whether the path goes on; adds
  *        status flags to `status`.
  */
-template <typename Geometry, typename Film>
+template <bool P, typename Geometry, typename Film>
 WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
                         const WT_GPU_THREAD Geometry& geometry,
                         WT_GPU_THREAD Film& film,
                         const WT_GPU_THREAD path_scratch& scratch,
                         const WT_GPU_THREAD traversal_t& tr,
-                        WT_GPU_THREAD path_state& p,
+                        WT_GPU_THREAD path_state_t<P>& p,
                         WT_GPU_THREAD u32& status) {
     const plt_path_params opts = scene.params;
     const bool ray_trace = opts.ray_tracing_only!=0;
@@ -1280,7 +1301,7 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
 
     ++p.iteration;
 
-    WT_GPU_THREAD beam& b = p.b;
+    WT_GPU_THREAD beam_t<P>& b = p.b;
     WT_GPU_THREAD rng& rnd = p.rnd;
 
     const real dist_to_interaction = tr.dist;
@@ -1298,7 +1319,7 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
         p.fsd = 0;
 
         if (p.sampled_fsd!=0)
-            b.S = b.S*f;
+            b.scale(f);
         else {
             p.prev_beam.transform_region_interaction(origin_wp, length(origin_wp-prev_cone.r.o), b.dir(), f);
             b.add(p.prev_beam, backward);
@@ -1375,7 +1396,7 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
             const real f = do_fsd(scene, geometry, k, b.envelope, p.prev_geo, sd.p,
                                   scratch.aperture, p.aperture_size, status).intensity();
             if (f!=real(0)) {
-                beam fsd_beam = b;
+                beam_t<P> fsd_beam = b;
                 fsd_beam.transform_region_interaction(interaction_wp, dist_to_interaction, -sd.wd, f);
                 if (fsd_beam.S.s0>real(0))
                     p.splat(scene.film, spec.response, film, sd.ex, sd.ey, sd.offset,
@@ -1459,7 +1480,7 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
         if (!(rnd.r()<=q))
             return false;
         const real scale = real(1)/q;
-        b.S = b.S*scale;
+        b.scale(scale);
         p.throughput *= scale;
     }
     if (!sampled_null)
@@ -1473,12 +1494,12 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
  *        interaction. Returns whether the path goes on; adds status flags to
  *        `status`. A path that ends without overflowing goes to `end_path`.
  */
-template <typename Geometry, typename Film>
+template <bool P, typename Geometry, typename Film>
 WT_GPU_FN bool step_path(const WT_GPU_THREAD plt_scene& scene,
                          const WT_GPU_THREAD Geometry& geometry,
                          WT_GPU_THREAD Film& film,
                          const WT_GPU_THREAD path_scratch& scratch,
-                         WT_GPU_THREAD path_state& p,
+                         WT_GPU_THREAD path_state_t<P>& p,
                          WT_GPU_THREAD u32& status) {
     traversal_t tr;
     return trace_step(scene, geometry, scratch, p, tr, status) &&

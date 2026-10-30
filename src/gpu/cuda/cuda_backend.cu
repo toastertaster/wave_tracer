@@ -20,6 +20,7 @@
 #include <array>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 
 #include <wt/gpu/backend.hpp>
@@ -137,7 +138,7 @@ struct path_entry_t {
  *        `table_size` samples.
  */
 struct path_pool_t {
-    k::path_state* paths;
+    void* paths;                    // `k::path_state_t<P>` of the paths' sensor (see `states`)
     k::traversal_t* traversals;     // of the step in progress
     k::u32* trace_results;          // of the step in progress: status flags, and `trace_found`
     k::u32* free_slots;
@@ -158,6 +159,10 @@ struct path_pool_t {
         if (table_paths)
             atomicSub(table_paths + spectral/table_size, 1u);
     }
+
+    /** @brief The path states, of a polarimetric sensor (`P`) or not. */
+    template <bool P>
+    __device__ k::path_state_t<P>* states() const { return static_cast<k::path_state_t<P>*>(paths); }
 
     __device__ k::path_scratch scratch(k::u32 slot) const {
         return {
@@ -207,12 +212,18 @@ __global__ void fill_free_slots_kernel(k::u32* free_slots, k::u32 count) {
     if (i<count) free_slots[i] = i;
 }
 
+/*
+ * The path kernels are templates of `P`: whether the sensor is polarimetric
+ * (`k::path_state_t`).
+ */
+
 /** @brief Path `base+i` with `seed` and spectral table `table`, or `list[base+i]` if `list` is given. */
-__device__ k::path_state start_path(const k::plt_scene& scene, std::uint64_t base, k::u32 i,
-                                    const path_entry_t* list, std::uint32_t seed, k::u32 table) {
+template <bool P>
+__device__ k::path_state_t<P> start_path(const k::plt_scene& scene, std::uint64_t base, k::u32 i,
+                                         const path_entry_t* list, std::uint32_t seed, k::u32 table) {
     const path_entry_t e = list ? list[base+i] : path_entry_t{ base+i, 0, seed, k::choose_spectral };
     const auto rnd = k::rng::for_path(e.seed, k::u32(e.path), k::u32(e.path>>32));
-    return k::start_path(scene, rnd, e.path, e.skip, table, e.spectral);
+    return k::start_path<P>(scene, rnd, e.path, e.skip, table, e.spectral);
 }
 
 /**
@@ -220,6 +231,7 @@ __device__ k::path_state start_path(const k::plt_scene& scene, std::uint64_t bas
  *        of the free stack (`free_top` slots) and are queued after the
  *        `queued` paths of `queue`.
  */
+template <bool P>
 __global__ void start_paths_kernel(k::plt_scene scene, std::uint64_t base, k::u32 count,
                                    const path_entry_t* list, std::uint32_t seed, k::u32 table, path_pool_t pool,
                                    k::u32 free_top, k::u32* queue, k::u32 queued) {
@@ -228,7 +240,7 @@ __global__ void start_paths_kernel(k::plt_scene scene, std::uint64_t base, k::u3
 
     pool.paths_started(table, count);
     const k::u32 slot = pool.free_slots[free_top-1-i];
-    store_vectors(pool.paths+slot, start_path(scene, base, i, list, seed, table));
+    store_vectors(pool.states<P>()+slot, start_path<P>(scene, base, i, list, seed, table));
     queue[queued+i] = slot;
 }
 
@@ -236,7 +248,8 @@ __global__ void start_paths_kernel(k::plt_scene scene, std::uint64_t base, k::u3
  * @brief Ends a path, or lists it in `overflow` if it outgrew its scratch
  *        memory (to be re-traced; `end_path` would splat what it has not finished).
  */
-__device__ void end_path(const k::plt_scene& scene, cuda_film_t& film, const path_pool_t& pool, k::path_state& p,
+template <bool P>
+__device__ void end_path(const k::plt_scene& scene, cuda_film_t& film, const path_pool_t& pool, k::path_state_t<P>& p,
                          k::u32& s, step_counters_t* counters, path_entry_t* overflow) {
     if (s & k::status_scratch_overflow) {
         // the path's generator says which path it is
@@ -254,13 +267,14 @@ __device__ void end_path(const k::plt_scene& scene, cuda_film_t& film, const pat
  *        `next_queue`; those that end (`end_path`) free their slots, pushed
  *        above the `free_top` free ones.
  */
+template <bool P>
 __device__ void finish_step(const k::plt_scene& scene, cuda_film_t& film, const path_pool_t& pool, k::u32 slot,
-                            k::path_state& p, bool goes_on, k::u32 s, k::u32* next_queue, k::u32 free_top,
+                            k::path_state_t<P>& p, bool goes_on, k::u32 s, k::u32* next_queue, k::u32 free_top,
                             step_counters_t* counters, path_entry_t* overflow, std::uint32_t* status) {
     if (s & k::status_scratch_overflow)
         goes_on = false;
     if (goes_on) {
-        store_vectors(pool.paths+slot, p);
+        store_vectors(pool.states<P>()+slot, p);
         next_queue[atomicAdd(&counters->queued, 1u)] = slot;
     } else {
         end_path(scene, film, pool, p, s, counters, overflow);
@@ -275,12 +289,13 @@ __device__ void finish_step(const k::plt_scene& scene, cuda_film_t& film, const 
  *        (`trace_step`). A kernel of its own, so that the BVH traversals run
  *        with fewer registers, without warps diverging into interaction code.
  */
+template <bool P>
 __global__ void trace_paths_kernel(k::plt_scene scene, path_pool_t pool, const k::u32* queue, k::u32 count) {
     const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i>=count) return;
 
     const k::u32 slot = queue[i];
-    const k::path_state p = load_vectors(pool.paths+slot);
+    const k::path_state_t<P> p = load_vectors(pool.states<P>()+slot);
     const cuda_bvh_geometry_t geometry = { scene.bvh };
 
     k::traversal_t tr;
@@ -292,6 +307,7 @@ __global__ void trace_paths_kernel(k::plt_scene scene, path_pool_t pool, const k
 }
 
 /** @brief Second part of a step of the `count` queued paths (`interact`), after `trace_paths_kernel`. */
+template <bool P>
 __global__ void __launch_bounds__(block_size, 4) interact_paths_kernel(k::plt_scene scene, path_pool_t pool,
                                         const k::u32* queue, k::u32 count,
                                         cuda_film_t film, k::u32* next_queue, k::u32 free_top,
@@ -301,7 +317,7 @@ __global__ void __launch_bounds__(block_size, 4) interact_paths_kernel(k::plt_sc
     if (i>=count) return;
 
     const k::u32 slot = queue[i];
-    k::path_state p = load_vectors(pool.paths+slot);
+    k::path_state_t<P> p = load_vectors(pool.states<P>()+slot);
     const k::u32 traced = pool.trace_results[slot];
     k::u32 s = traced & ~trace_found;
     bool goes_on = false;
@@ -318,6 +334,7 @@ __global__ void __launch_bounds__(block_size, 4) interact_paths_kernel(k::plt_sc
  *        in one kernel: for the last few paths, which would otherwise take a
  *        pair of launches per step.
  */
+template <bool P>
 __global__ void __launch_bounds__(block_size, 4) step_paths_kernel(k::plt_scene scene, path_pool_t pool,
                                         const k::u32* queue, k::u32 count, k::u32 max_steps,
                                         cuda_film_t film, k::u32* next_queue, k::u32 free_top,
@@ -327,7 +344,7 @@ __global__ void __launch_bounds__(block_size, 4) step_paths_kernel(k::plt_scene 
     if (i>=count) return;
 
     const k::u32 slot = queue[i];
-    k::path_state p = load_vectors(pool.paths+slot);
+    k::path_state_t<P> p = load_vectors(pool.states<P>()+slot);
     const cuda_bvh_geometry_t geometry = { scene.bvh };
 
     k::u32 s = k::status_ok;
@@ -343,6 +360,7 @@ __global__ void __launch_bounds__(block_size, 4) step_paths_kernel(k::plt_scene 
  *        are cheap: moving path states between launches would take longer
  *        than the steps.
  */
+template <bool P>
 __global__ void __launch_bounds__(block_size, 3) run_paths_kernel(k::plt_scene scene, path_pool_t pool,
                                         std::uint64_t base, k::u32 count, const path_entry_t* list,
                                         std::uint32_t seed, k::u32 table, cuda_film_t film,
@@ -352,7 +370,7 @@ __global__ void __launch_bounds__(block_size, 3) run_paths_kernel(k::plt_scene s
     if (i>=count) return;
 
     pool.paths_started(table, count);
-    k::path_state p = start_path(scene, base, i, list, seed, table);
+    k::path_state_t<P> p = start_path<P>(scene, base, i, list, seed, table);
     const cuda_bvh_geometry_t geometry = { scene.bvh };
 
     k::u32 s = k::status_ok;
@@ -376,6 +394,7 @@ class cuda_plt_path_renderer_t final : public backend_renderer_t {
 public:
     cuda_plt_path_renderer_t(int ordinal, k::bvh_view bvh, const plt_path_scene_t& scene)
         : ordinal(ordinal),
+          polarimetric(scene.film.polarimetric!=0),
           table_size(scene.emitter_count*scene.samples_per_emitter)
     {
         set_device(ordinal);
@@ -391,12 +410,14 @@ public:
         bitmaps.upload(scene.bitmaps.data(), scene.bitmaps.size());
         texels.upload(scene.texels.data(), scene.texels.size());
 
-        film_size = std::size_t(scene.film.width) * scene.film.height * scene.film.components;
+        // a polarimetric film's components have four values (Stokes parameters), and one weight
+        weights_size = std::size_t(scene.film.width) * scene.film.height * scene.film.components;
+        film_size = weights_size * (scene.film.polarimetric!=0 ? 4 : 1);
         film.resize(film_size);
         check(cudaMemset(film.get(), 0, film_size*sizeof(double)), "clearing the film");
         if (scene.params.backward!=0) {
-            film_weights.resize(film_size);
-            check(cudaMemset(film_weights.get(), 0, film_size*sizeof(double)), "clearing the film");
+            film_weights.resize(weights_size);
+            check(cudaMemset(film_weights.get(), 0, weights_size*sizeof(double)), "clearing the film");
         }
         const std::uint32_t zero = 0;
         status_word.upload(&zero, 1);
@@ -497,7 +518,7 @@ public:
         if (weights) {
             if (params.params.backward==0)
                 throw std::logic_error("forward transport accumulates no film weights");
-            film_weights.download(weights, film_size);
+            film_weights.download(weights, weights_size);
         }
     }
 
@@ -540,7 +561,8 @@ private:
 
     /** @brief Starts an empty pool of `slots` paths with `capacity` scratch triangles and edges each. */
     void begin(wavefront_t& wf, k::u32 slots, k::u32 capacity) {
-        paths.resize(slots);
+        const std::size_t state_size = polarimetric ? sizeof(k::path_state_t<true>) : sizeof(k::path_state_t<false>);
+        paths.resize(std::size_t(slots)*state_size/sizeof(uint4));
         traversals.resize(slots);
         trace_results.resize(slots);
         free_slots.resize(slots);
@@ -612,9 +634,11 @@ private:
             while (source.started<source.count) {
                 const auto n = k::u32(std::min<std::uint64_t>(wf.slots, source.count-source.started));
                 check(cudaMemset(counters.get(), 0, sizeof(step_counters_t)), "clearing the step counters");
-                run_paths_kernel<<<grid_size(n), block_size>>>(
-                        params, pool, source.list ? source.started : source.first+source.started, n, source.list,
-                        seed, table, film_view(), counters.get(), overflow.get(), status_word.get());
+                dispatch([&](auto P) {
+                    run_paths_kernel<P.value><<<grid_size(n), block_size>>>(
+                            params, pool, source.list ? source.started : source.first+source.started, n, source.list,
+                            seed, table, film_view(), counters.get(), overflow.get(), status_word.get());
+                });
                 check(cudaGetLastError(), "launching the path kernel");
                 source.started += n;
                 collect_overflowed();
@@ -626,9 +650,11 @@ private:
             // fill the free slots with new paths
             const auto n = k::u32(std::min<std::uint64_t>(wf.free_top, source.count-source.started));
             if (n>0) {
-                start_paths_kernel<<<grid_size(n), block_size>>>(
-                        params, source.list ? source.started : source.first+source.started, n, source.list,
-                        seed, table, pool, wf.free_top, queues[wf.q].get(), wf.queued);
+                dispatch([&](auto P) {
+                    start_paths_kernel<P.value><<<grid_size(n), block_size>>>(
+                            params, source.list ? source.started : source.first+source.started, n, source.list,
+                            seed, table, pool, wf.free_top, queues[wf.q].get(), wf.queued);
+                });
                 check(cudaGetLastError(), "launching the path start kernel");
                 source.started += n;
                 wf.queued += n;
@@ -647,16 +673,22 @@ private:
         const auto* queue = queues[wf.q].get();
         auto* next_queue = queues[1-wf.q].get();
         if (all_started && wf.queued<=tail_size) {
-            step_paths_kernel<<<grid_size(wf.queued), block_size>>>(
-                    params, pool, queue, wf.queued, k::max_path_iterations+1, film_view(),
-                    next_queue, wf.free_top, counters.get(), overflow.get(), status_word.get());
+            dispatch([&](auto P) {
+                step_paths_kernel<P.value><<<grid_size(wf.queued), block_size>>>(
+                        params, pool, queue, wf.queued, k::max_path_iterations+1, film_view(),
+                        next_queue, wf.free_top, counters.get(), overflow.get(), status_word.get());
+            });
             check(cudaGetLastError(), "launching the path step kernel");
         } else {
-            trace_paths_kernel<<<grid_size(wf.queued), block_size>>>(params, pool, queue, wf.queued);
+            dispatch([&](auto P) {
+                trace_paths_kernel<P.value><<<grid_size(wf.queued), block_size>>>(params, pool, queue, wf.queued);
+            });
             check(cudaGetLastError(), "launching the path tracing kernel");
-            interact_paths_kernel<<<grid_size(wf.queued), block_size>>>(
-                    params, pool, queue, wf.queued, film_view(),
-                    next_queue, wf.free_top, counters.get(), overflow.get(), status_word.get());
+            dispatch([&](auto P) {
+                interact_paths_kernel<P.value><<<grid_size(wf.queued), block_size>>>(
+                        params, pool, queue, wf.queued, film_view(),
+                        next_queue, wf.free_top, counters.get(), overflow.get(), status_word.get());
+            });
             check(cudaGetLastError(), "launching the path interaction kernel");
         }
 
@@ -706,6 +738,13 @@ private:
         throw std::logic_error("a path's spectral sample is in no loaded table");
     }
 
+    /** @brief Calls `f` with the paths' `P` (a std::bool_constant). */
+    template <typename F>
+    void dispatch(F&& f) const {
+        if (polarimetric) f(std::true_type{});
+        else              f(std::false_type{});
+    }
+
     [[nodiscard]] std::uint32_t read_status() const {
         std::uint32_t status;
         status_word.download(&status, 1);
@@ -714,6 +753,7 @@ private:
 
     int ordinal;
     k::plt_scene params;
+    bool polarimetric;                  // the sensor's: paths are `k::path_state_t<polarimetric>`
 
     device_buffer_t<k::tri_shading>   tris;
     device_buffer_t<k::edge>          edges;
@@ -729,6 +769,7 @@ private:
     device_buffer_t<double>           film;
     device_buffer_t<double>           film_weights;     // backward transport
     std::size_t film_size = 0;
+    std::size_t weights_size = 0;
     device_buffer_t<std::uint32_t>    status_word;
 
     // spectral tables: `tables` of `table_size` samples, for the main pool (or one for re-traced paths)
@@ -743,7 +784,7 @@ private:
 
     // the path pool (`main`, or a pool re-tracing overflowed paths)
     wavefront_t main;
-    device_buffer_t<k::path_state>     paths;
+    device_buffer_t<uint4>             paths;            // path states (`path_pool_t::states`)
     device_buffer_t<k::traversal_t>    traversals;
     device_buffer_t<k::u32>            trace_results;
     device_buffer_t<k::u32>            free_slots;

@@ -650,17 +650,18 @@ std::vector<const bsdf::bsdf_t*> compile_geometry(const scene_t& scene, const ad
 
 /** @brief A sensor's film, and the beams it sources at a wavenumber (`sourcing_geometry`). */
 struct sensor_spectral_t {
-    const sensor::film_t<2,false>* film;
+    const sensor::response::response_t* response;
+    std::uint32_t components;
     std::function<beam::sourcing_geometry_t(wavenumber_t)> sourcing;
 };
 
-template <typename Film>
-void compile_film(const Film& film, plt_path_scene_t& out) {
+template <std::size_t Dims, bool polarimetric>
+void compile_film(const sensor::film_t<Dims, polarimetric>& film, plt_path_scene_t& out) {
     const auto size = film.dimensions();
     const auto components = film.pixel_layout().components;
     if (components>4)
         throw gpu_error_t("GPU rendering supports films of up to 4 components");
-    if (std::uint64_t(size.x)*size.y*components > std::uint64_t(1)<<32)
+    if (std::uint64_t(size.x)*size.y*components*(polarimetric ? 4 : 1) > std::uint64_t(1)<<32)
         throw gpu_error_t("GPU rendering supports films of up to 2^32 values");
     if (film.reconstruction_filter_radius()>kernel::max_rf_radius)
         throw gpu_error_t(std::format(
@@ -671,6 +672,7 @@ void compile_film(const Film& film, plt_path_scene_t& out) {
     fd.width = size.x;
     fd.height = size.y;
     fd.components = components;
+    fd.polarimetric = polarimetric ? 1 : 0;
     fd.rf_radius = kernel::i32(film.reconstruction_filter_radius());
     fd.rf_sigma = real(film.reconstruction_filter_stddev());
 }
@@ -699,24 +701,25 @@ sensor_spectral_t compile_sensor(const sensor::sensor_t& sensor, const bool back
         s.recp_area = real(u::to_inv_m2(f_t(1) / plane->area()));
         s.importance = real(u::to_num(plane->importance()));
         compile_film(plane->film(), out);
-        return { &plane->film(), [plane](wavenumber_t k) { return plane->sourcing_geometry(k); } };
+        return { plane->film().response(), plane->film().pixel_layout().components,
+                 [plane](wavenumber_t k) { return plane->sourcing_geometry(k); } };
     }
 
-    if (const auto* perspective = dynamic_cast<const sensor::perspective_t<false>*>(&sensor); perspective) {
-        // perspective_t::sample; forward transport cannot reach a point sensor
+    // perspective_t::sample; forward transport cannot reach a point sensor
+    const auto perspective = [&]<bool polarimetric>(const sensor::perspective_t<polarimetric>& perspective) {
         if (!backward)
             throw gpu_error_t(std::format(
                 "GPU rendering supports perspective sensors only with backward plt_path "
                 "(direction=\"backward\"); sensor <{}>", sensor.get_id()));
         s.type = kernel::sensor_perspective;
-        s.position = to_kernel(perspective->position());
+        s.position = to_kernel(perspective.position());
         // glm matrices are column-major
-        const auto& to_camera = perspective->film_to_camera_transform().matrix();
+        const auto& to_camera = perspective.film_to_camera_transform().matrix();
         for (int r=0; r<4; ++r)
         for (int c=0; c<4; ++c)
             s.to_camera[4*r+c] = real(to_camera[c][r]);
         // directions transform by the inverse transpose (transform_t::operator()(dir3_t))
-        const auto dir_to_world = perspective->to_world_transform().inverse_transpose();
+        const auto dir_to_world = perspective.to_world_transform().inverse_transpose();
         for (int c=0; c<3; ++c) {
             auto e = vec3_t{ 0 };
             e[c] = 1;
@@ -724,14 +727,19 @@ sensor_spectral_t compile_sensor(const sensor::sensor_t& sensor, const bool back
             for (int r=0; r<3; ++r)
                 s.dir_to_world[3*r+c] = real(column[r]);
         }
-        s.ddir_dx = to_kernel(perspective->direction_pdvx());
-        s.ddir_dy = to_kernel(perspective->direction_pdvy());
-        compile_film(perspective->film(), out);
-        return { &perspective->film(), [perspective](wavenumber_t k) { return perspective->sourcing_geometry(k); } };
-    }
+        s.ddir_dx = to_kernel(perspective.direction_pdvx());
+        s.ddir_dy = to_kernel(perspective.direction_pdvy());
+        compile_film(perspective.film(), out);
+        return sensor_spectral_t{ perspective.film().response(), perspective.film().pixel_layout().components,
+                                  [p = &perspective](wavenumber_t k) { return p->sourcing_geometry(k); } };
+    };
+    if (const auto* p = dynamic_cast<const sensor::perspective_t<false>*>(&sensor); p)
+        return perspective(*p);
+    if (const auto* p = dynamic_cast<const sensor::perspective_t<true>*>(&sensor); p)
+        return perspective(*p);
 
     throw gpu_error_t(std::format(
-        "GPU rendering supports only virtual_plane and (non-polarimetric) perspective sensors so far; "
+        "GPU rendering supports only virtual_plane and perspective sensors so far; "
         "sensor <{}> is a '{}'", sensor.get_id(), type_of(sensor)));
 }
 
@@ -833,10 +841,8 @@ private:
             s.sensor_tan_alpha = real(sourcing.tan_alpha);
             s.sensor_x0 = real(u::to_m(sourcing.initial_spatial_lengths.x));
         }
-        const auto& film = *sensor_spectral.film;
-        const auto components = film.pixel_layout().components;
         for (std::uint32_t c=0; c<4; ++c)
-            s.response.c[c] = c<components ? real(film.response()->f(c, k)) : real(0);
+            s.response.c[c] = c<sensor_spectral.components ? real(sensor_spectral.response->f(c, k)) : real(0);
         // RGB uplift: the white, cyan, magenta, yellow, red, green and blue bases
         const auto lambda = wavenum_to_wavelen(k);
         const vec3_t bases[7] = { { 1,1,1 }, { 0,1,1 }, { 1,0,1 }, { 1,1,0 }, { 1,0,0 }, { 0,1,0 }, { 0,0,1 } };
@@ -927,7 +933,8 @@ renderer_t::renderer_t(const device_t& device,
     compiled.samples_per_emitter = spectra->samples_per_emitter();
 
     paths_per_spe = std::uint64_t(compiled.film.width) * compiled.film.height;
-    film_values = std::size_t(paths_per_spe) * compiled.film.components;
+    film_elements = std::size_t(paths_per_spe) * compiled.film.components;
+    polarimetric = compiled.film.polarimetric!=0;
 
     geometry = device.upload(ads);
     try {
@@ -976,18 +983,23 @@ void renderer_t::check_status(std::uint32_t status) {
 }
 
 void renderer_t::write_film(sensor::film_storage_handle_t& film) const {
-    auto* storage = dynamic_cast<sensor::film_storage_t<false, 2>*>(&film);
-    if (!storage || storage->pixel_layout().components*paths_per_spe!=film_values)
-        throw gpu_error_t("GPU rendering expected the sensor's 2D scalar film");
+    const auto write = [&](auto* storage) {
+        if (!storage || storage->pixel_layout().components*paths_per_spe!=film_elements)
+            throw gpu_error_t("GPU rendering expected the sensor's 2D film");
 
-    // as the CPU's integrators write: backward, block splats; forward, direct splats
-    std::vector<double> values(film_values);
-    if (backward) {
-        std::vector<double> weights(film_values);
-        backend->read_film(values.data(), weights.data());
-        storage->set_image(values.data(), weights.data());
-    } else {
-        backend->read_film(values.data(), nullptr);
-        storage->set_light_image(values.data());
-    }
+        // as the CPU's integrators write: backward, block splats; forward, direct splats
+        std::vector<double> values(film_elements * storage->values_per_component);
+        if (backward) {
+            std::vector<double> weights(film_elements);
+            backend->read_film(values.data(), weights.data());
+            storage->set_image(values.data(), weights.data());
+        } else {
+            backend->read_film(values.data(), nullptr);
+            storage->set_light_image(values.data());
+        }
+    };
+    if (polarimetric)
+        write(dynamic_cast<sensor::film_storage_t<true, 2>*>(&film));
+    else
+        write(dynamic_cast<sensor::film_storage_t<false, 2>*>(&film));
 }

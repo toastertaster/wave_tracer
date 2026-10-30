@@ -244,14 +244,16 @@ public:
         });
     }
 
+    /** @brief Values per element component in the arrays of ``set_image`` and ``set_light_image``. */
+    static constexpr std::size_t values_per_component = polarimetric ? 4 : 1;
+
     /**
      * @brief Replaces the light images (the direct splats) with an image accumulated elsewhere, e.g. on a GPU.
-     *        Element ``p`` (linear index, x fastest) component ``c`` is ``values[p*components + c]``.
+     *        Element ``p`` (linear index, x fastest) component ``c`` is ``values[p*components + c]``; for a
+     *        polarimetric film, its Stokes parameters are ``values[(p*components + c)*4 + i]``.
      *        (not thread safe)
      */
-    void set_light_image(const FilmStoragePixelT* values) noexcept
-        requires (!polarimetric)
-    {
+    void set_light_image(const FilmStoragePixelT* values) noexcept {
         assert(light_surfaces);
         if (!light_surfaces)
             return;
@@ -267,7 +269,7 @@ public:
                     stride *= dims[d];
                 }
                 for (std::uint8_t c=0;c<comps;++c)
-                    storage(p,c) = i==0 ? StorageT(values[idx*comps + c]) : StorageT{};
+                    storage(p,c) = i==0 ? stored_value(values + (idx*comps + c)*values_per_component) : StorageT{};
             });
         }
     }
@@ -275,12 +277,11 @@ public:
     /**
      * @brief Replaces the image (the block splats) with one accumulated elsewhere, e.g. on a GPU: the sums of
      *        the splatted values and of their reconstruction weights. Element ``p`` (linear index, x fastest)
-     *        component ``c`` is ``values[p*components + c]``, and likewise ``weights``.
+     *        component ``c`` is ``values[p*components + c]`` (polarimetric films: its Stokes parameters are
+     *        ``values[(p*components + c)*4 + i]``), its weight ``weights[p*components + c]``.
      *        (not thread safe)
      */
-    void set_image(const FilmStoragePixelT* values, const FilmStoragePixelT* weights) noexcept
-        requires (!polarimetric)
-    {
+    void set_image(const FilmStoragePixelT* values, const FilmStoragePixelT* weights) noexcept {
         assert(image);
         if (!image)
             return;
@@ -295,10 +296,17 @@ public:
             }
             for (std::uint8_t c=0;c<comps;++c)
                 (*image)(p,c) = storage_element_t{
-                    .value  = StorageT(values[idx*comps + c]),
+                    .value  = stored_value(values + (idx*comps + c)*values_per_component),
                     .weight = StorageWeightT(weights[idx*comps + c]),
                 };
         });
+    }
+
+    [[nodiscard]] static StorageT stored_value(const FilmStoragePixelT* v) noexcept {
+        if constexpr (polarimetric)
+            return StorageT{ v[0], v[1], v[2], v[3] };
+        else
+            return StorageT(v[0]);
     }
 
     /**
