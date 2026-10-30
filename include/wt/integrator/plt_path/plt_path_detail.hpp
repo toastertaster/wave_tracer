@@ -811,13 +811,24 @@ inline void integrate_forward(
     const auto emitter_wavenumber = ctx.scene->sample_emitter_and_spectrum_and_source_beam(ctx.sensor);
     const auto& emitter_sample    = emitter_wavenumber.emitter_sample;
 
-    const auto& k = emitter_wavenumber.wavenumber.k;
-    const auto recp_spectral_pd = f_t(1) / ctx.scene->sum_spectral_pdf_for_all_emitters(ctx.sensor, k);
+    // the sampling weight: one over the probability of sampling this emitter and wavenumber (the emitter's beam
+    // is not divided by either). (Not the spectral density summed over all emitters, which suits backward
+    // transport, whose wavenumber does not decide the emitter; here it would scale each emitter's
+    // contribution by its sampling probability.)
+    const auto& wpd = emitter_wavenumber.wavenumber.wpd;
+    const wavenumber_t recp_spectral_pd = (wpd.is_discrete() ?
+        f_t(1) / wavenumber_density_t{ wpd.mass() * u::mm } :
+        f_t(1) / wpd.density()) / emitter_wavenumber.emitter_pdf;
 
     // path trace
+    // a beam sourced on a surface (area emitters) starts from that surface, so that traversal offsets its
+    // origin off the surface: from the bare point, ray queries find the emitter's own triangle at about 0
+    // distance, which absorbs most of the emitted beams
     auto data = path_walk_data_t{
         .beam = emitter_sample.beam,
-        .prev_vert_geo  = emitter_sample.beam.origin(),
+        .prev_vert_geo  = emitter_sample.surface ?
+            vertex_geo_variant_t{ *emitter_sample.surface } :
+            vertex_geo_variant_t{ emitter_sample.beam.origin() },
         .opts = opts,
         .ctx = ctx
     };

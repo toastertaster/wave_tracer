@@ -91,6 +91,15 @@ WT_GPU_FN vec3 cosine_hemisphere(vec2 u) {
     return { d.x, d.y, sqrt(max(real(0), 1-sqr(d.x)-sqr(d.y))) };
 }
 
+/** @brief `sampler_t::uniform_cone`: a direction in the cone about +z of `solid_angle` (uniform density). */
+WT_GPU_FN vec3 uniform_cone(real solid_angle, vec2 u) {
+    const real cos_theta_max = 1 - inv_two_pi*solid_angle;
+    const real cos_theta = 1 + u.x*(cos_theta_max-1);
+    const real sin_theta = sqrt(max(real(0), 1-sqr(cos_theta)));
+    const real phi = two_pi*u.y;
+    return { cos(phi)*sin_theta, sin(phi)*sin_theta, cos_theta };
+}
+
 /** @brief `sampler_t::uniform_sphere` */
 WT_GPU_FN vec3 uniform_sphere(vec2 u) {
     const real z = 1 - 2*u.x;
@@ -309,6 +318,18 @@ WT_GPU_FN mueller_block eval_bsdf(const WT_GPU_THREAD material& m, vec3 wi, vec3
     if (m.type==material_diffuse && wi.z>real(0) && wo.z>real(0))
         return mueller_block::depolarizer(wo.z * inv_pi * m.reflectance * m.scale);
     return mueller_block::depolarizer(0);
+}
+
+/** @brief `bsdf_t::pdf`: the solid-angle density of `sample_bsdf` sampling `wo` (0 for delta BSDFs). */
+WT_GPU_FN real pdf_bsdf(const WT_GPU_THREAD material& m, vec3 wi, vec3 wo) {
+    // two_sided_t
+    if (m.two_sided!=0 && wi.z<real(0)) {
+        wi.z = -wi.z;
+        wo.z = -wo.z;
+    }
+    if (m.type==material_diffuse && wi.z>real(0) && wo.z>real(0))
+        return inv_pi * wo.z;
+    return 0;
 }
 
 /** @brief `bsdf_t::is_delta_only`: no BSDF evaluation or next-event estimation. */
@@ -677,6 +698,7 @@ struct alignas(16) path_state {
     u32 skip;               // splats to skip (made by an earlier, overflowed, attempt)
     u32 splats;             // splats made
     u32 spectral;           // the path's spectral sample (`plt_scene::spectra`)
+    real prev_dpd;          // solid-angle density of the last sampled direction, or 0 if discrete (`from_previous_dpd`)
 
     // forward transport
     real flux;              // the emitter's: Stokes parameters are relative to it
@@ -745,6 +767,56 @@ WT_GPU_FN void sample_sensor(const WT_GPU_THREAD sensor_desc& s, const WT_GPU_TH
     b.self_intersection_distance = 0;
 }
 
+/** @brief A direction transformed by row-major `M` (a direction transform of the host), normalized. */
+WT_GPU_FN vec3 transform_direction(const WT_GPU_GLOBAL real* M, vec3 v) {
+    return normalize(vec3{
+        M[0]*v.x + M[1]*v.y + M[2]*v.z,
+        M[3]*v.x + M[4]*v.y + M[5]*v.z,
+        M[6]*v.x + M[7]*v.y + M[8]*v.z,
+    });
+}
+
+/** @brief `spot_t::compute_falloff`: the intensity scale of a spot's (local) direction. */
+WT_GPU_FN real spot_falloff(const WT_GPU_GLOBAL emitter& em, vec3 local) {
+    const real cos_theta = local.z;
+    if (cos_theta<=em.cos_cutoff) return 0;
+    if (cos_theta>=em.cos_falloff) return 1;
+    return (em.cutoff - acos(cos_theta)) * em.recp_cutoff_range;
+}
+
+/** @brief A point on an area emitter (`shape_t::sample_position`: uniform by area), and its triangle. */
+struct area_point_t {
+    vec3 p;
+    u32 tri;
+};
+
+WT_GPU_FN area_point_t sample_area_point(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_GLOBAL emitter& em,
+                                         WT_GPU_THREAD rng& rnd) {
+    // a triangle by area (the first whose inclusive CDF exceeds u)
+    const real u = rnd.r();
+    u32 lo = 0, hi = em.tri_count-1;
+    while (lo<hi) {
+        const u32 mid = (lo+hi)/2;
+        if (u<scene.area_cdf[em.first_tri+mid]) hi = mid;
+        else lo = mid+1;
+    }
+    const u32 tri = scene.area_tris[em.first_tri+lo];
+
+    // a point on it (`sampler_t::uniform_triangle`)
+    vec2 b = rnd.r2();
+    if (b.x+b.y>real(1))
+        b = vec2{ 1-b.x, 1-b.y };
+    const bvh_tri t = scene.bvh.tris[tri];
+    return { t.a + b.x*(t.b-t.a) + b.y*(t.c-t.a), tri };
+}
+
+/** @brief The power heuristic (`MIS` of plt_path_detail.hpp), of densities `pd1` (non-zero) and `pd2`. */
+WT_GPU_FN real mis_power(real pd1, real pd2) {
+    if (pd2==real(0))
+        return 1;
+    return pd1*pd1 / (pd1*pd1 + pd2*pd2);
+}
+
 /** @brief `scene_t::sample_emitter` for a uniform random number `u`: an index into the emitter CDF. */
 WT_GPU_FN u32 sample_emitter(const WT_GPU_THREAD plt_scene& scene, real u) {
     u32 ei = 0;
@@ -786,6 +858,7 @@ WT_GPU_FN path_state start_path(const WT_GPU_THREAD plt_scene& scene, rng rnd, u
     const u32 ei = sample_emitter(scene, rnd.r());
     p.spectral = spectral!=choose_spectral ? spectral :
         table + ei*scene.samples_per_emitter + spectral_sample_for_path(path, scene.samples_per_emitter);
+    p.prev_dpd = 0;
 
     if (scene.params.backward!=0) {
         const spectral_sample spec = scene.spectra[p.spectral];
@@ -797,15 +870,42 @@ WT_GPU_FN path_state start_path(const WT_GPU_THREAD plt_scene& scene, rng rnd, u
         p.L = 0;
         p.flux = 0;
     } else {
-        const point_emitter em = scene.emitters[p.spectral*scene.emitter_count + ei];
+        // source a beam (`emitter_t::sample`)
+        const WT_GPU_GLOBAL emitter& em = scene.emitters[ei];
+        const emission es = scene.emissions[p.spectral*scene.emitter_count + ei];
+        ray r;
+        real scale = 1;
+        u32 surface_tri = no_triangle;
+        if (em.type==emitter_point) {
+            r = make_ray(em.position, uniform_sphere(rnd.r2()));
+        } else if (em.type==emitter_spot) {
+            // uniform over the cutoff cone, scaled by the falloff
+            const vec3 local = uniform_cone(em.cutoff_solid_angle, rnd.r2());
+            r = make_ray(em.position, transform_direction(em.dir_to_world, local));
+            scale = spot_falloff(em, local);
+        } else if (em.type==emitter_directional) {
+            // from outside the world, through a point on the target disc
+            const vec2 d = concentric_disk(rnd.r2()) * em.target_radius;
+            const vec3 wp = em.target_centre + d.x*em.target.t + d.y*em.target.b;
+            r = make_ray(wp + em.far*em.target.n, -em.target.n);
+        } else {
+            // area: from a point on the shape, cosine-distributed about its normal
+            const area_point_t ap = sample_area_point(scene, em, rnd);
+            const frame geo = build_shading_frame(scene.bvh.tris[ap.tri].n, scene.tris[ap.tri].dpdu);
+            r = make_ray(ap.p, geo.to_world(cosine_hemisphere(rnd.r2())));
+            surface_tri = ap.tri;
+        }
 
-        // source a beam (point_t::sample)
-        p.b.envelope = make_isotropic_cone(make_ray(em.position, uniform_sphere(rnd.r2())), em.tan_alpha, em.x0);
-        p.b.S = { 1,0,0,0 };
+        p.b.envelope = make_isotropic_cone(r, es.tan_alpha, es.x0);
+        p.b.S = { scale,0,0,0 };
         p.b.Sframe = p.b.envelope.frame();
         p.b.self_intersection_distance = 0;
-        p.prev_geo = { em.position, geo_point, 0 };
-        p.flux = em.flux;
+        // The CPU starts from the beam's origin, a point, even on an area emitter; but there, a GPU ray
+        // query finds the emitter's triangle itself, at a distance of about 0: start from its surface,
+        // whose ray origins are offset off the triangle.
+        p.prev_geo = surface_tri!=no_triangle ? vertex_geo{ r.o, geo_surface, surface_tri } :
+                                                vertex_geo{ r.o, geo_point, 0 };
+        p.flux = es.flux;
         p.ex = p.ey = 0;
         p.offset = { 0,0 };
         p.L = 0;
@@ -840,28 +940,60 @@ WT_GPU_FN void end_path(const WT_GPU_THREAD plt_scene& scene, WT_GPU_THREAD Film
  * @brief `nee_backward`: next-event estimation from the surface `s` of a
  *        non-delta material: connects to a sampled emitter (at spectral
  *        sample `spectral`), and returns the radiant flux the beam `b`
- *        observes through the connection. (Point emitters are sampled
- *        discretely: no MIS.)
+ *        observes through the connection, MIS-weighted against sampling
+ *        the BSDF for area emitters (the others are sampled discretely).
  */
 template <typename Geometry>
 WT_GPU_FN real nee_backward(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_THREAD Geometry& geometry,
                             u32 spectral, const WT_GPU_THREAD beam& b, const WT_GPU_THREAD surface& s,
                             const WT_GPU_THREAD material& m, WT_GPU_THREAD rng& rnd,
                             WT_GPU_THREAD u32& status) {
-    // scene_t::sample_emitter_direct
+    // scene_t::sample_emitter_direct: the emitter's `sample_direct`, divided by the emitter's sampling
+    // probability. `I`: the emitted beam's intensity; `woworld`: the direction to the emitter.
     const u32 ei = sample_emitter(scene, rnd.r());
-    const point_emitter em = scene.emitters[spectral*scene.emitter_count + ei];
-
-    // point_t::sample_direct: the emitted beam, divided by the emitter's sampling probability
-    const vec3 dl = s.wp - em.position;
-    const real recp_dist2 = 1 / length2(dl);
-    const vec3 d = dl * sqrt(recp_dist2);
-    const real I = em.intensity * recp_dist2 / em.pmf;
+    const WT_GPU_GLOBAL emitter& em = scene.emitters[ei];
+    const real intensity = scene.emissions[spectral*scene.emitter_count + ei].intensity;
+    real I;
+    vec3 woworld;
+    vertex_geo emitter_geo;
+    real pd_direct = 0;     // solid-angle density of the connection, or 0 if discrete
+    if (em.type==emitter_point || em.type==emitter_spot) {
+        const vec3 dl = s.wp - em.position;
+        const real recp_dist2 = 1 / length2(dl);
+        const vec3 d = dl * sqrt(recp_dist2);
+        I = intensity * recp_dist2 / em.pmf;
+        if (em.type==emitter_spot)
+            I *= spot_falloff(em, transform_direction(em.dir_to_local, d));
+        woworld = -d;
+        emitter_geo = { em.position, geo_point, 0 };
+    } else if (em.type==emitter_directional) {
+        // from outside the world, if `s.wp` is in the target disc
+        const vec3 v = s.wp - em.target_centre;
+        const vec2 plocal = { dot(v, em.target.t), dot(v, em.target.b) };
+        const real scale = length2(plocal)<=sqr(em.target_radius) ? real(1) : real(0);
+        const vec3 targetwp = em.target_centre + plocal.x*em.target.t + plocal.y*em.target.b;
+        I = intensity * scale / em.pmf;
+        woworld = em.target.n;
+        emitter_geo = { targetwp + em.far*em.target.n, geo_point, 0 };
+    } else {
+        // area: a point on the shape (area_t::sample_direct, pdf_direct)
+        const area_point_t ap = sample_area_point(scene, em, rnd);
+        const vec3 dl = s.wp - ap.p;
+        const real l2 = length2(dl);
+        const vec3 d = dl / sqrt(l2);
+        const real dn = max(real(0), dot(d, scene.bvh.tris[ap.tri].n));
+        const real recp_dn = dn>real(0) ? 1/dn : real(0);
+        const real dpd = (1/em.area) * l2 * recp_dn;
+        const real recp_dpd = dpd>real(0) ? 1/dpd : real(0);
+        I = intensity * dn * recp_dpd / em.pmf;
+        woworld = -d;
+        emitter_geo = { ap.p, geo_surface, ap.tri };
+        pd_direct = dpd * em.pmf;
+    }
     if (I==real(0))
         return 0;
 
     const vec3 wiworld = -b.dir();
-    const vec3 woworld = -d;
     const vec3 wi = s.shading.to_local(wiworld);
     const vec3 wo = s.shading.to_local(woworld);
     if (wi.z*dot(wiworld, s.geo.n)<=real(0) || wo.z*dot(woworld, s.geo.n)<=real(0))
@@ -871,14 +1003,38 @@ WT_GPU_FN real nee_backward(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_T
     if (f.m00==real(0))
         return 0;
 
-    if (shadowed(scene, geometry, vertex_geo{ s.wp, geo_surface, s.tri }, vertex_geo{ em.position, geo_point, 0 },
-                 status))
+    if (shadowed(scene, geometry, vertex_geo{ s.wp, geo_surface, s.tri }, emitter_geo, status))
         return 0;
 
     // integrate_beams over the beam after the interaction, and the unpolarized emitted beam
     beam nee = b;
     nee.apply_bsdf(s, woworld, f, true);
-    return nee.S.s0 * I;
+    const real mis = pd_direct>real(0) ? mis_power(pd_direct, pdf_bsdf(m, wi, wo)) : real(1);
+    return nee.S.s0 * I * mis;
+}
+
+/**
+ * @brief `emission` of plt_path_detail.hpp (backward transport): the radiant
+ *        flux the beam `b` observes from the area emitter `ei` it hit at `s`,
+ *        MIS-weighted against next-event estimation if the beam's direction
+ *        was sampled from a density `prev_dpd` (`area_t::Li`, `pdf_position`).
+ */
+WT_GPU_FN real emission_hit(const WT_GPU_THREAD plt_scene& scene, u32 spectral, u32 ei, real prev_dpd,
+                            const WT_GPU_THREAD beam& b, const WT_GPU_THREAD surface& s) {
+    const WT_GPU_GLOBAL emitter& em = scene.emitters[ei];
+    const real dn = dot(-b.dir(), s.geo.n);
+    if (dn<=real(0))
+        return 0;
+    const real L = b.S.s0 * scene.emissions[spectral*scene.emitter_count + ei].intensity;
+
+    real mis = 1;
+    if (prev_dpd>real(0)) {
+        // the solid-angle density of next-event estimation sampling this point
+        const real l2 = length2(b.origin() - s.wp);
+        const real pd_nee = (1/em.area) * l2 / abs(dn);
+        mis = mis_power(prev_dpd, pd_nee * em.pmf);
+    }
+    return L * mis;
 }
 
 /**
@@ -991,13 +1147,15 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
     // distance to interaction region end, or triangle intersection
     const real interaction_region_end = has_surface ? primary.dist : dist_to_interaction;
 
-    // the surface intersection, and its material
+    // the surface intersection, its material, and its emitter
     surface s;
     material mat;
+    u32 surface_emitter = no_emitter;
     if (has_surface) {
         const bvh_tri tri = scene.bvh.tris[primary.tri];
         const tri_shading sh = scene.tris[primary.tri];
         mat = scene.materials[p.spectral*scene.material_count + sh.material];
+        surface_emitter = sh.emitter;
         s.tri = primary.tri;
         s.wp = origin_wp + primary.dist*b.dir();
         s.geo = build_shading_frame(tri.n, sh.dpdu);
@@ -1047,6 +1205,12 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
     }
 
     //
+    // emission (backward: the beam hit an emitter)
+
+    if (backward && surface_emitter!=no_emitter)
+        p.L += emission_hit(scene, p.spectral, surface_emitter, p.prev_dpd, b, s);
+
+    //
     // sensing (forward: connection to the virtual sensor), up to the interaction
 
     if (!backward) {
@@ -1084,6 +1248,7 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
         p.prev_geo = { s.wp, geo_surface, s.tri };
         p.prev_beam = b;
         p.sampled_fsd = 0;
+        p.prev_dpd = is_delta(mat) ? real(0) : bs.pdf;
         b.transform_surface_interaction(s, woworld, bs.M, 1, backward);
         p.throughput *= bs.M.m00;
         if (bs.eta!=real(1))
@@ -1095,6 +1260,7 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
         p.prev_geo = { interaction_wp, geo_point, 0 };
         p.prev_beam = b;
         p.sampled_fsd = 1;
+        p.prev_dpd = 0;
         b.transform_region_interaction(interaction_wp, dist_to_interaction, fs.wo, fs.weight);
         p.throughput *= fs.weight;
     } else {

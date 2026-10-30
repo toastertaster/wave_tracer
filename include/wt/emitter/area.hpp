@@ -102,6 +102,13 @@ public:
     area_t(area_t&&) = default;
     
     [[nodiscard]] inline bool is_area_emitter() const noexcept override { return true; }
+
+    /** @brief The shape the emitter radiates from. */
+    [[nodiscard]] inline const shape_t* get_shape() const noexcept { return shape; }
+    /** @brief The emitted radiance texture, if any (otherwise, the average radiance is emitted everywhere). */
+    [[nodiscard]] inline const auto& radiance_texture() const noexcept { return radiance; }
+    /** @brief Scale of the emitted radiance. */
+    [[nodiscard]] inline f_t get_scale() const noexcept { return scale; }
     
     [[nodiscard]] inline bool is_delta_position() const noexcept override { return false; }
     [[nodiscard]] inline bool is_delta_direction() const noexcept override { return false; }

@@ -62,7 +62,10 @@ struct ball_hit_t {
 struct plt_path_scene_t {
     std::vector<kernel::tri_shading> tris;     // per BVH triangle
     std::vector<kernel::edge> edges;
+    std::vector<kernel::emitter> emitters;
     std::vector<kernel::real> emitter_cdf;
+    std::vector<std::uint32_t> area_tris;      // area emitters' triangles (see `kernel::plt_scene`)
+    std::vector<kernel::real> area_cdf;
     std::uint32_t emitter_count;
     std::uint32_t material_count;
     std::uint32_t samples_per_emitter;         // in each spectral table
@@ -73,13 +76,13 @@ struct plt_path_scene_t {
 
 /**
  * @brief Spectral samples (see `kernel::plt_scene`): `samples[s]`, with
- *        emitter e at `emitters[s*emitter_count + e]` and material m at
+ *        emitter e at `emissions[s*emitter_count + e]` and material m at
  *        `materials[s*material_count + m]`. A table for `trace` holds
  *        `samples_per_emitter` samples of each emitter, emitter by emitter.
  */
 struct spectral_table_t {
     std::vector<kernel::spectral_sample> samples;
-    std::vector<kernel::point_emitter> emitters;
+    std::vector<kernel::emission> emissions;
     std::vector<kernel::material> materials;
 };
 

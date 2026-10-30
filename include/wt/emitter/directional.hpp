@@ -95,6 +95,17 @@ public:
     }
     
     [[nodiscard]] inline const auto& direction_to_emitter() const noexcept { return dir_to_emitter; }
+
+    /** @brief Frame of the radiation target, a disc about the world centre: n is the direction to the emitter. */
+    [[nodiscard]] inline const auto& target_frame() const noexcept { return frame; }
+    /** @brief Centre of the radiation target. */
+    [[nodiscard]] inline auto target_centre() const noexcept { return world_centre(); }
+    /** @brief Radius of the radiation target. */
+    [[nodiscard]] inline auto target_disc_radius() const noexcept { return target_radius; }
+    /** @brief Area of the radiation target. */
+    [[nodiscard]] inline auto target_area() const noexcept { return surface_area; }
+    /** @brief Distance, along the direction to the emitter, from the target to outside the world. */
+    [[nodiscard]] inline auto distance_to_outside() const noexcept { return far; }
     
     /**
      * @brief Returns the emitter's emission spectrum

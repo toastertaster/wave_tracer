@@ -65,6 +65,13 @@ public:
     [[nodiscard]] inline auto position() const noexcept {
         return to_world(pqvec3_t::zero(), transform_point);
     }
+    /** @brief The spot's frame: emission directions are about its local z axis. */
+    [[nodiscard]] inline const auto& to_world_transform() const noexcept { return to_world; }
+    /** @brief Angle from the mean direction past which nothing is emitted. */
+    [[nodiscard]] inline auto get_cutoff() const noexcept { return cutoff; }
+    /** @brief Angle from the mean direction up to which the full intensity is emitted. */
+    [[nodiscard]] inline auto get_falloff() const noexcept { return falloff; }
+
     [[nodiscard]] inline auto mean_direction() const noexcept { 
         return to_world(dir3_t{ 0,0,1 });
     }

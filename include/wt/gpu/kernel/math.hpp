@@ -40,6 +40,8 @@ WT_GPU_FN float  k_erf(float x)  { return erff(x); }
 WT_GPU_FN double k_erf(double x) { return erf(x); }
 WT_GPU_FN float  k_tan(float x)  { return tanf(x); }
 WT_GPU_FN double k_tan(double x) { return tan(x); }
+WT_GPU_FN float  k_acos(float x)  { return acosf(x); }
+WT_GPU_FN double k_acos(double x) { return acos(x); }
 WT_GPU_FN float  k_atan2(float y, float x)  { return atan2f(y,x); }
 WT_GPU_FN double k_atan2(double y, double x) { return atan2(y,x); }
 WT_GPU_FN float  k_exp(float x)  { return expf(x); }
@@ -69,6 +71,7 @@ WT_GPU_FN real sin(real x) { return k_sin(x); }
 WT_GPU_FN real cos(real x) { return k_cos(x); }
 WT_GPU_FN real erf(real x) { return k_erf(x); }
 WT_GPU_FN real tan(real x) { return k_tan(x); }
+WT_GPU_FN real acos(real x) { return k_acos(x); }
 WT_GPU_FN real atan2(real y, real x) { return k_atan2(y,x); }
 WT_GPU_FN real exp(real x) { return k_exp(x); }
 WT_GPU_FN real log(real x) { return k_log(x); }

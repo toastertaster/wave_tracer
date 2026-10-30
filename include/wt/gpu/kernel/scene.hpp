@@ -29,6 +29,7 @@ namespace wt::gpu::kernel {
 
 constexpr u32 no_triangle = 0xffffffffu;
 constexpr u32 no_edge = 0xffffffffu;
+constexpr u32 no_emitter = 0xffffffffu;
 
 /** @brief Shading data of a BVH triangle (`bvh_view::tris` order). */
 struct tri_shading {
@@ -36,6 +37,7 @@ struct tri_shading {
     vec3 dpdu;      // `mesh::triangle_t::tangent_frame.dpdu`
     u32 material;
     u32 edges[3];   // `ads::tri_t::edge_ab, edge_bc, edge_ca`, or no_edge
+    u32 emitter;    // the area emitter of the triangle's shape, or no_emitter
 };
 
 /**
@@ -70,25 +72,57 @@ struct material {
     real reflectance;           // `diffuse_t`'s reflectance, clamped to [0,1]
 };
 
-/** @brief An `emitter::point_t`, at a spectral sample's wavenumber. */
-struct point_emitter {
+constexpr u32 emitter_point = 0;          // `emitter::point_t`
+constexpr u32 emitter_spot = 1;           // `emitter::spot_t`
+constexpr u32 emitter_directional = 2;    // `emitter::directional_t`
+constexpr u32 emitter_area = 3;           // `emitter::area_t`, of a constant radiance
+
+/** @brief An emitter, but for what depends on the wavenumber (see `emission`). */
+struct emitter {
+    u32 type;
+    real pmf;                   // probability of sampling this emitter (`scene_t::pdf_emitter`)
+
+    // point, spot
     vec3 position;
-    // sourced beams: isotropic cones (`point_t::sourcing_geometry`)
+
+    // spot: directions in its frame, whose z axis is its mean direction
+    real dir_to_world[9];       // row-major: `to_world(dir3_t)`, before normalization
+    real dir_to_local[9];       // row-major: `to_world.inverse()(dir3_t)`, before normalization
+    real cos_cutoff, cos_falloff;
+    real cutoff;                // radians
+    real recp_cutoff_range;     // one over (cutoff - falloff), in 1/radians
+    real cutoff_solid_angle;    // of the cone of directions sampled, in steradians
+
+    // directional: radiates into a target disc, from outside the world
+    frame target;               // n: the direction to the emitter
+    vec3 target_centre;
+    real target_radius;
+    real far;                   // distance along n from the target to outside the world
+
+    // area: triangles `area_tris[first_tri .. first_tri+tri_count-1]`
+    u32 first_tri, tri_count;
+    real area;                  // the shape's surface area
+};
+
+/**
+ * @brief An emitter at a spectral sample's wavenumber, divided by the spectral
+ *        sampling density (of `plt_path::integrate_forward` or `integrate_backward`).
+ */
+struct emission {
+    // sourced beams: isotropic cones (`sourcing_geometry`)
     real tan_alpha;
     real x0;
     /**
-     * @brief Forward transport: Watts per unit of a beam's relative Stokes
-     *        parameters: the sampled beam's flux (`point_t::sample`) divided by
-     *        the spectral sampling density (`scene_t::sum_spectral_pdf_for_all_emitters`).
+     * @brief Forward transport: Watts per unit of a sourced beam's relative
+     *        Stokes parameters (the sampled beam's flux, `emitter_t::sample`).
      */
     real flux;
     /**
-     * @brief Backward transport: the radiant intensity (W/sr), the spectral
-     *        radiant intensity divided by the spectral sampling density of
-     *        `plt_path::integrate_backward`.
+     * @brief Backward transport: the radiant intensity (W/sr) of point and
+     *        spot emitters, the irradiance (W/m²) of directional emitters, the
+     *        radiance (W/m²/sr) of area emitters.
      */
     real intensity;
-    real pmf;           // probability of sampling this emitter (`scene_t::pdf_emitter`)
 };
 
 constexpr u32 sensor_virtual_plane = 0;
@@ -175,13 +209,17 @@ struct plt_scene {
     const WT_GPU_GLOBAL edge* edges;
 
     const WT_GPU_GLOBAL spectral_sample* spectra;
-    const WT_GPU_GLOBAL point_emitter* emitters;    // emitter e at spectral sample s: [s*emitter_count + e]
+    const WT_GPU_GLOBAL emission* emissions;        // emitter e at spectral sample s: [s*emitter_count + e]
     const WT_GPU_GLOBAL material* materials;        // material m at spectral sample s: [s*material_count + m]
     u32 emitter_count;
     u32 material_count;
     u32 samples_per_emitter;
 
-    const WT_GPU_GLOBAL real* emitter_cdf;     // inclusive CDF of the emitter sampling distribution
+    const WT_GPU_GLOBAL emitter* emitters;
+    const WT_GPU_GLOBAL real* emitter_cdf;          // inclusive CDF of the emitter sampling distribution
+    // area emitters' triangles (BVH triangles), and each emitter's inclusive CDF of them by area
+    const WT_GPU_GLOBAL u32* area_tris;
+    const WT_GPU_GLOBAL real* area_cdf;
 
     sensor_desc sensor;
     film_desc film;

@@ -381,7 +381,10 @@ public:
         set_device(ordinal);
         tris.upload(scene.tris.data(), scene.tris.size());
         edges.upload(scene.edges.data(), scene.edges.size());
+        emitters.upload(scene.emitters.data(), scene.emitters.size());
         emitter_cdf.upload(scene.emitter_cdf.data(), scene.emitter_cdf.size());
+        area_tris.upload(scene.area_tris.data(), scene.area_tris.size());
+        area_cdf.upload(scene.area_cdf.data(), scene.area_cdf.size());
 
         film_size = std::size_t(scene.film.width) * scene.film.height * scene.film.components;
         film.resize(film_size);
@@ -399,7 +402,10 @@ public:
         params.bvh = bvh;
         params.tris = tris.get();
         params.edges = edges.get();
+        params.emitters = emitters.get();
         params.emitter_cdf = emitter_cdf.get();
+        params.area_tris = area_tris.get();
+        params.area_cdf = area_cdf.get();
         params.emitter_count = scene.emitter_count;
         params.material_count = scene.material_count;
         params.samples_per_emitter = scene.samples_per_emitter;
@@ -413,7 +419,7 @@ public:
                         const spectral_table_t& spectra) override {
         set_device(ordinal);
         if (spectra.samples.size()!=table_size ||
-            spectra.emitters.size()!=std::size_t(table_size)*params.emitter_count ||
+            spectra.emissions.size()!=std::size_t(table_size)*params.emitter_count ||
             spectra.materials.size()!=std::size_t(table_size)*params.material_count)
             throw std::logic_error("the spectral table does not match the compiled scene");
         if (main.slots==0)
@@ -556,16 +562,16 @@ private:
     /** @brief Room for `count` spectral samples on the device. Moves them: only when no paths are in flight. */
     void reserve_spectra(std::size_t count) {
         spectra.resize(count);
-        sample_emitters.resize(count*params.emitter_count);
+        sample_emissions.resize(count*params.emitter_count);
         sample_materials.resize(count*params.material_count);
         params.spectra = spectra.get();
-        params.emitters = sample_emitters.get();
+        params.emissions = sample_emissions.get();
         params.materials = sample_materials.get();
     }
 
     void upload_spectra(k::u32 base, const spectral_table_t& table) {
         spectra.upload_at(base, table.samples.data(), table.samples.size());
-        sample_emitters.upload_at(std::size_t(base)*params.emitter_count, table.emitters.data(), table.emitters.size());
+        sample_emissions.upload_at(std::size_t(base)*params.emitter_count, table.emissions.data(), table.emissions.size());
         sample_materials.upload_at(std::size_t(base)*params.material_count, table.materials.data(), table.materials.size());
     }
 
@@ -678,9 +684,9 @@ private:
             if (inserted) {
                 const auto E = params.emitter_count, M = params.material_count;
                 retained.samples.push_back(t.table.samples[i]);
-                retained.emitters.insert(retained.emitters.end(),
-                                         t.table.emitters.begin() + std::size_t(i)*E,
-                                         t.table.emitters.begin() + std::size_t(i+1)*E);
+                retained.emissions.insert(retained.emissions.end(),
+                                          t.table.emissions.begin() + std::size_t(i)*E,
+                                          t.table.emissions.begin() + std::size_t(i+1)*E);
                 retained.materials.insert(retained.materials.end(),
                                           t.table.materials.begin() + std::size_t(i)*M,
                                           t.table.materials.begin() + std::size_t(i+1)*M);
@@ -701,7 +707,10 @@ private:
 
     device_buffer_t<k::tri_shading>   tris;
     device_buffer_t<k::edge>          edges;
+    device_buffer_t<k::emitter>       emitters;
     device_buffer_t<k::real>          emitter_cdf;
+    device_buffer_t<k::u32>           area_tris;
+    device_buffer_t<k::real>          area_cdf;
     device_buffer_t<double>           film;
     device_buffer_t<double>           film_weights;     // backward transport
     std::size_t film_size = 0;
@@ -710,7 +719,7 @@ private:
     // spectral tables: `tables` of `table_size` samples, for the main pool (or one for re-traced paths)
     k::u32 table_size;
     device_buffer_t<k::spectral_sample> spectra;
-    device_buffer_t<k::point_emitter>   sample_emitters;
+    device_buffer_t<k::emission>        sample_emissions;
     device_buffer_t<k::material>        sample_materials;
     device_buffer_t<k::u32>             table_paths;      // paths in flight of each table
     std::array<loaded_table_t, tables>  loaded;

@@ -19,7 +19,12 @@
 #include <wt/ads/bvh8w/bvh8w.hpp>
 #include <wt/scene/scene.hpp>
 #include <wt/integrator/plt_path/plt_path.hpp>
+#include <wt/emitter/area.hpp>
+#include <wt/emitter/directional.hpp>
 #include <wt/emitter/point.hpp>
+#include <wt/emitter/spot.hpp>
+#include <wt/math/util.hpp>
+#include <wt/scene/shape.hpp>
 #include <wt/bsdf/two_sided.hpp>
 #include <wt/bsdf/composite.hpp>
 #include <wt/bsdf/diffuse.hpp>
@@ -71,13 +76,28 @@ void compile_integrator(const scene_t& scene, const sensor::sensor_t& sensor,
     out.params.ray_tracing_only = sensor.ray_trace_only() ? 1 : 0;
 }
 
+/** @brief A direction transform (as `transform_t::operator()(dir3_t)` applies it, before normalizing), row-major. */
+void compile_direction_transform(const transform_t& t, real (&out)[9]) {
+    const auto it = t.inverse_transpose();
+    for (int c=0; c<3; ++c) {
+        auto e = vec3_t{ 0 };
+        e[c] = 1;
+        const auto column = it(e, transform_vector);
+        for (int r=0; r<3; ++r)
+            out[3*r+c] = real(column[r]);
+    }
+}
+
 /**
  * @brief The emitters the sensor samples (in the order of the emitter CDF,
- *        which this compiles), which must be point emitters.
+ *        which this compiles), but for what depends on the wavenumber.
+ *        `shape_emitter[i]` is the emitter of scene shape i, or no_emitter.
  */
-std::vector<const emitter::point_t*> compile_emitters(const scene_t& scene, const sensor::sensor_t& sensor,
-                                                      plt_path_scene_t& out) {
-    std::vector<const emitter::point_t*> emitters;
+std::vector<const emitter::emitter_t*> compile_emitters(const scene_t& scene, const sensor::sensor_t& sensor,
+                                                        const ads::bvh8w_t& bvh, plt_path_scene_t& out,
+                                                        std::vector<std::uint32_t>& shape_emitter) {
+    shape_emitter.assign(scene.shapes().size(), kernel::no_emitter);
+    std::vector<const emitter::emitter_t*> emitters;
     std::vector<double> pdfs;
     for (const auto& e : scene.emitters()) {
         // emitters that are never sampled for this sensor do not matter
@@ -85,12 +105,68 @@ std::vector<const emitter::point_t*> compile_emitters(const scene_t& scene, cons
         if (!(pdf>0))
             continue;
 
-        const auto* point = dynamic_cast<const emitter::point_t*>(e.get());
-        if (!point)
+        kernel::emitter k{};
+        k.pmf = real(pdf);
+        if (const auto* point = dynamic_cast<const emitter::point_t*>(e.get()); point) {
+            k.type = kernel::emitter_point;
+            k.position = to_kernel(point->get_position());
+        } else if (const auto* spot = dynamic_cast<const emitter::spot_t*>(e.get()); spot) {
+            k.type = kernel::emitter_spot;
+            k.position = to_kernel(spot->position());
+            compile_direction_transform(spot->to_world_transform(), k.dir_to_world);
+            compile_direction_transform(spot->to_world_transform().inverse(), k.dir_to_local);
+            const auto cutoff = f_t(u::to_rad(spot->get_cutoff()));
+            const auto falloff = f_t(u::to_rad(spot->get_falloff()));
+            k.cos_cutoff = real(std::cos(cutoff));
+            k.cos_falloff = real(std::cos(falloff));
+            k.cutoff = real(cutoff);
+            k.recp_cutoff_range = real(f_t(1) / (cutoff-falloff));
+            k.cutoff_solid_angle = real(m::two_pi * (1-std::cos(cutoff)));
+        } else if (const auto* directional = dynamic_cast<const emitter::directional_t*>(e.get()); directional) {
+            k.type = kernel::emitter_directional;
+            k.target = to_kernel(directional->target_frame());
+            k.target_centre = to_kernel(directional->target_centre());
+            k.target_radius = real(u::to_m(directional->target_disc_radius()));
+            k.far = real(u::to_m(directional->distance_to_outside()));
+        } else if (const auto* area = dynamic_cast<const emitter::area_t*>(e.get()); area) {
+            if (area->radiance_texture())
+                throw gpu_error_t(std::format(
+                    "GPU rendering supports only area emitters of a constant radiance so far; "
+                    "emitter <{}> has a radiance texture", e->get_id()));
+            const auto* shape = area->get_shape();
+            const auto shape_it = std::ranges::find_if(scene.shapes(), [&](const auto& s) { return s.get()==shape; });
+            if (shape_it==scene.shapes().end())
+                throw gpu_error_t(std::format("GPU rendering found no shape of area emitter <{}>", e->get_id()));
+            const auto shape_idx = std::size_t(shape_it - scene.shapes().begin());
+            shape_emitter[shape_idx] = std::uint32_t(emitters.size());
+
+            // the shape's (BVH) triangles, and their inclusive CDF by area
+            k.type = kernel::emitter_area;
+            k.first_tri = std::uint32_t(out.area_tris.size());
+            double total = 0;
+            std::vector<double> cdf;
+            for (std::size_t i=0; i<bvh.triangles_count(); ++i) {
+                const auto& t = bvh.tri(ads::tuid_t{ ads::idx_t(i) });
+                if (t.shape_idx!=shape_idx)
+                    continue;
+                const auto& mt = shape->get_mesh().triangle(t.shape_tri_idx);
+                total += double(u::to_m2(util::tri_surface_area(mt.p[0], mt.p[1], mt.p[2])));
+                out.area_tris.push_back(std::uint32_t(i));
+                cdf.push_back(total);
+            }
+            if (cdf.empty() || !(total>0))
+                throw gpu_error_t(std::format("GPU rendering found no surface of area emitter <{}>", e->get_id()));
+            for (const auto c : cdf)
+                out.area_cdf.push_back(real(c/total));
+            out.area_cdf.back() = 1;
+            k.tri_count = std::uint32_t(cdf.size());
+            k.area = real(u::to_m2(shape->get_surface_area()));
+        } else {
             throw gpu_error_t(std::format(
-                "GPU rendering supports only point emitters so far; emitter <{}> is a '{}'",
-                e->get_id(), type_of(*e)));
-        emitters.push_back(point);
+                "GPU rendering does not support '{}' emitters yet (emitter <{}>)", type_of(*e), e->get_id()));
+        }
+        out.emitters.push_back(k);
+        emitters.push_back(e.get());
         pdfs.push_back(pdf);
     }
     if (emitters.empty())
@@ -208,8 +284,12 @@ kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k) {
         "GPU rendering does not support '{}' BSDFs yet (BSDF <{}>)", type_of(*b), b->get_id()));
 }
 
-/** @brief Compiles the geometry; returns the materials' BSDFs (compiled for each spectral sample). */
+/**
+ * @brief Compiles the geometry, with the emitters of shapes `shape_emitter`;
+ *        returns the materials' BSDFs (compiled for each spectral sample).
+ */
 std::vector<const bsdf::bsdf_t*> compile_geometry(const scene_t& scene, const ads::bvh8w_t& bvh,
+                                                  const std::vector<std::uint32_t>& shape_emitter,
                                                   plt_path_scene_t& out) {
     std::vector<const bsdf::bsdf_t*> bsdfs;
     std::map<const bsdf::bsdf_t*, std::uint32_t> material_of;
@@ -235,6 +315,7 @@ std::vector<const bsdf::bsdf_t*> compile_geometry(const scene_t& scene, const ad
             s.n[v] = to_kernel(dir3_t{ mesh_tri.n[v] });
         s.dpdu = to_kernel(mesh_tri.tangent_frame.dpdu);
         s.material = shape_material[t.shape_idx];
+        s.emitter = shape_emitter[t.shape_idx];
         s.edges[0] = edge_id(t.edge_ab);
         s.edges[1] = edge_id(t.edge_bc);
         s.edges[2] = edge_id(t.edge_ca);
@@ -381,7 +462,7 @@ public:
 
     spectral_tables_t(const scene_t& scene, const sensor::sensor_t& sensor, const bool backward,
                       sensor_spectral_t sensor_spectral,
-                      std::vector<const emitter::point_t*> emitters,
+                      std::vector<const emitter::emitter_t*> emitters,
                       std::vector<const bsdf::bsdf_t*> bsdfs)
         : scene(scene), sensor(sensor), backward(backward),
           sensor_spectral(std::move(sensor_spectral)),
@@ -406,24 +487,29 @@ public:
 private:
     void build(std::uint64_t pass) {
         current.samples.clear();
-        current.emitters.clear();
+        current.emissions.clear();
         current.materials.clear();
         seeded_sampler_t sampler{ mix_seed(pass) };
         for (const auto* emitter : emitters)
         for (std::uint32_t j=0; j<per_emitter; ++j) {
             sampler.stratify(j, per_emitter);
-            compile(scene.sample_spectrum(&sensor, emitter, sampler));
+            compile(scene.sample_spectrum(&sensor, emitter, sampler), scene.pdf_emitter(&sensor, emitter));
         }
         built_for = pass;
     }
 
-    /** @brief Appends the spectral sample of wavenumber sample `ws`. */
-    void compile(const wavenumber_sample_t& ws) {
+    /** @brief Appends the spectral sample of wavenumber sample `ws`, drawn for an emitter of probability `emitter_pdf`. */
+    void compile(const wavenumber_sample_t& ws, const f_t emitter_pdf) {
         const auto k = ws.k;
 
-        // spectral (importance) sampling weight: plt_path::integrate_forward, integrate_backward
-        const wavenumber_t recp_spectral_pd = backward && ws.wpd.is_discrete() ?
+        // spectral (importance) sampling weight: plt_path::integrate_forward (one over the probability of
+        // the emitter and wavenumber sampled), integrate_backward (of the wavenumber, over all emitters)
+        const auto recp_wpd = ws.wpd.is_discrete() ?
             f_t(1) / wavenumber_density_t{ ws.wpd.mass() * u::mm } :
+            f_t(1) / ws.wpd.density();
+        const wavenumber_t recp_spectral_pd =
+            !backward ? recp_wpd / emitter_pdf :
+            ws.wpd.is_discrete() ? recp_wpd :
             f_t(1) / scene.sum_spectral_pdf_for_all_emitters(&sensor, k);
         // a wavenumber no emitter emits at contributes nothing
         const auto recp = recp_spectral_pd>zero && m::isfinite(recp_spectral_pd) ?
@@ -447,30 +533,57 @@ private:
             s.response.c[c] = c<components ? real(film.response()->f(c, k)) : real(0);
         current.samples.push_back(s);
 
-        for (const auto* point : emitters) {
-            const auto sourcing = point->sourcing_geometry(k);
-            const auto intensity = point->spectral_radiant_intensity(k) * recp;
-            current.emitters.push_back(kernel::point_emitter{
-                .position = to_kernel(point->get_position()),
-                .tan_alpha = real(sourcing.tan_alpha),
-                .x0 = real(u::to_m(sourcing.initial_spatial_lengths.x)),
-                // point_t::sample
-                .flux = real(u::to_W(intensity * (m::four_pi * u::ang::sr))),
-                // point_t::sample_direct
-                .intensity = real(u::to_W(intensity * u::ang::sr)),
-                .pmf = real(scene.pdf_emitter(&sensor, point)),
-            });
-        }
+        for (const auto* e : emitters)
+            current.emissions.push_back(compile_emission(*e, k, recp));
 
         for (const auto* bsdf : bsdfs)
             current.materials.push_back(compile_bsdf(*bsdf, k));
+    }
+
+    /** @brief An emitter's `kernel::emission` at wavenumber `k`, times the spectral sampling weight `recp`. */
+    static kernel::emission compile_emission(const emitter::emitter_t& e, const wavenumber_t k,
+                                             const wavenumber_t recp) {
+        kernel::emission ret{};
+        const auto sourced = [&](const beam::sourcing_geometry_t& sourcing) {
+            if (sourcing.surface || sourcing.initial_spatial_lengths.x!=sourcing.initial_spatial_lengths.y)
+                throw gpu_error_t(std::format(
+                    "GPU rendering supports only emitters that source isotropic beams; emitter <{}> does not",
+                    e.get_id()));
+            ret.tan_alpha = real(sourcing.tan_alpha);
+            ret.x0 = real(u::to_m(sourcing.initial_spatial_lengths.x));
+        };
+
+        // `flux`: emitter_t::sample's beam over its sampling densities; `intensity`: what sample_direct emits
+        if (const auto* point = dynamic_cast<const emitter::point_t*>(&e); point) {
+            sourced(point->sourcing_geometry(k));
+            const auto I = point->spectral_radiant_intensity(k) * recp;
+            ret.flux = real(u::to_W(I * (m::four_pi * u::ang::sr)));
+            ret.intensity = real(u::to_W(I * u::ang::sr));
+        } else if (const auto* spot = dynamic_cast<const emitter::spot_t*>(&e); spot) {
+            sourced(spot->sourcing_geometry(k));
+            const auto I = spot->spectral_radiant_intensity(k) * recp;
+            const auto cutoff_solid_angle = m::two_pi * (1-std::cos(f_t(u::to_rad(spot->get_cutoff()))));
+            ret.flux = real(u::to_W(I * (cutoff_solid_angle * u::ang::sr)));
+            ret.intensity = real(u::to_W(I * u::ang::sr));
+        } else if (const auto* directional = dynamic_cast<const emitter::directional_t*>(&e); directional) {
+            sourced(directional->sourcing_geometry(k));
+            const auto E = directional->spectral_irradiance(k) * recp;
+            ret.flux = real(u::numerical_value_in(E * directional->target_area(), u::W));
+            ret.intensity = real(u::numerical_value_in(E * square(u::m), u::W));
+        } else if (const auto* area = dynamic_cast<const emitter::area_t*>(&e); area) {
+            sourced(area->sourcing_geometry(k));
+            const auto L = area->get_scale() * area->emission_spectrum().f(k) * spectral_radiance_t::unit * recp;
+            ret.flux = real(u::numerical_value_in(L * area->get_shape()->get_surface_area() * (m::pi * u::ang::sr), u::W));
+            ret.intensity = real(u::numerical_value_in(L * square(u::m) * u::ang::sr, u::W));
+        }
+        return ret;
     }
 
     const scene_t& scene;
     const sensor::sensor_t& sensor;
     bool backward;
     sensor_spectral_t sensor_spectral;
-    std::vector<const emitter::point_t*> emitters;
+    std::vector<const emitter::emitter_t*> emitters;
     std::vector<const bsdf::bsdf_t*> bsdfs;
 
     std::uint32_t per_emitter;
@@ -492,8 +605,9 @@ renderer_t::renderer_t(const device_t& device,
     compile_integrator(scene, sensor, compiled);
     backward = compiled.params.backward!=0;
     auto sensor_spectral = compile_sensor(sensor, backward, compiled);
-    auto emitters = compile_emitters(scene, sensor, compiled);
-    auto bsdfs = compile_geometry(scene, *bvh, compiled);
+    std::vector<std::uint32_t> shape_emitter;
+    auto emitters = compile_emitters(scene, sensor, *bvh, compiled, shape_emitter);
+    auto bsdfs = compile_geometry(scene, *bvh, shape_emitter, compiled);
     // the first pass's table: compiles the BSDFs, refusing those the GPU does not support
     spectra = std::make_unique<spectral_tables_t>(scene, sensor, backward, std::move(sensor_spectral),
                                                   std::move(emitters), std::move(bsdfs));

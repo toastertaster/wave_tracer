@@ -21,7 +21,8 @@
  *   - virtual_plane (coverage) sensors, and, with backward transport,
  *     non-polarimetric perspective sensors, of any (scalar) response:
  *     paths draw wavenumbers as the CPU's do (see `spectral_tables_t`);
- *   - point emitters;
+ *   - point, spot and directional emitters, and area emitters of a constant
+ *     radiance;
  *   - surface_spm BSDFs with a Dirac surface profile (specular), and diffuse
  *     BSDFs with a constant reflectance, optionally wrapped in twosided,
  *     composite and (constant) scale BSDFs;
