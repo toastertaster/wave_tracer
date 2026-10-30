@@ -53,6 +53,13 @@ public:
         if (count)
             check(cudaMemcpy(ptr, data, count*sizeof(T), cudaMemcpyHostToDevice), "copying to the device");
     }
+    /** @brief Copies to elements `offset .. offset+count-1`, which must be allocated. */
+    void upload_at(std::size_t offset, const T* data, std::size_t count) {
+        if (offset+count>capacity)
+            throw std::logic_error("copying past the end of device memory");
+        if (count)
+            check(cudaMemcpy(ptr+offset, data, count*sizeof(T), cudaMemcpyHostToDevice), "copying to the device");
+    }
     void download(T* data, std::size_t count) const {
         if (count)
             check(cudaMemcpy(data, ptr, count*sizeof(T), cudaMemcpyDeviceToHost), "running a GPU query");

@@ -119,10 +119,11 @@ WT_GPU_FN real gaussian_integrate(real sigma, real lo, real hi) {
 
 /**
  * @brief `film_t::splat_direct`: splats `watts` around element (ex,ey) with
- *        fractional offset `offset`, weighted by the reconstruction filter.
+ *        fractional offset `offset`, weighted by the reconstruction filter
+ *        and the sensor's response.
  */
 template <typename Film>
-WT_GPU_FN void splat(const WT_GPU_THREAD film_desc& film, WT_GPU_THREAD Film& sink,
+WT_GPU_FN void splat(const WT_GPU_THREAD film_desc& film, film_response response, WT_GPU_THREAD Film& sink,
                      u32 ex, u32 ey, vec2 offset, real watts) {
     const i32 r = film.rf_radius;
 
@@ -139,7 +140,7 @@ WT_GPU_FN void splat(const WT_GPU_THREAD film_desc& film, WT_GPU_THREAD Film& si
     const real recp_tw = tw>real(0) ? real(1)/tw : real(0);
 
     for (u32 c=0; c<film.components; ++c) {
-        const real val = watts * film.response[c];
+        const real val = watts * response.c[c];
         // avoid NaNs, infs and negatives
         if (!(val>real(0)) || !isfinite(val))
             continue;
@@ -161,7 +162,7 @@ WT_GPU_FN void splat(const WT_GPU_THREAD film_desc& film, WT_GPU_THREAD Film& si
  *        film develops their ratio. Every sample splats, zero or not.
  */
 template <typename Film>
-WT_GPU_FN void splat_weighted(const WT_GPU_THREAD film_desc& film, WT_GPU_THREAD Film& sink,
+WT_GPU_FN void splat_weighted(const WT_GPU_THREAD film_desc& film, film_response response, WT_GPU_THREAD Film& sink,
                               u32 ex, u32 ey, vec2 offset, real watts) {
     const i32 r = film.rf_radius;
 
@@ -177,7 +178,7 @@ WT_GPU_FN void splat_weighted(const WT_GPU_THREAD film_desc& film, WT_GPU_THREAD
     const real recp_tw = tw>real(0) ? real(1)/tw : real(0);
 
     for (u32 c=0; c<film.components; ++c) {
-        real val = watts * film.response[c];
+        real val = watts * response.c[c];
         // avoid NaNs, infs and negatives (but sum up the weights)
         if (!(val>=real(0)) || !isfinite(val))
             val = 0;
@@ -566,10 +567,9 @@ struct fsd_amplitudes_t {
  */
 template <typename Geometry>
 WT_GPU_FN fsd_amplitudes_t do_fsd(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_THREAD Geometry& geometry,
-                                  const WT_GPU_THREAD cone& cone_from_src, vertex_geo src_geo, vec3 dst,
+                                  real k, const WT_GPU_THREAD cone& cone_from_src, vertex_geo src_geo, vec3 dst,
                                   const WT_GPU_GLOBAL aperture_entry* aperture, u32 aperture_size,
                                   WT_GPU_THREAD u32& status) {
-    const real k = scene.params.k;
     const vec3 src = cone_from_src.r.o;
     const vertex_geo dst_geo = { dst, geo_point, 0 };
 
@@ -676,6 +676,7 @@ struct alignas(16) path_state {
     u32 sampled_fsd;        // nonzero: the last interaction sampled a diffraction
     u32 skip;               // splats to skip (made by an earlier, overflowed, attempt)
     u32 splats;             // splats made
+    u32 spectral;           // the path's spectral sample (`plt_scene::spectra`)
 
     // forward transport
     real flux;              // the emitter's: Stokes parameters are relative to it
@@ -687,10 +688,10 @@ struct alignas(16) path_state {
 
     /** @brief Splats a sensor connection (forward transport), unless an earlier attempt made it. */
     template <typename Film>
-    WT_GPU_FN void splat(const WT_GPU_THREAD film_desc& desc, WT_GPU_THREAD Film& film,
+    WT_GPU_FN void splat(const WT_GPU_THREAD film_desc& desc, film_response response, WT_GPU_THREAD Film& film,
                          u32 ex, u32 ey, vec2 offset, real watts) {
         if (splats++>=skip)
-            kernel::splat(desc, film, ex, ey, offset, watts);
+            kernel::splat(desc, response, film, ex, ey, offset, watts);
     }
 };
 
@@ -705,10 +706,12 @@ WT_GPU_FN vec3 point_on_sensor(const WT_GPU_THREAD sensor_desc& s, vec2 film_pos
 
 /**
  * @brief `sensor_t::sample` (backward transport): a beam sourced from
- *        sensor element (ex,ey), at an offset within it; its radiometric
- *        data is the sampled importance (`Se`) over the sampling densities.
+ *        sensor element (ex,ey), at an offset within it, at the wavenumber
+ *        of `spec`; its radiometric data is the sampled importance (`Se`)
+ *        over the sampling densities.
  */
-WT_GPU_FN void sample_sensor(const WT_GPU_THREAD sensor_desc& s, u32 ex, u32 ey, WT_GPU_THREAD rng& rnd,
+WT_GPU_FN void sample_sensor(const WT_GPU_THREAD sensor_desc& s, const WT_GPU_THREAD spectral_sample& spec,
+                             u32 ex, u32 ey, WT_GPU_THREAD rng& rnd,
                              WT_GPU_THREAD beam& b, WT_GPU_THREAD vec2& offset) {
     ray r;
     real scale;
@@ -736,36 +739,65 @@ WT_GPU_FN void sample_sensor(const WT_GPU_THREAD sensor_desc& s, u32 ex, u32 ey,
         scale = dpd>real(0) ? s.importance * max(real(0), dot(r.d, s.f.n)) * s.area / dpd : real(0);
     }
 
-    b.envelope = make_isotropic_cone(r, s.tan_alpha, s.x0);
+    b.envelope = make_isotropic_cone(r, spec.sensor_tan_alpha, spec.sensor_x0);
     b.S = { scale,0,0,0 };      // the identity operator, scaled
     b.Sframe = b.envelope.frame();
     b.self_intersection_distance = 0;
 }
 
+/** @brief `scene_t::sample_emitter` for a uniform random number `u`: an index into the emitter CDF. */
+WT_GPU_FN u32 sample_emitter(const WT_GPU_THREAD plt_scene& scene, real u) {
+    u32 ei = 0;
+    while (ei+1<scene.emitter_count && !(u<scene.emitter_cdf[ei]))
+        ++ei;
+    return ei;
+}
+
+/** @brief `start_path`'s `spectral` argument: choose a spectral sample of the table (rather than this one). */
+constexpr u32 choose_spectral = 0xffffffffu;
+
+/**
+ * @brief Which of an emitter's `count` spectral samples path `path` takes: a
+ *        hash of the path index, so that the samples of a sensor element
+ *        take different ones (and not the path's random numbers).
+ */
+WT_GPU_FN u32 spectral_sample_for_path(u64 path, u32 count) {
+    // the splitmix64 finalizer
+    u64 z = path + 0x9e3779b97f4a7c15ull;
+    z = (z ^ (z>>30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z>>27)) * 0x94d049bb133111ebull;
+    z = z ^ (z>>31);
+    return u32(z>>32) % count;
+}
+
 /**
  * @brief Starts path `path` (`plt_path::integrate_forward` or
- *        `integrate_backward`): forward, samples an emitter and sources a
- *        beam; backward, sources a beam from sensor element `path` modulo the
- *        film's elements. `rnd` is the path's generator; `skip` the splats an
+ *        `integrate_backward`): samples an emitter, and one of the emitter's
+ *        spectral samples in the table starting at `table` (or takes
+ *        `spectral`, unless it is `choose_spectral`), as the CPU samples an
+ *        emitter and a wavenumber; then, forward, sources a beam from the
+ *        emitter; backward, from sensor element `path` modulo the film's
+ *        elements. `rnd` is the path's generator; `skip` the splats an
  *        earlier, overflowed, attempt at this path made.
  */
-WT_GPU_FN path_state start_path(const WT_GPU_THREAD plt_scene& scene, rng rnd, u64 path, u32 skip) {
+WT_GPU_FN path_state start_path(const WT_GPU_THREAD plt_scene& scene, rng rnd, u64 path, u32 skip,
+                                u32 table, u32 spectral) {
     path_state p;
+    const u32 ei = sample_emitter(scene, rnd.r());
+    p.spectral = spectral!=choose_spectral ? spectral :
+        table + ei*scene.samples_per_emitter + spectral_sample_for_path(path, scene.samples_per_emitter);
+
     if (scene.params.backward!=0) {
+        const spectral_sample spec = scene.spectra[p.spectral];
         const u32 element = u32(path % (u64(scene.film.width)*scene.film.height));
         p.ex = element % scene.film.width;
         p.ey = element / scene.film.width;
-        sample_sensor(scene.sensor, p.ex, p.ey, rnd, p.b, p.offset);
+        sample_sensor(scene.sensor, spec, p.ex, p.ey, rnd, p.b, p.offset);
         p.prev_geo = { p.b.origin(), geo_point, 0 };
         p.L = 0;
         p.flux = 0;
     } else {
-        // sample an emitter (the wavenumber is fixed)
-        const real ue = rnd.r();
-        u32 ei = 0;
-        while (ei+1<scene.emitter_count && !(ue<scene.emitter_cdf[ei]))
-            ++ei;
-        const point_emitter em = scene.emitters[ei];
+        const point_emitter em = scene.emitters[p.spectral*scene.emitter_count + ei];
 
         // source a beam (point_t::sample)
         p.b.envelope = make_isotropic_cone(make_ray(em.position, uniform_sphere(rnd.r2())), em.tan_alpha, em.x0);
@@ -801,26 +833,24 @@ template <typename Film>
 WT_GPU_FN void end_path(const WT_GPU_THREAD plt_scene& scene, WT_GPU_THREAD Film& film,
                         WT_GPU_THREAD path_state& p) {
     if (scene.params.backward!=0 && p.splats++>=p.skip)
-        splat_weighted(scene.film, film, p.ex, p.ey, p.offset, p.L);
+        splat_weighted(scene.film, scene.spectra[p.spectral].response, film, p.ex, p.ey, p.offset, p.L);
 }
 
 /**
  * @brief `nee_backward`: next-event estimation from the surface `s` of a
- *        non-delta material: connects to a sampled emitter, and returns the
- *        radiant flux the beam `b` observes through the connection. (Point
- *        emitters are sampled discretely: no MIS.)
+ *        non-delta material: connects to a sampled emitter (at spectral
+ *        sample `spectral`), and returns the radiant flux the beam `b`
+ *        observes through the connection. (Point emitters are sampled
+ *        discretely: no MIS.)
  */
 template <typename Geometry>
 WT_GPU_FN real nee_backward(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_THREAD Geometry& geometry,
-                            const WT_GPU_THREAD beam& b, const WT_GPU_THREAD surface& s,
+                            u32 spectral, const WT_GPU_THREAD beam& b, const WT_GPU_THREAD surface& s,
                             const WT_GPU_THREAD material& m, WT_GPU_THREAD rng& rnd,
                             WT_GPU_THREAD u32& status) {
     // scene_t::sample_emitter_direct
-    const real ue = rnd.r();
-    u32 ei = 0;
-    while (ei+1<scene.emitter_count && !(ue<scene.emitter_cdf[ei]))
-        ++ei;
-    const point_emitter em = scene.emitters[ei];
+    const u32 ei = sample_emitter(scene, rnd.r());
+    const point_emitter em = scene.emitters[spectral*scene.emitter_count + ei];
 
     // point_t::sample_direct: the emitted beam, divided by the emitter's sampling probability
     const vec3 dl = s.wp - em.position;
@@ -878,7 +908,7 @@ WT_GPU_FN bool trace_step(const WT_GPU_THREAD plt_scene& scene,
     const WT_GPU_THREAD beam& b = p.b;
     cone envelope = b.envelope;
     envelope.r.o = offseted_ray_origin(scene, p.prev_geo, envelope.r);
-    tr = traverse(geometry, envelope, two_pi/opts.k, ray_trace, scratch, status);
+    tr = traverse(geometry, envelope, two_pi/scene.spectra[p.spectral].k, ray_trace, scratch, status);
     if ((status & status_scratch_overflow) || !tr.hit)
         return false;
 
@@ -916,7 +946,8 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
     const plt_path_params opts = scene.params;
     const bool ray_trace = opts.ray_tracing_only!=0;
     const bool backward = opts.backward!=0;
-    const real k = opts.k;
+    const spectral_sample spec = scene.spectra[p.spectral];
+    const real k = spec.k;
 
     ++p.iteration;
 
@@ -933,7 +964,7 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
 
     if (p.fsd!=0) {
         const cone prev_cone = p.prev_beam.envelope;
-        const real f = do_fsd(scene, geometry, prev_cone, p.prev_geo, interaction_wp,
+        const real f = do_fsd(scene, geometry, k, prev_cone, p.prev_geo, interaction_wp,
                               scratch.aperture, p.aperture_size, status).intensity();
         p.fsd = 0;
 
@@ -966,7 +997,7 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
     if (has_surface) {
         const bvh_tri tri = scene.bvh.tris[primary.tri];
         const tri_shading sh = scene.tris[primary.tri];
-        mat = scene.materials[sh.material];
+        mat = scene.materials[p.spectral*scene.material_count + sh.material];
         s.tri = primary.tri;
         s.wp = origin_wp + primary.dist*b.dir();
         s.geo = build_shading_frame(tri.n, sh.dpdu);
@@ -999,17 +1030,18 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
 
     if (backward) {
         if (p.depth<opts.max_depth && has_surface && !is_delta(mat))
-            p.L += nee_backward(scene, geometry, b, s, mat, rnd, status);
+            p.L += nee_backward(scene, geometry, p.spectral, b, s, mat, rnd, status);
     } else if (p.depth<opts.max_depth && p.fsd!=0) {
         const sensor_direct_t sd = sensor_sample_direct(scene.sensor, interaction_wp, rnd);
         if (sd.importance>real(0)) {
-            const real f = do_fsd(scene, geometry, b.envelope, p.prev_geo, sd.p,
+            const real f = do_fsd(scene, geometry, k, b.envelope, p.prev_geo, sd.p,
                                   scratch.aperture, p.aperture_size, status).intensity();
             if (f!=real(0)) {
                 beam fsd_beam = b;
                 fsd_beam.transform_region_interaction(interaction_wp, dist_to_interaction, -sd.wd, f);
                 if (fsd_beam.S.s0>real(0))
-                    p.splat(scene.film, film, sd.ex, sd.ey, sd.offset, sd.importance * fsd_beam.S.s0 * p.flux);
+                    p.splat(scene.film, spec.response, film, sd.ex, sd.ey, sd.offset,
+                            sd.importance * fsd_beam.S.s0 * p.flux);
             }
         }
     }
@@ -1022,7 +1054,7 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
                                   max(real(0), dot(b.dir(), origin_wp - b.origin()));
         const sensor_hit_t sensed = virtual_plane_hit(scene.sensor, b, range{ 0, max_distance });
         if (sensed.hit && b.S.s0>real(0))
-            p.splat(scene.film, film, sensed.ex, sensed.ey, sensed.offset,
+            p.splat(scene.film, spec.response, film, sensed.ex, sensed.ey, sensed.offset,
                     b.S.s0 * p.flux * scene.sensor.importance);
     }
 

@@ -17,8 +17,10 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 #include <wt/gpu/backend.hpp>
 #include <wt/gpu/kernel/plt_path.hpp>
@@ -117,16 +119,22 @@ struct cuda_film_t {
     }
 };
 
-/** @brief A path to (re-)trace, skipping the splats an earlier attempt made. */
+/**
+ * @brief A path to (re-)trace, skipping the splats an earlier attempt made,
+ *        with its spectral sample (or `k::choose_spectral`, for a new path).
+ */
 struct path_entry_t {
     std::uint64_t path;
     std::uint32_t skip;
     std::uint32_t seed;
+    std::uint32_t spectral;
 };
 
 /**
  * @brief Paths in flight, each in a slot: its state and its scratch memory.
- *        Unused slots are on a stack, `free_slots`.
+ *        Unused slots are on a stack, `free_slots`. `table_paths` (if not
+ *        null) counts the paths in flight of each spectral table, of
+ *        `table_size` samples.
  */
 struct path_pool_t {
     k::path_state* paths;
@@ -137,6 +145,19 @@ struct path_pool_t {
     k::u32* edges;
     k::aperture_entry* aperture;
     k::u32 tri_capacity, edge_capacity;
+    k::u32* table_paths;
+    k::u32 table_size;
+
+    /** @brief `count` paths start with spectral table `table` (the first thread of a launch counts them). */
+    __device__ void paths_started(k::u32 table, k::u32 count) const {
+        if (table_paths && blockIdx.x==0 && threadIdx.x==0)
+            atomicAdd(table_paths + table/table_size, count);
+    }
+    /** @brief A path with spectral sample `spectral` ended. */
+    __device__ void path_ended(k::u32 spectral) const {
+        if (table_paths)
+            atomicSub(table_paths + spectral/table_size, 1u);
+    }
 
     __device__ k::path_scratch scratch(k::u32 slot) const {
         return {
@@ -186,21 +207,28 @@ __global__ void fill_free_slots_kernel(k::u32* free_slots, k::u32 count) {
     if (i<count) free_slots[i] = i;
 }
 
+/** @brief Path `base+i` with `seed` and spectral table `table`, or `list[base+i]` if `list` is given. */
+__device__ k::path_state start_path(const k::plt_scene& scene, std::uint64_t base, k::u32 i,
+                                    const path_entry_t* list, std::uint32_t seed, k::u32 table) {
+    const path_entry_t e = list ? list[base+i] : path_entry_t{ base+i, 0, seed, k::choose_spectral };
+    const auto rnd = k::rng::for_path(e.seed, k::u32(e.path), k::u32(e.path>>32));
+    return k::start_path(scene, rnd, e.path, e.skip, table, e.spectral);
+}
+
 /**
- * @brief Starts `count` paths: `base+i` with `seed`, or `list[base+i]` if
- *        `list` is given. They take the slots on top of the free stack
- *        (`free_top` slots) and are queued after the `queued` paths of `queue`.
+ * @brief Starts `count` paths (see `start_path`). They take the slots on top
+ *        of the free stack (`free_top` slots) and are queued after the
+ *        `queued` paths of `queue`.
  */
 __global__ void start_paths_kernel(k::plt_scene scene, std::uint64_t base, k::u32 count,
-                                   const path_entry_t* list, std::uint32_t seed, path_pool_t pool,
+                                   const path_entry_t* list, std::uint32_t seed, k::u32 table, path_pool_t pool,
                                    k::u32 free_top, k::u32* queue, k::u32 queued) {
     const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i>=count) return;
 
-    const path_entry_t e = list ? list[base+i] : path_entry_t{ base+i, 0, seed };
+    pool.paths_started(table, count);
     const k::u32 slot = pool.free_slots[free_top-1-i];
-    const auto rnd = k::rng::for_path(e.seed, k::u32(e.path), k::u32(e.path>>32));
-    store_vectors(pool.paths+slot, k::start_path(scene, rnd, e.path, e.skip));
+    store_vectors(pool.paths+slot, start_path(scene, base, i, list, seed, table));
     queue[queued+i] = slot;
 }
 
@@ -208,16 +236,17 @@ __global__ void start_paths_kernel(k::plt_scene scene, std::uint64_t base, k::u3
  * @brief Ends a path, or lists it in `overflow` if it outgrew its scratch
  *        memory (to be re-traced; `end_path` would splat what it has not finished).
  */
-__device__ void end_path(const k::plt_scene& scene, cuda_film_t& film, k::path_state& p, k::u32& s,
-                         step_counters_t* counters, path_entry_t* overflow) {
+__device__ void end_path(const k::plt_scene& scene, cuda_film_t& film, const path_pool_t& pool, k::path_state& p,
+                         k::u32& s, step_counters_t* counters, path_entry_t* overflow) {
     if (s & k::status_scratch_overflow) {
         // the path's generator says which path it is
         const std::uint64_t path = p.rnd.path_lo | std::uint64_t(p.rnd.path_hi)<<32;
-        overflow[atomicAdd(&counters->overflowed, 1u)] = { path, p.splats, p.rnd.seed };
+        overflow[atomicAdd(&counters->overflowed, 1u)] = { path, p.splats, p.rnd.seed, p.spectral };
         s &= ~k::status_scratch_overflow;
     } else {
         k::end_path(scene, film, p);
     }
+    pool.path_ended(p.spectral);
 }
 
 /**
@@ -234,7 +263,7 @@ __device__ void finish_step(const k::plt_scene& scene, cuda_film_t& film, const 
         store_vectors(pool.paths+slot, p);
         next_queue[atomicAdd(&counters->queued, 1u)] = slot;
     } else {
-        end_path(scene, film, p, s, counters, overflow);
+        end_path(scene, film, pool, p, s, counters, overflow);
         pool.free_slots[free_top + atomicAdd(&counters->freed, 1u)] = slot;
     }
     if (s!=k::status_ok)
@@ -309,27 +338,27 @@ __global__ void __launch_bounds__(block_size, 4) step_paths_kernel(k::plt_scene 
 }
 
 /**
- * @brief Traces `count` whole paths, `base+i` with `seed` or `list[base+i]`,
- *        one per thread, path `i` with the scratch memory of slot `i`. For
- *        ray tracing, whose steps are cheap: moving path states between
- *        launches would take longer than the steps.
+ * @brief Traces `count` whole paths (see `start_path`), one per thread, path
+ *        `i` with the scratch memory of slot `i`. For ray tracing, whose steps
+ *        are cheap: moving path states between launches would take longer
+ *        than the steps.
  */
 __global__ void __launch_bounds__(block_size, 3) run_paths_kernel(k::plt_scene scene, path_pool_t pool,
                                         std::uint64_t base, k::u32 count, const path_entry_t* list,
-                                        std::uint32_t seed, cuda_film_t film, step_counters_t* counters,
-                                        path_entry_t* overflow, std::uint32_t* status) {
+                                        std::uint32_t seed, k::u32 table, cuda_film_t film,
+                                        step_counters_t* counters, path_entry_t* overflow,
+                                        std::uint32_t* status) {
     const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i>=count) return;
 
-    const path_entry_t e = list ? list[base+i] : path_entry_t{ base+i, 0, seed };
-    k::path_state p = k::start_path(scene, k::rng::for_path(e.seed, k::u32(e.path), k::u32(e.path>>32)),
-                                    e.path, e.skip);
+    pool.paths_started(table, count);
+    k::path_state p = start_path(scene, base, i, list, seed, table);
     const cuda_bvh_geometry_t geometry = { scene.bvh };
 
     k::u32 s = k::status_ok;
     while (k::step_path(scene, geometry, film, pool.scratch(i), p, s)) {}
 
-    end_path(scene, film, p, s, counters, overflow);
+    end_path(scene, film, pool, p, s, counters, overflow);
     if (s!=k::status_ok)
         atomicOr(status, s);
 }
@@ -346,13 +375,12 @@ __global__ void __launch_bounds__(block_size, 3) run_paths_kernel(k::plt_scene s
 class cuda_plt_path_renderer_t final : public backend_renderer_t {
 public:
     cuda_plt_path_renderer_t(int ordinal, k::bvh_view bvh, const plt_path_scene_t& scene)
-        : ordinal(ordinal)
+        : ordinal(ordinal),
+          table_size(scene.emitter_count*scene.samples_per_emitter)
     {
         set_device(ordinal);
         tris.upload(scene.tris.data(), scene.tris.size());
         edges.upload(scene.edges.data(), scene.edges.size());
-        materials.upload(scene.materials.data(), scene.materials.size());
-        emitters.upload(scene.emitters.data(), scene.emitters.size());
         emitter_cdf.upload(scene.emitter_cdf.data(), scene.emitter_cdf.size());
 
         film_size = std::size_t(scene.film.width) * scene.film.height * scene.film.components;
@@ -365,25 +393,42 @@ public:
         const std::uint32_t zero = 0;
         status_word.upload(&zero, 1);
         counters.resize(1);
+        const std::uint32_t no_paths[tables] = {};
+        table_paths.upload(no_paths, tables);
 
         params.bvh = bvh;
         params.tris = tris.get();
         params.edges = edges.get();
-        params.materials = materials.get();
-        params.emitters = emitters.get();
         params.emitter_cdf = emitter_cdf.get();
-        params.emitter_count = k::u32(scene.emitters.size());
+        params.emitter_count = scene.emitter_count;
+        params.material_count = scene.material_count;
+        params.samples_per_emitter = scene.samples_per_emitter;
         params.sensor = scene.sensor;
         params.film = scene.film;
         params.params = scene.params;
+        reserve_spectra(std::size_t(tables)*table_size);
     }
 
-    std::uint32_t trace(std::uint64_t first, std::uint64_t count, std::uint32_t seed) override {
+    std::uint32_t trace(std::uint64_t first, std::uint64_t count, std::uint32_t seed,
+                        const spectral_table_t& spectra) override {
         set_device(ordinal);
+        if (spectra.samples.size()!=table_size ||
+            spectra.emitters.size()!=std::size_t(table_size)*params.emitter_count ||
+            spectra.materials.size()!=std::size_t(table_size)*params.material_count)
+            throw std::logic_error("the spectral table does not match the compiled scene");
         if (main.slots==0)
             begin(main, pool_size, initial_capacity);
+
+        // the next table slot, once the paths of the table it holds have ended
+        const k::u32 slot = next_table;
+        next_table = (next_table+1) % tables;
+        drain_table(slot);
+        const k::u32 base = slot*table_size;
+        upload_spectra(base, spectra);
+        loaded[slot] = { base, table_size, ++generation, spectra };
+
         path_source_t source = { first, count, nullptr };
-        advance(main, source, seed, pool_size/2);
+        advance(main, source, seed, base, pool_size/2);
         return read_status();
     }
 
@@ -391,10 +436,11 @@ public:
         set_device(ordinal);
         if (main.slots>0) {
             path_source_t none = { 0, 0, nullptr };
-            advance(main, none, 0, 0);
+            advance(main, none, 0, 0, 0);
         }
 
-        // paths that outgrew their scratch memory are re-traced with more room
+        // paths that outgrew their scratch memory are re-traced with more room, with the spectral samples
+        // they had (kept in `retained`: the tables they came from may have been replaced since)
         k::u32 capacity = initial_capacity;
         std::vector<path_entry_t> pending;
         while (!overflowed.empty()) {
@@ -405,15 +451,26 @@ public:
             std::swap(pending, overflowed);
             overflowed.clear();
 
+            // the retained samples are the retries' table (no paths of the main pool are in flight)
+            const auto count = k::u32(retained.samples.size());
+            reserve_spectra(count);
+            upload_spectra(0, retained);
+            loaded.fill({});
+            loaded[0] = { 0, count, ++generation, std::move(retained) };
+            retained = {};
+            retained_index.clear();
+
             // as many paths in flight as fit the scratch memory of the main pool
             wavefront_t retry;
             begin(retry, k::u32(std::max<std::size_t>(1, std::size_t(pool_size)*initial_capacity/capacity)), capacity);
             path_list.upload(pending.data(), pending.size());
             path_source_t source = { 0, pending.size(), path_list.get() };
-            advance(retry, source, 0, 0);
+            advance(retry, source, 0, 0, 0, /* count table paths */ false);
         }
-        // the retries reuse the main pool's memory: start it anew
+        // the retries reuse the main pool's memory and spectral tables: start them anew
         main = {};
+        loaded.fill({});
+        next_table = 0;
 
         return read_status();
     }
@@ -436,6 +493,11 @@ private:
     static constexpr k::u32 max_capacity = 1u<<20;
     /** @brief Paths in flight few enough to finish in one launch, rather than a launch per step. */
     static constexpr k::u32 tail_size = 1024;
+    /**
+     * @brief Spectral tables on the device: paths of the last few `trace`s
+     *        may still be in flight, each with a sample of its pass's table.
+     */
+    static constexpr k::u32 tables = 4;
 
     /** @brief A pool of paths in flight. */
     struct wavefront_t {
@@ -451,6 +513,13 @@ private:
         std::uint64_t first, count;
         const path_entry_t* list;
         std::uint64_t started = 0;
+    };
+
+    /** @brief A spectral table on the device: samples `base .. base+count-1`, and a copy of it. */
+    struct loaded_table_t {
+        k::u32 base = 0, count = 0;
+        std::uint64_t generation = 0;
+        spectral_table_t table;
     };
 
     /** @brief Starts an empty pool of `slots` paths with `capacity` scratch triangles and edges each. */
@@ -471,11 +540,12 @@ private:
         wf = { slots, capacity, 0, slots, 0 };
     }
 
-    [[nodiscard]] path_pool_t pool(const wavefront_t& wf) const noexcept {
+    [[nodiscard]] path_pool_t pool(const wavefront_t& wf, bool count_table_paths) const noexcept {
         return {
             paths.get(), traversals.get(), trace_results.get(), free_slots.get(),
             scratch_tris.get(), scratch_edges.get(), scratch_aperture.get(),
             wf.capacity, wf.capacity,
+            count_table_paths ? table_paths.get() : nullptr, table_size,
         };
     }
 
@@ -483,13 +553,44 @@ private:
         return { film.get(), film_weights.get() };
     }
 
+    /** @brief Room for `count` spectral samples on the device. Moves them: only when no paths are in flight. */
+    void reserve_spectra(std::size_t count) {
+        spectra.resize(count);
+        sample_emitters.resize(count*params.emitter_count);
+        sample_materials.resize(count*params.material_count);
+        params.spectra = spectra.get();
+        params.emitters = sample_emitters.get();
+        params.materials = sample_materials.get();
+    }
+
+    void upload_spectra(k::u32 base, const spectral_table_t& table) {
+        spectra.upload_at(base, table.samples.data(), table.samples.size());
+        sample_emitters.upload_at(std::size_t(base)*params.emitter_count, table.emitters.data(), table.emitters.size());
+        sample_materials.upload_at(std::size_t(base)*params.material_count, table.materials.data(), table.materials.size());
+    }
+
+    /** @brief Steps the main pool until no paths of table `slot` remain in flight (rarely needed). */
+    void drain_table(k::u32 slot) {
+        for (;;) {
+            std::uint32_t counts[tables];
+            table_paths.download(counts, tables);
+            if (counts[slot]==0)
+                return;
+            if (main.queued==0)
+                throw std::logic_error("a spectral table counts paths in flight, but none are");
+            step(main, this->pool(main, true), /* all started */ true);
+        }
+    }
+
     /**
-     * @brief Starts `source`'s paths (with `seed`) and steps the paths in
-     *        flight, until all started and at most `keep` remain in flight.
-     *        Paths that overflow their scratch memory go to `overflowed`.
+     * @brief Starts `source`'s paths (with `seed` and the table at `table`)
+     *        and steps the paths in flight, until all started and at most
+     *        `keep` remain in flight. Paths that overflow their scratch memory
+     *        go to `overflowed`.
      */
-    void advance(wavefront_t& wf, path_source_t& source, std::uint32_t seed, k::u32 keep) {
-        const path_pool_t pool = this->pool(wf);
+    void advance(wavefront_t& wf, path_source_t& source, std::uint32_t seed, k::u32 table, k::u32 keep,
+                 bool count_table_paths = true) {
+        const path_pool_t pool = this->pool(wf, count_table_paths);
         if (params.params.ray_tracing_only!=0) {
             // whole paths, a pool's worth per launch (nothing remains in flight)
             while (source.started<source.count) {
@@ -497,7 +598,7 @@ private:
                 check(cudaMemset(counters.get(), 0, sizeof(step_counters_t)), "clearing the step counters");
                 run_paths_kernel<<<grid_size(n), block_size>>>(
                         params, pool, source.list ? source.started : source.first+source.started, n, source.list,
-                        seed, film_view(), counters.get(), overflow.get(), status_word.get());
+                        seed, table, film_view(), counters.get(), overflow.get(), status_word.get());
                 check(cudaGetLastError(), "launching the path kernel");
                 source.started += n;
                 collect_overflowed();
@@ -511,7 +612,7 @@ private:
             if (n>0) {
                 start_paths_kernel<<<grid_size(n), block_size>>>(
                         params, source.list ? source.started : source.first+source.started, n, source.list,
-                        seed, pool, wf.free_top, queues[wf.q].get(), wf.queued);
+                        seed, table, pool, wf.free_top, queues[wf.q].get(), wf.queued);
                 check(cudaGetLastError(), "launching the path start kernel");
                 source.started += n;
                 wf.queued += n;
@@ -520,32 +621,39 @@ private:
             const bool all_started = source.started==source.count;
             if (wf.queued==0 || (all_started && wf.queued<=keep))
                 return;
-
-            check(cudaMemset(counters.get(), 0, sizeof(step_counters_t)), "clearing the step counters");
-            const auto* queue = queues[wf.q].get();
-            auto* next_queue = queues[1-wf.q].get();
-            if (all_started && wf.queued<=tail_size) {
-                step_paths_kernel<<<grid_size(wf.queued), block_size>>>(
-                        params, pool, queue, wf.queued, k::max_path_iterations+1, film_view(),
-                        next_queue, wf.free_top, counters.get(), overflow.get(), status_word.get());
-                check(cudaGetLastError(), "launching the path step kernel");
-            } else {
-                trace_paths_kernel<<<grid_size(wf.queued), block_size>>>(params, pool, queue, wf.queued);
-                check(cudaGetLastError(), "launching the path tracing kernel");
-                interact_paths_kernel<<<grid_size(wf.queued), block_size>>>(
-                        params, pool, queue, wf.queued, film_view(),
-                        next_queue, wf.free_top, counters.get(), overflow.get(), status_word.get());
-                check(cudaGetLastError(), "launching the path interaction kernel");
-            }
-
-            const step_counters_t c = collect_overflowed();
-            wf.queued = c.queued;
-            wf.free_top += c.freed;
-            wf.q = 1-wf.q;
+            step(wf, pool, all_started);
         }
     }
 
-    /** @brief The last launch's counters; appends the paths that overflowed to `overflowed`. */
+    /** @brief Advances the paths in flight a step (or, the last few, to their ends). */
+    void step(wavefront_t& wf, const path_pool_t& pool, bool all_started) {
+        check(cudaMemset(counters.get(), 0, sizeof(step_counters_t)), "clearing the step counters");
+        const auto* queue = queues[wf.q].get();
+        auto* next_queue = queues[1-wf.q].get();
+        if (all_started && wf.queued<=tail_size) {
+            step_paths_kernel<<<grid_size(wf.queued), block_size>>>(
+                    params, pool, queue, wf.queued, k::max_path_iterations+1, film_view(),
+                    next_queue, wf.free_top, counters.get(), overflow.get(), status_word.get());
+            check(cudaGetLastError(), "launching the path step kernel");
+        } else {
+            trace_paths_kernel<<<grid_size(wf.queued), block_size>>>(params, pool, queue, wf.queued);
+            check(cudaGetLastError(), "launching the path tracing kernel");
+            interact_paths_kernel<<<grid_size(wf.queued), block_size>>>(
+                    params, pool, queue, wf.queued, film_view(),
+                    next_queue, wf.free_top, counters.get(), overflow.get(), status_word.get());
+            check(cudaGetLastError(), "launching the path interaction kernel");
+        }
+
+        const step_counters_t c = collect_overflowed();
+        wf.queued = c.queued;
+        wf.free_top += c.freed;
+        wf.q = 1-wf.q;
+    }
+
+    /**
+     * @brief The last launch's counters; appends the paths that overflowed to
+     *        `overflowed`, with their spectral samples copied to `retained`.
+     */
     step_counters_t collect_overflowed() {
         step_counters_t c;
         counters.download(&c, 1);
@@ -553,8 +661,33 @@ private:
             const auto offset = overflowed.size();
             overflowed.resize(offset+c.overflowed);
             overflow.download(overflowed.data()+offset, c.overflowed);
+            for (auto i=offset; i<overflowed.size(); ++i)
+                overflowed[i].spectral = retain(overflowed[i].spectral);
         }
         return c;
+    }
+
+    /** @brief Copies device spectral sample `spectral` to `retained` (once); returns its index there. */
+    k::u32 retain(k::u32 spectral) {
+        for (const auto& t : loaded) {
+            if (t.count==0 || spectral<t.base || spectral>=t.base+t.count)
+                continue;
+            const auto i = spectral - t.base;
+            const auto [it, inserted] = retained_index.try_emplace(t.generation<<32 | i,
+                                                                   k::u32(retained.samples.size()));
+            if (inserted) {
+                const auto E = params.emitter_count, M = params.material_count;
+                retained.samples.push_back(t.table.samples[i]);
+                retained.emitters.insert(retained.emitters.end(),
+                                         t.table.emitters.begin() + std::size_t(i)*E,
+                                         t.table.emitters.begin() + std::size_t(i+1)*E);
+                retained.materials.insert(retained.materials.end(),
+                                          t.table.materials.begin() + std::size_t(i)*M,
+                                          t.table.materials.begin() + std::size_t(i+1)*M);
+            }
+            return it->second;
+        }
+        throw std::logic_error("a path's spectral sample is in no loaded table");
     }
 
     [[nodiscard]] std::uint32_t read_status() const {
@@ -568,13 +701,21 @@ private:
 
     device_buffer_t<k::tri_shading>   tris;
     device_buffer_t<k::edge>          edges;
-    device_buffer_t<k::material>      materials;
-    device_buffer_t<k::point_emitter> emitters;
     device_buffer_t<k::real>          emitter_cdf;
     device_buffer_t<double>           film;
     device_buffer_t<double>           film_weights;     // backward transport
     std::size_t film_size = 0;
     device_buffer_t<std::uint32_t>    status_word;
+
+    // spectral tables: `tables` of `table_size` samples, for the main pool (or one for re-traced paths)
+    k::u32 table_size;
+    device_buffer_t<k::spectral_sample> spectra;
+    device_buffer_t<k::point_emitter>   sample_emitters;
+    device_buffer_t<k::material>        sample_materials;
+    device_buffer_t<k::u32>             table_paths;      // paths in flight of each table
+    std::array<loaded_table_t, tables>  loaded;
+    k::u32 next_table = 0;
+    std::uint64_t generation = 0;
 
     // the path pool (`main`, or a pool re-tracing overflowed paths)
     wavefront_t main;
@@ -591,6 +732,9 @@ private:
     device_buffer_t<path_entry_t>      path_list;
     /** @brief Paths that outgrew their scratch memory, to re-trace with more. */
     std::vector<path_entry_t>          overflowed;
+    /** @brief Their spectral samples, indexed by `path_entry_t::spectral`; by (table generation, sample). */
+    spectral_table_t                   retained;
+    std::unordered_map<std::uint64_t, k::u32> retained_index;
 };
 
 

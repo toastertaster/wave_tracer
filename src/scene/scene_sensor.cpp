@@ -40,7 +40,16 @@ emitter_wavenumber_sample_t scene_sensor_t::sample_emitter_and_spectrum(
     const auto ep = pdf_emitter(parent, emitter);
     assert(ep>zero);
 
-    // sample wavenumber
+    return {
+        .emitter = emitter,
+        .emitter_pdf = ep,
+        .wavenumber = sample_spectrum(emitter, sampler),
+    };
+}
+
+wavenumber_sample_t scene_sensor_t::sample_spectrum(
+        const emitter::emitter_t* emitter,
+        sampler::sampler_t& sampler) const noexcept {
     const auto wavenumber_sample = emitter_sampler.sample_wavenumber(sampler, emitter);
     const auto k = wavenumber_sample.x / u::mm;
 
@@ -49,11 +58,7 @@ emitter_wavenumber_sample_t scene_sensor_t::sample_emitter_and_spectrum(
         wavenumber_sampling_pd_t{ wavenumber_sample.pdf * u::mm };
 
     return {
-        .emitter = emitter,
-        .emitter_pdf = ep,
-        .wavenumber = {
-            .k = k,
-            .wpd = wpd,
-        },
+        .k = k,
+        .wpd = wpd,
     };
 }

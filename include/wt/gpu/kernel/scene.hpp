@@ -15,11 +15,14 @@
 /*
  * Scene data for GPU rendering.
  *
- * The host compiles a wave_tracer scene into these plain structs for one
- * rendered wavenumber (src/gpu/renderer.cpp): spectra, BSDFs, emitters and the
- * sensor are evaluated at that wavenumber, and anything the GPU does not
- * implement is rejected there with an explanation. All lengths are in metres,
- * radiometric quantities in SI units.
+ * The host compiles a wave_tracer scene into these plain structs
+ * (src/gpu/renderer.cpp), and rejects anything the GPU does not implement
+ * with an explanation. The GPU evaluates no spectra: the host draws
+ * wavenumbers, as the CPU draws them for its paths, and evaluates everything
+ * that depends on the wavenumber (emitters, BSDFs, the sensor's beams and
+ * response) at each, into a `spectral_sample` and per-sample arrays of
+ * emitters and materials. Each path takes one spectral sample. All lengths are
+ * in metres, radiometric quantities in SI units.
  */
 
 namespace wt::gpu::kernel {
@@ -47,7 +50,7 @@ struct edge {
     u32 tri1, tri2; // BVH triangles; tri2 is no_triangle for an edge of one triangle
 };
 
-/** @brief No BSDF at the rendered wavenumber: paths end here (`composite_t` without a matching bin). */
+/** @brief No BSDF at the spectral sample's wavenumber: paths end here (`composite_t` without a matching bin). */
 constexpr u32 material_absorbing = 0;
 /** @brief `surface_spm_t` with a Dirac surface profile: specular reflection and refraction. */
 constexpr u32 material_specular = 1;
@@ -67,7 +70,7 @@ struct material {
     real reflectance;           // `diffuse_t`'s reflectance, clamped to [0,1]
 };
 
-/** @brief An `emitter::point_t`. */
+/** @brief An `emitter::point_t`, at a spectral sample's wavenumber. */
 struct point_emitter {
     vec3 position;
     // sourced beams: isotropic cones (`point_t::sourcing_geometry`)
@@ -94,12 +97,10 @@ constexpr u32 sensor_perspective = 1;
 /**
  * @brief A `sensor::virtual_plane_sensor_t` (`type` sensor_virtual_plane), or
  *        a `sensor::perspective_t` (sensor_perspective; backward transport only).
+ *        The beams it sources depend on the wavenumber: see `spectral_sample`.
  */
 struct sensor_desc {
     u32 type;
-    // beams the sensor sources (backward transport): isotropic cones (`sourcing_geometry`)
-    real tan_alpha;
-    real x0;
 
     // virtual plane
     vec3 origin;                // corner of element (0,0)
@@ -122,13 +123,33 @@ struct sensor_desc {
 /** @brief Largest supported film reconstruction filter radius, in elements. */
 constexpr i32 max_rf_radius = 8;
 
-/** @brief A `sensor::film_t` (2D, scalar). Elements are accumulated by the backend. */
+/**
+ * @brief A `sensor::film_t` (2D, scalar). Elements are accumulated by the
+ *        backend. The sensor's response depends on the wavenumber: see
+ *        `spectral_sample`.
+ */
 struct film_desc {
     u32 width, height;
     u32 components;
     i32 rf_radius;              // Gaussian reconstruction filter radius, in elements
     real rf_sigma;              // ... and standard deviation
-    real response[4];           // sensor response of each component at the rendered wavenumber
+};
+
+/** @brief The sensor's response of each film component (`response_t::f`) at a wavenumber. */
+struct film_response {
+    real c[4];
+};
+
+/**
+ * @brief A wavenumber drawn for paths of an emitter (`scene_t::sample_spectrum`),
+ *        and what depends on it, other than emitters and materials.
+ */
+struct spectral_sample {
+    real k;                     // wavenumber (1/m)
+    // beams the sensor sources (backward transport): isotropic cones (`sourcing_geometry`)
+    real sensor_tan_alpha;
+    real sensor_x0;
+    film_response response;
 };
 
 /** @brief `integrator::plt_path_t::options_t`, and how the scene is rendered. */
@@ -138,19 +159,29 @@ struct plt_path_params {
     u32 fsd;
     u32 ray_tracing_only;       // `sensor_t::ray_trace_only()`
     u32 backward;               // transport direction: paths start at the sensor
-    real k;                     // rendered wavenumber (1/m)
 };
 
-/** @brief Everything a plt_path kernel reads. */
+/**
+ * @brief Everything a plt_path kernel reads.
+ *
+ * Spectral samples come in tables: a table holds `samples_per_emitter`
+ * samples of each emitter, emitter `e`'s from `base + e*samples_per_emitter`
+ * (`base` the table's first). A path samples an emitter, then takes one of
+ * the emitter's samples (see `start_path`).
+ */
 struct plt_scene {
     bvh_view bvh;
     const WT_GPU_GLOBAL tri_shading* tris;
     const WT_GPU_GLOBAL edge* edges;
-    const WT_GPU_GLOBAL material* materials;
 
-    const WT_GPU_GLOBAL point_emitter* emitters;
-    const WT_GPU_GLOBAL real* emitter_cdf;     // inclusive CDF of the emitter sampling distribution
+    const WT_GPU_GLOBAL spectral_sample* spectra;
+    const WT_GPU_GLOBAL point_emitter* emitters;    // emitter e at spectral sample s: [s*emitter_count + e]
+    const WT_GPU_GLOBAL material* materials;        // material m at spectral sample s: [s*material_count + m]
     u32 emitter_count;
+    u32 material_count;
+    u32 samples_per_emitter;
+
+    const WT_GPU_GLOBAL real* emitter_cdf;     // inclusive CDF of the emitter sampling distribution
 
     sensor_desc sensor;
     film_desc film;

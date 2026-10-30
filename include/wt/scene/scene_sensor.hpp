@@ -110,6 +110,13 @@ private:
             sampler::sampler_t& sampler) const noexcept;
 
     /**
+     * @brief Samples a wavenumber from an emitter's spectrum (integrated over the sensor's spectrum).
+     */
+    [[nodiscard]] wavenumber_sample_t sample_spectrum(
+            const emitter::emitter_t* emitter,
+            sampler::sampler_t& sampler) const noexcept;
+
+    /**
      * @brief Computes the spectral probability density for the given wavenumber ``k`` summed over all scene emitters: 
      */
     [[nodiscard]] inline wavenumber_density_t sum_spectral_pdf_for_all_emitters(

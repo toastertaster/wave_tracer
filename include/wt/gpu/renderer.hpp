@@ -18,9 +18,9 @@
  * silently rendering on the CPU. Supported so far:
  *   - the plt_path integrator, forward and backward transport (beams,
  *     free-space diffraction, or ray tracing);
- *   - sensors sensitive to a single wavelength: virtual_plane (coverage)
- *     sensors, and, with backward transport, non-polarimetric perspective
- *     sensors;
+ *   - virtual_plane (coverage) sensors, and, with backward transport,
+ *     non-polarimetric perspective sensors, of any (scalar) response:
+ *     paths draw wavenumbers as the CPU's do (see `spectral_tables_t`);
  *   - point emitters;
  *   - surface_spm BSDFs with a Dirac surface profile (specular), and diffuse
  *     BSDFs with a constant reflectance, optionally wrapped in twosided,
@@ -48,6 +48,7 @@ class film_storage_handle_t;
 namespace wt::gpu {
 
 class backend_renderer_t;
+class spectral_tables_t;
 
 /** @brief Renders one sensor of a scene on a GPU. Not thread safe. */
 class renderer_t {
@@ -95,6 +96,7 @@ public:
 private:
     std::unique_ptr<geometry_t> geometry;
     std::unique_ptr<backend_renderer_t> backend;
+    std::unique_ptr<spectral_tables_t> spectra;
 
     bool backward;
     std::uint64_t paths_per_spe;

@@ -54,19 +54,33 @@ struct ball_hit_t {
 };
 
 /**
- * @brief A scene compiled for plt_path rendering of one sensor at one
- *        wavenumber (see wt/gpu/kernel/scene.hpp). The device pointers of
- *        `kernel::plt_scene` are filled in by the backend.
+ * @brief A scene compiled for plt_path rendering of one sensor (see
+ *        wt/gpu/kernel/scene.hpp), but for what depends on the wavenumber:
+ *        see `spectral_table_t`. The device pointers of `kernel::plt_scene`
+ *        are filled in by the backend.
  */
 struct plt_path_scene_t {
     std::vector<kernel::tri_shading> tris;     // per BVH triangle
     std::vector<kernel::edge> edges;
-    std::vector<kernel::material> materials;
-    std::vector<kernel::point_emitter> emitters;
     std::vector<kernel::real> emitter_cdf;
+    std::uint32_t emitter_count;
+    std::uint32_t material_count;
+    std::uint32_t samples_per_emitter;         // in each spectral table
     kernel::sensor_desc sensor;
     kernel::film_desc film;
     kernel::plt_path_params params;
+};
+
+/**
+ * @brief Spectral samples (see `kernel::plt_scene`): `samples[s]`, with
+ *        emitter e at `emitters[s*emitter_count + e]` and material m at
+ *        `materials[s*material_count + m]`. A table for `trace` holds
+ *        `samples_per_emitter` samples of each emitter, emitter by emitter.
+ */
+struct spectral_table_t {
+    std::vector<kernel::spectral_sample> samples;
+    std::vector<kernel::point_emitter> emitters;
+    std::vector<kernel::material> materials;
 };
 
 /** @brief Traces paths of a compiled scene on a device, accumulating a film there. Not thread safe. */
@@ -75,13 +89,15 @@ public:
     virtual ~backend_renderer_t() noexcept = default;
 
     /**
-     * @brief Starts paths `first .. first+count-1` and traces them, and paths
-     *        in flight from earlier calls; may return with some still in
-     *        flight, for the next call or `finish`. A path's index and `seed`
-     *        determine its random numbers. Returns the status flags of all
+     * @brief Starts paths `first .. first+count-1`, whose spectral samples
+     *        are in `spectra`, and traces them, and paths in flight from
+     *        earlier calls; may return with some still in flight, for the next
+     *        call or `finish`. A path's index and `seed` determine its random
+     *        numbers and spectral sample. Returns the status flags of all
      *        paths so far (kernel::status_*).
      */
-    virtual std::uint32_t trace(std::uint64_t first, std::uint64_t count, std::uint32_t seed) = 0;
+    virtual std::uint32_t trace(std::uint64_t first, std::uint64_t count, std::uint32_t seed,
+                                const spectral_table_t& spectra) = 0;
 
     /** @brief Completes all paths in flight. Returns the status flags of all paths so far. */
     virtual std::uint32_t finish() = 0;
