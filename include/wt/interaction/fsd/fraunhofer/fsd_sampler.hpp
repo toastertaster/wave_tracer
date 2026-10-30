@@ -31,6 +31,7 @@ struct sample_ret_t {
 };
 
 struct fsd_sample_impl_t;
+class fsd_lut_t;
 
 /**
  * @brief FSD sampler. 
@@ -60,6 +61,11 @@ public:
                           const vec2_t xi) const noexcept {
         return fsd::ASF(aperture, xi) * aperture.recp_I;
     }
+
+    /**
+     * @brief The lookup tables the sampler samples edges' diffraction lobes with.
+     */
+    [[nodiscard]] const fsd_lut_t& lut() const noexcept;
 
     [[nodiscard]] scene::element::info_t description() const override;
 };

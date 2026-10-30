@@ -111,6 +111,8 @@ constexpr real inv_two_pi = real(0.15915494309189533577);
 constexpr real inv_four_pi = real(0.07957747154594766788);
 constexpr real inv_sqrt_two = real(0.70710678118654752440);
 constexpr real inv_sqrt_two_pi = real(0.39894228040143267794);
+constexpr real sqrt_pi = real(1.77245385090551602730);
+constexpr real inv_sqrt_pi = real(0.56418958354775628695);
 constexpr real sqrt_pi_2 = real(1.25331413731550025121);
 
 WT_GPU_FN bool isnan(real x) { return x!=x; }

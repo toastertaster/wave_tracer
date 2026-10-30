@@ -72,6 +72,7 @@ struct plt_scene_t {
     std::vector<kernel::bitmap> bitmaps;
     std::vector<std::uint32_t> texels;         // `kernel::bitmap`s' texels
     std::vector<kernel::real> texel_luts;
+    std::vector<kernel::real> fsd_lut;         // plt_bdpt's free-space diffraction, or empty (see `kernel::plt_scene`)
     std::uint32_t emitter_count;
     std::uint32_t material_count;
     std::uint32_t samples_per_emitter;         // in each spectral table

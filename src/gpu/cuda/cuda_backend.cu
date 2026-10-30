@@ -152,10 +152,12 @@ struct path_pool_t {
     k::u32 tri_capacity, edge_capacity;
     k::u32* table_paths;
     k::u32 table_size;
-    // plt_bdpt: `vertex_capacity` vertices of each subpath
+    // plt_bdpt: `vertex_capacity` vertices of each subpath, and `aperture_capacity` aperture edges of each path
     void* sensor_vertices;          // `k::bdpt_vertex<P>` of the paths' sensor (see `sensor_verts`)
     k::bdpt_vertex<false>* emitter_vertices;
     k::u32 vertex_capacity;
+    k::fraunhofer::fsd_edge* aperture_edges;
+    k::u32 aperture_capacity;
 
     /** @brief `count` paths start with spectral table `table` (the first thread of a launch counts them). */
     __device__ void paths_started(k::u32 table, k::u32 count) const {
@@ -180,6 +182,10 @@ struct path_pool_t {
     /** @brief The emitter subpath vertices of a plt_bdpt path. */
     __device__ k::bdpt_vertex<false>* emitter_verts(k::u32 slot) const {
         return emitter_vertices + std::size_t(slot)*vertex_capacity;
+    }
+    /** @brief The edges of the apertures of a plt_bdpt path's free-space diffractions. */
+    __device__ k::fraunhofer::fsd_edge* apertures(k::u32 slot) const {
+        return aperture_edges + std::size_t(slot)*aperture_capacity;
     }
 
     __device__ k::path_scratch scratch(k::u32 slot) const {
@@ -430,6 +436,7 @@ __global__ void __launch_bounds__(block_size, 2) run_bdpt_paths_kernel(k::plt_sc
     k::u32 s = k::status_ok;
     const k::u32 spectral = k::trace_bdpt_path(scene, geometry, film, light, pool.scratch(i),
                                                pool.sensor_verts<P>(i), pool.emitter_verts(i), pool.vertex_capacity,
+                                               pool.apertures(i), pool.aperture_capacity,
                                                path_rng(e), e.path, table, e.spectral, s);
     if (s & k::status_scratch_overflow) {
         overflow[atomicAdd(&counters->overflowed, 1u)] = { e.path, 0, e.seed, spectral };
@@ -472,6 +479,7 @@ public:
         bitmaps.upload(scene.bitmaps.data(), scene.bitmaps.size());
         texels.upload(scene.texels.data(), scene.texels.size());
         texel_luts.upload(scene.texel_luts.data(), scene.texel_luts.size());
+        fsd_lut.upload(scene.fsd_lut.data(), scene.fsd_lut.size());
 
         // a polarimetric film's components have four values (Stokes parameters), and one weight
         weights_size = std::size_t(scene.film.width) * scene.film.height * scene.film.components;
@@ -505,6 +513,7 @@ public:
         params.bitmaps = bitmaps.get();
         params.texels = texels.get();
         params.texel_luts = texel_luts.get();
+        params.fsd_lut = fsd_lut.get();
         params.emitter_count = scene.emitter_count;
         params.material_count = scene.material_count;
         params.samples_per_emitter = scene.samples_per_emitter;
@@ -604,6 +613,8 @@ private:
     static constexpr k::u32 max_capacity = 1u<<20;
     /** @brief plt_bdpt: vertices a subpath holds at first (at `initial_capacity`; growing with it). */
     static constexpr k::u32 initial_vertex_capacity = 16;
+    /** @brief plt_bdpt: aperture edges of free-space diffractions a path holds at first (as vertices). */
+    static constexpr k::u32 initial_aperture_capacity = 256;
     /** @brief plt_bdpt: memory for paths in flight, which bounds their count. */
     static constexpr std::size_t bdpt_pool_bytes = std::size_t(512)<<20;
     /** @brief Paths in flight few enough to finish in one launch, rather than a launch per step. */
@@ -642,6 +653,10 @@ private:
         const auto max_vertices = std::uint64_t(params.params.max_depth) + 2;
         return k::u32(std::min<std::uint64_t>(max_vertices, std::uint64_t(initial_vertex_capacity)*capacity/initial_capacity));
     }
+    /** @brief plt_bdpt: the aperture edges a path holds, at `capacity` (none without free-space diffraction). */
+    [[nodiscard]] k::u32 aperture_capacity(k::u32 capacity) const noexcept {
+        return params.params.fsd!=0 ? initial_aperture_capacity*(capacity/initial_capacity) : 0;
+    }
 
     /**
      * @brief Starts an empty pool of paths with `capacity` scratch triangles
@@ -651,14 +666,20 @@ private:
     void begin(wavefront_t& wf, k::u32 capacity) {
         if (params.params.bdpt!=0) {
             const auto vertices = vertex_capacity(capacity);
+            const auto apertures = aperture_capacity(capacity);
+            // free-space diffraction collects the edges of a query's triangles
+            const std::size_t edges = params.params.fsd!=0 ? 3*std::size_t(capacity) : 0;
             const std::size_t sensor_vertex_size =
                 polarimetric ? sizeof(k::bdpt_vertex<true>) : sizeof(k::bdpt_vertex<false>);
             const std::size_t slot_size =
-                vertices*(sensor_vertex_size + sizeof(k::bdpt_vertex<false>)) + capacity*sizeof(k::u32);
+                vertices*(sensor_vertex_size + sizeof(k::bdpt_vertex<false>)) + (capacity+edges)*sizeof(k::u32) +
+                apertures*sizeof(k::fraunhofer::fsd_edge);
             const auto slots = k::u32(std::clamp<std::size_t>(bdpt_pool_bytes/slot_size, 1, pool_size));
             sensor_vertices.resize(std::size_t(slots)*vertices*sensor_vertex_size/sizeof(uint4));
             emitter_vertices.resize(std::size_t(slots)*vertices);
             scratch_tris.resize(std::size_t(slots)*capacity);
+            scratch_edges.resize(std::size_t(slots)*edges);
+            aperture_edges.resize(std::size_t(slots)*apertures);
             overflow.resize(slots);
             wf = { slots, capacity, 0, slots, 0 };
             return;
@@ -689,6 +710,7 @@ private:
             wf.capacity, wf.capacity,
             count_table_paths ? table_paths.get() : nullptr, table_size,
             sensor_vertices.get(), emitter_vertices.get(), vertex_capacity(wf.capacity),
+            aperture_edges.get(), aperture_capacity(wf.capacity),
         };
     }
 
@@ -882,6 +904,7 @@ private:
     device_buffer_t<k::bitmap>        bitmaps;
     device_buffer_t<k::u32>           texels;
     device_buffer_t<k::real>          texel_luts;
+    device_buffer_t<k::real>          fsd_lut;
     device_buffer_t<double>           film;
     device_buffer_t<double>           film_weights;     // block splats
     device_buffer_t<double>           light_film;       // plt_bdpt's direct splats
@@ -911,6 +934,7 @@ private:
     device_buffer_t<k::aperture_entry> scratch_aperture;
     device_buffer_t<uint4>             sensor_vertices;  // plt_bdpt (`path_pool_t::sensor_verts`)
     device_buffer_t<k::bdpt_vertex<false>> emitter_vertices;
+    device_buffer_t<k::fraunhofer::fsd_edge> aperture_edges;
     device_buffer_t<step_counters_t>   counters;
     device_buffer_t<path_entry_t>      overflow;
     device_buffer_t<path_entry_t>      path_list;

@@ -18,8 +18,8 @@
  * silently rendering on the CPU. Supported so far:
  *   - the plt_path integrator, forward and backward transport (beams,
  *     free-space diffraction, or ray tracing);
- *   - the plt_bdpt integrator (beams without free-space diffraction, or
- *     ray tracing);
+ *   - the plt_bdpt integrator (beams, with its Fraunhofer free-space
+ *     diffraction, or ray tracing);
  *   - virtual_plane (coverage) sensors, and perspective sensors (but with
  *     forward plt_path), polarimetric or not, of any response: paths draw
  *     wavenumbers as the CPU's do (see `spectral_tables_t`);

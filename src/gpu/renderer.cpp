@@ -24,6 +24,7 @@
 #include <wt/scene/scene.hpp>
 #include <wt/integrator/plt_path/plt_path.hpp>
 #include <wt/integrator/plt_bdpt/plt_bdpt.hpp>
+#include <wt/interaction/fsd/fraunhofer/fsd_lut.hpp>
 #include <wt/emitter/area.hpp>
 #include <wt/emitter/directional.hpp>
 #include <wt/emitter/point.hpp>
@@ -51,6 +52,7 @@
 #include <wt/scene/element/attributes.hpp>
 #include <wt/util/logger/logger.hpp>
 #include <wt/gpu/kernel/plt_path.hpp>
+#include <wt/gpu/kernel/fraunhofer.hpp>
 
 #include "to_kernel.hpp"
 
@@ -72,6 +74,33 @@ std::string type_of(const scene::scene_element_t& element) {
     return element.description().type;
 }
 
+/**
+ * @brief plt_bdpt's free-space diffraction: the lookup tables its sampler
+ *        samples edges' diffraction lobes with, as `kernel::plt_scene::fsd_lut`.
+ */
+std::vector<real> compile_fsd_lut(const integrator::plt_bdpt_t& integrator) {
+    namespace kf = kernel::fraunhofer;
+    using lut_t = fraunhofer::fsd_sampler::fsd_lut_t;
+    static_assert(lut_t::theta_samples==kf::fsd_theta_samples && lut_t::radius_samples==kf::fsd_radius_samples,
+                  "the kernels' free-space diffraction lookup tables differ from the CPU's");
+
+    const auto* sampler = integrator.get_fsd_sampler();
+    if (!sampler)
+        throw std::logic_error("plt_bdpt's free-space diffraction sampler was not loaded");
+    const auto& lut = sampler->lut();
+
+    std::vector<real> out;
+    out.reserve(kf::fsd_lut_size);
+    for (int lobe=0; lobe<2; ++lobe)
+        for (const auto v : lut.iCDF_theta(lobe))
+            out.push_back(real(v));
+    for (int lobe=0; lobe<2; ++lobe)
+        for (const auto& row : lut.iCDF_radius(lobe))
+            for (const auto v : row)
+                out.push_back(real(v));
+    return out;
+}
+
 void compile_integrator(const scene_t& scene, const sensor::sensor_t& sensor,
                         plt_scene_t& out) {
     const auto& integrator = scene.integrator();
@@ -90,17 +119,16 @@ void compile_integrator(const scene_t& scene, const sensor::sensor_t& sensor,
 
     if (const auto* plt_bdpt = dynamic_cast<const integrator::plt_bdpt_t*>(&integrator); plt_bdpt) {
         const auto& opts = plt_bdpt->get_options();
-        // the CPU's bdpt diffracts with Fraunhofer free-space diffraction, which the GPU does not implement
-        if (opts.FSD && !sensor.ray_trace_only())
-            throw gpu_error_t(std::format(
-                "GPU rendering does not support plt_bdpt's free-space diffraction yet; set the integrator's FSD "
-                "to false, or ray trace (integrator <{}>)", integrator.get_id()));
         params.bdpt = 1;
         params.max_depth = opts.max_depth;
         params.russian_roulette = opts.RR ? 1 : 0;
         params.mis = opts.MIS ? 1 : 0;
         params.sensor_direct = opts.sensor_direct ? 1 : 0;
         params.emitter_direct = opts.emitter_direct ? 1 : 0;
+        // Fraunhofer free-space diffraction, of beams (rays never diffract)
+        params.fsd = opts.FSD && !sensor.ray_trace_only() ? 1 : 0;
+        if (params.fsd!=0)
+            out.fsd_lut = compile_fsd_lut(*plt_bdpt);
         return;
     }
 

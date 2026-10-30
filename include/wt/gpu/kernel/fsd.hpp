@@ -214,7 +214,6 @@ WT_GPU_FN complex faddeeva_w(complex z) {
         real(1.7483958860819619),
     };
 #endif
-    constexpr real inv_sqrt_pi = real(0.56418958354775628695);
 
     // Z = (L+iz)/(L-iz) lies in the unit disc; w = 2p(Z)/(L-iz)² + 1/(√π (L-iz))
     const complex iz = { -z.im, z.re };

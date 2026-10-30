@@ -336,7 +336,7 @@ struct plt_params {
     u32 bdpt;                   // plt_bdpt (else plt_path)
     u32 max_depth;
     u32 russian_roulette;
-    u32 fsd;
+    u32 fsd;                    // free-space diffraction (of beams; plt_bdpt's: Fraunhofer, fraunhofer.hpp)
     u32 ray_tracing_only;       // `sensor_t::ray_trace_only()`
     u32 backward;               // plt_path's transport direction: paths start at the sensor
     u32 mis;                    // plt_bdpt: multiple importance sampling of the connection strategies
@@ -382,6 +382,9 @@ struct plt_scene {
     const WT_GPU_GLOBAL bitmap* bitmaps;
     const WT_GPU_GLOBAL u32* texels;
     const WT_GPU_GLOBAL real* texel_luts;           // decoding tables of unorm texels (see `bitmap`)
+
+    // plt_bdpt's free-space diffraction: the sampler's lookup tables (see fraunhofer.hpp), or null
+    const WT_GPU_GLOBAL real* fsd_lut;
 
     sensor_desc sensor;
     film_desc film;

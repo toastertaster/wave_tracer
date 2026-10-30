@@ -600,6 +600,7 @@ struct alignas(16) traversal_t {
     real region_depth;      // depth past `dist` over which triangles are considered
     bool hit;
     bool ballistic;
+    bool front_face;        // diffusive, if requested (see `traverse`): the closest triangle faces the beam
     // ballistic: the triangle hit
     u32 tri;
     real baryx, baryy;
@@ -612,14 +613,16 @@ struct alignas(16) traversal_t {
  * @brief `traverse()` of wt/integrator/traversal.hpp: short ballistic (ray)
  *        segments, after each of which diffusive (cone) propagation is tried.
  *        `envelope` starts at the (offset) traversal origin. Sets
- *        `status_scratch_overflow` if the triangles do not fit.
+ *        `status_scratch_overflow` if the triangles do not fit. Finds whether
+ *        the closest triangle faces the beam (`traversal_t::front_face`) only
+ *        if asked to (`FrontFace`): tracking it slows the cone traversals.
  */
-template <typename Geometry>
+template <bool FrontFace = false, typename Geometry>
 WT_GPU_FN traversal_t traverse(const WT_GPU_THREAD Geometry& geometry, const WT_GPU_THREAD cone& envelope,
                                real lambda, bool ray_trace, const WT_GPU_THREAD path_scratch& scratch,
                                WT_GPU_THREAD u32& status) {
     const ray r = envelope.r;
-    traversal_t ret = { r.o, inf(), 0, false, true, no_triangle, 0, 0, 0 };
+    traversal_t ret = { r.o, inf(), 0, false, true, false, no_triangle, 0, 0, 0 };
 
     const auto ballistic_hit = [&](const WT_GPU_THREAD ray_hit& h) {
         ret.hit = true;
@@ -674,6 +677,8 @@ WT_GPU_FN traversal_t traverse(const WT_GPU_THREAD Geometry& geometry, const WT_
             ret.hit = !empty;
             ret.dist = ch.dist;
             ret.tri_count = ch.tri_count;
+            if constexpr (FrontFace)
+                ret.front_face = ch.front_face!=0;
             ret.region_depth = empty ? real(0) : 2*envelope.axes(ch.dist).x;
             return ret;
         }

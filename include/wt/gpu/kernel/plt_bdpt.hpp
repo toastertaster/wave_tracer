@@ -9,7 +9,7 @@
 
 #pragma once
 
-#include "plt_path.hpp"
+#include "fraunhofer.hpp"
 
 /*
  * plt_bdpt on the GPU: a port of `plt_bdpt_t::integrate` (src/integrator/plt_bdpt.cpp)
@@ -20,15 +20,16 @@
  * the sensor (`t` of 0 or 1) splat into the film's light image, the others, summed,
  * into the sensor element the sensor subpath started from.
  *
- * Beams propagate ballistically and diffusively (`traverse`) and interact with
- * surfaces, but do not diffract: the CPU's Fraunhofer free-space diffraction (its
- * `FSD` option) is not ported. (Ray tracing never diffracts.)
+ * Beams propagate ballistically and diffusively (`traverse`), interact with
+ * surfaces, and, with the `FSD` option, diffract where an interaction region
+ * holds edges but no surface (Fraunhofer free-space diffraction, see
+ * fraunhofer.hpp). (Ray tracing never diffracts.)
  *
  * `trace_bdpt_path` traces a path, parameterized by the backend's Geometry and Film
- * as plt_path's functions are. A path keeps its vertices in memory the backend
- * provides, up to a capacity; a path that outgrows it, or its scratch memory,
- * stops with `status_scratch_overflow` before it splats anything, to be re-traced
- * with more.
+ * as plt_path's functions are. A path keeps its vertices, and the apertures of
+ * its diffractions, in memory the backend provides, up to capacities; a path
+ * that outgrows them, or its scratch memory, stops with `status_scratch_overflow`
+ * before it splats anything, to be re-traced with more.
  */
 
 namespace wt::gpu::kernel {
@@ -36,6 +37,7 @@ namespace wt::gpu::kernel {
 constexpr u32 vertex_sensor = 0;
 constexpr u32 vertex_emitter = 1;
 constexpr u32 vertex_surface = 2;
+constexpr u32 vertex_fsd = 3;             // a free-space diffraction
 
 /**
  * @brief A subpath vertex (`plt_bdpt::vertex_t`), and the beam that arrived at
@@ -55,7 +57,8 @@ struct alignas(16) bdpt_vertex {
     vec3 ng;
     frame shading;              // surfaces: the shading frame
     material mat;               // surfaces: the material, textured
-    u32 type;                   // vertex_sensor, vertex_emitter or vertex_surface
+    fraunhofer::fsd_aperture fsd;   // free-space diffractions: the aperture (in the frame of `beam`)
+    u32 type;                   // vertex_sensor, vertex_emitter, vertex_surface or vertex_fsd
     u32 on_surface;             // `vertex_t::is_on_surface()`
     u32 delta;                  // surfaces: a delta BSDF lobe sampled the next vertex
     u32 tri;                    // surfaces and area emitters: the BVH triangle, or no_triangle
@@ -81,6 +84,43 @@ WT_GPU_FN bdpt_point point_of(const WT_GPU_GLOBAL bdpt_vertex<P>& v) {
 template <bool P>
 WT_GPU_FN vertex_geo geo_of(const WT_GPU_GLOBAL bdpt_vertex<P>& v) {
     return v.tri!=no_triangle ? vertex_geo{ v.wp, geo_surface, v.tri } : vertex_geo{ v.wp, geo_point, 0 };
+}
+
+/** @brief `vertex_t::is_connectible` */
+template <bool P>
+WT_GPU_FN bool is_connectible(const WT_GPU_GLOBAL bdpt_vertex<P>& v) {
+    return v.type==vertex_fsd || (v.type==vertex_surface && v.mat.delta_only==0);
+}
+
+/** @brief `vertex_t::ns()`: the shading normal of surfaces (and area emitters, which connections never use). */
+template <bool P>
+WT_GPU_FN vec3 ns_of(const WT_GPU_GLOBAL bdpt_vertex<P>& v) {
+    return v.type==vertex_surface ? v.shading.n : vec3{ 0,0,1 };
+}
+
+/** @brief The frame of a vertex's arriving beam (`beam_generic_t::frame`): of a diffraction, its aperture's. */
+template <bool P>
+WT_GPU_FN frame beam_frame_of(const WT_GPU_GLOBAL bdpt_vertex<P>& v) {
+    return { v.beam.envelope.x, v.beam.envelope.y, v.beam.envelope.r.d };
+}
+
+/**
+ * @brief A path's memory of its diffractions' apertures, of `capacity` edges,
+ *        `used` of which by its vertices so far; and its wavenumber.
+ */
+struct fsd_memory {
+    WT_GPU_GLOBAL fraunhofer::fsd_edge* edges;
+    u32 capacity;
+    u32 used;
+    real k;
+};
+
+/** @brief `free_space_diffraction_t::pdf` (and `f`) of a diffraction vertex, of the world direction `wo`. */
+template <bool P>
+WT_GPU_FN real fsd_pdf_of(const WT_GPU_GLOBAL bdpt_vertex<P>& v, const WT_GPU_THREAD fsd_memory& apertures,
+                          vec3 wo) {
+    const fraunhofer::fsd_aperture ap = v.fsd;
+    return fraunhofer::fsd_pdf(ap, apertures.edges, apertures.k, beam_frame_of(v).to_local(wo));
 }
 
 /** @brief `shading_normals_correction_scale` of wt/integrator/common.hpp (forward transport). */
@@ -181,13 +221,21 @@ WT_GPU_FN bool is_delta_emitter(const WT_GPU_THREAD plt_scene& scene, u32 ei) {
     return scene.emitters[ei].type!=emitter_area;
 }
 
-/** @brief `vertex_t::pdf` of a surface vertex `v`: of sampling `next` from it, having come from `prev`. */
+/**
+ * @brief `vertex_t::pdf` of a surface or diffraction vertex `v`: of sampling
+ *        `next` from it, having come from `prev`.
+ */
 template <bool P>
-WT_GPU_FN real pdf_surface(const WT_GPU_GLOBAL bdpt_vertex<P>& v, vec3 prev, bdpt_point next) {
+WT_GPU_FN real vertex_pdf(const WT_GPU_GLOBAL bdpt_vertex<P>& v, const WT_GPU_THREAD fsd_memory& apertures,
+                          vec3 prev, bdpt_point next) {
+    const vec3 woworld = normalize(next.wp - v.wp);
+    if (v.type==vertex_fsd)
+        return area_density(fsd_pdf_of(v, apertures, woworld), v.wp, next);
+
     const frame sh = v.shading;
     const material m = v.mat;
     const vec3 wi = sh.to_local(normalize(prev - v.wp));
-    const vec3 wo = sh.to_local(normalize(next.wp - v.wp));
+    const vec3 wo = sh.to_local(woworld);
     return area_density(pdf_bsdf(m, wi, wo), v.wp, next);
 }
 
@@ -315,16 +363,18 @@ WT_GPU_FN bdpt_walk_t<false> start_emitter_subpath(const WT_GPU_THREAD plt_scene
 
 /**
  * @brief The random walk of a subpath (`random_walk`) after its first vertex,
- *        `verts[0]`: appends a vertex for each surface interaction, up to
- *        `capacity` vertices (a subpath that needs more stops with
- *        `status_scratch_overflow`). `backward`: of a sensor subpath. Returns
- *        the subpath's vertex count.
+ *        `verts[0]`: appends a vertex for each surface interaction and
+ *        free-space diffraction, up to `capacity` vertices, whose apertures
+ *        go to `apertures` (a subpath that needs more of either, or of its
+ *        scratch memory, stops with `status_scratch_overflow`). `backward`:
+ *        of a sensor subpath. Returns the subpath's vertex count.
  */
 template <bool P, typename Geometry>
 WT_GPU_FN u32 bdpt_random_walk(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_THREAD Geometry& geometry,
                                const WT_GPU_THREAD path_scratch& scratch, u32 spectral, bool backward,
                                WT_GPU_THREAD bdpt_walk_t<P>& w, WT_GPU_GLOBAL bdpt_vertex<P>* verts, u32 capacity,
-                               WT_GPU_THREAD rng& rnd, WT_GPU_THREAD u32& status) {
+                               WT_GPU_THREAD fsd_memory& apertures, WT_GPU_THREAD rng& rnd,
+                               WT_GPU_THREAD u32& status) {
     const plt_params opts = scene.params;
     const bool ray_trace = opts.ray_tracing_only!=0;
     const real lambda = two_pi/scene.spectra[spectral].k;
@@ -332,6 +382,29 @@ WT_GPU_FN u32 bdpt_random_walk(const WT_GPU_THREAD plt_scene& scene, const WT_GP
     u32 count = 1;
     bdpt_point last = point_of(verts[0]);
     vertex_geo last_geo = geo_of(verts[0]);
+    // appends vertex `v`, sampled with solid-angle density `pdf_fwd` (`append_vertex`), from which the previous
+    // vertex is sampled with density `pdf_rev`; false if it may not be
+    const auto append_vertex = [&](WT_GPU_THREAD bdpt_vertex<P>& v, real pdf_fwd, real pdf_rev) {
+        if (count==capacity) {
+            status |= status_scratch_overflow;
+            return false;
+        }
+        if (last.wp==v.wp)
+            return false;
+        const bdpt_point point = point_of(v);
+        v.beam = w.b;
+        v.pdf = area_density(w.pdf_from_prev, last.wp, point);
+        v.pdf_rev = 0;
+        // continue_walk sets it so, before its Russian roulette
+        v.rr_weight = w.rr_weight;
+        verts[count-1].pdf_rev = area_density(pdf_rev, v.wp, last);
+        verts[count++] = v;
+        w.pdf_from_prev = pdf_fwd;
+        last = point;
+        last_geo = geo_of(v);
+        return true;
+    };
+
     for (u32 iteration=0;; ++iteration) {
         if (iteration==max_path_iterations) {
             status |= status_iteration_limit;
@@ -342,77 +415,108 @@ WT_GPU_FN u32 bdpt_random_walk(const WT_GPU_THREAD plt_scene& scene, const WT_GP
         // last vertex's surface, as the CPU's)
         cone envelope = w.b.envelope;
         envelope.r.o = offseted_ray_origin(scene, last_geo, envelope.r);
-        const traversal_t tr = traverse(geometry, envelope, lambda, ray_trace, scratch, status);
+        // (free-space diffraction needs to know whether the closest triangle faces the beam)
+        const traversal_t tr = traverse<true>(geometry, envelope, lambda, ray_trace, scratch, status);
         if ((status & status_scratch_overflow) || !tr.hit)
             break;
 
         const vec3 dir = w.b.dir();
+        const vec3 interaction_wp = tr.origin + tr.dist*dir;
         const primary_t primary = tr.ballistic || w.b.is_ray() ?
             primary_t{ tr.tri, tr.dist, tr.baryx, tr.baryy } :
             find_closest_triangle(scene, scratch.tris, tr.tri_count, range{ tr.dist, tr.dist+tr.region_depth },
                                   tr.origin, dir);
+
         if (primary.tri==no_triangle) {
-            // without free-space diffraction, an interaction region without a surface is a null
-            // interaction: no vertex, no Russian roulette
-            w.b.transform_restart(tr.origin + tr.dist*dir, tr.dist);
-            continue;
+            // a (diffusive) interaction region without a surface: free-space diffraction by its edges, if any
+            // (sample_fraunhofer_fsd_interaction); else a null interaction, no vertex, no Russian roulette
+            fraunhofer::fsd_aperture ap = {};
+            if (opts.fsd!=0) {
+                // (the edges' ids fit: a path keeps its apertures elsewhere, in `apertures`)
+                u32 edge_count = 0;
+                collect_edges(scene, scratch.tris, tr.tri_count, scratch.edges, 3*scratch.tri_capacity, edge_count);
+                if (edge_count>0) {
+                    // the aperture passes the beam's power but that which the region's triangles block
+                    const fraunhofer::gaussian_wavefront wf = fraunhofer::wavefront_at(w.b.envelope, tr.dist);
+                    const real power = 1 - fraunhofer::wavefront_flux_over_triangles(
+                            scene, scratch.tris, tr.tri_count, w.b.envelope, wf,
+                            range{ tr.dist, tr.dist+tr.region_depth }, tr.front_face);
+                    ap = fraunhofer::build_fsd_aperture(scene, scratch.edges, edge_count, w.b.envelope, wf,
+                                                        apertures.k, power, apertures.edges, apertures.used,
+                                                        apertures.capacity-apertures.used, status);
+                    if (status & status_scratch_overflow)
+                        break;
+                }
+            }
+            if (ap.count==0) {
+                w.b.transform_restart(interaction_wp, tr.dist);
+                continue;
+            }
+
+            const fraunhofer::fsd_sample_t fs = fraunhofer::fsd_sample(scene.fsd_lut, ap, apertures.edges,
+                                                                       apertures.k, rnd);
+            if (!(fs.dpd>real(0)) || fs.weight==real(0))
+                break;
+
+            // the reverse density is taken to be the forward one (as the CPU's)
+            bdpt_vertex<P> v;
+            v.wp = interaction_wp;
+            v.ng = { 0,0,1 };
+            v.fsd = ap;
+            v.type = vertex_fsd;
+            v.on_surface = 0;
+            v.delta = 0;
+            v.tri = no_triangle;
+            v.emitter = no_emitter;
+            if (!append_vertex(v, fs.dpd, fs.dpd))
+                break;
+            apertures.used += ap.count;
+
+            // the diffracted beam
+            const vec3 woworld = w.b.envelope.frame().to_world(fs.wo);
+            w.b.transform_region_interaction(interaction_wp, tr.dist, woworld, fs.weight);
+            w.throughput *= fs.weight;
+        } else {
+            // sample_surface_interaction
+            surface s;
+            material mat;
+            const u32 surface_emitter = hit_surface(scene, spectral, primary, tr.origin, tr.dist, w.b, s, mat);
+
+            const vec3 wiworld = -dir;
+            const vec3 wi = s.shading.to_local(wiworld);
+            const real wig = dot(wiworld, s.geo.n);
+            if (wig*wi.z<=real(0))
+                break;
+
+            bsdf_sample_t bs;
+            if (!sample_bsdf(mat, wi, backward, rnd, bs) || !(bs.pdf>real(0)))
+                break;
+            const vec3 woworld = normalize(s.shading.to_world(bs.wo));
+            const real wog = dot(woworld, s.geo.n);
+            if (wog*bs.wo.z<=real(0))
+                break;
+
+            bdpt_vertex<P> v;
+            v.wp = s.wp;
+            v.ng = s.geo.n;
+            v.shading = s.shading;
+            v.mat = mat;
+            v.type = vertex_surface;
+            v.on_surface = 1;
+            v.delta = bs.discrete ? 1u : 0u;
+            v.tri = s.tri;
+            v.emitter = surface_emitter;
+            if (!append_vertex(v, bs.discrete ? real(0) : bs.pdf, pdf_bsdf(mat, bs.wo, wi)))
+                break;
+
+            // the beam after the interaction (the adjoint BSDF for shading normals)
+            const real scale = s.shading.n==s.geo.n ? real(1) :
+                               shading_normals_correction(backward, wig, wog, wi.z, bs.wo.z);
+            w.b.transform_surface_interaction(s, woworld, bs.M, scale, backward);
+            w.throughput *= scale * bs.M.m00;
+            if (backward && bs.eta!=real(1))
+                w.throughput /= sqr(bs.eta);
         }
-
-        // sample_surface_interaction
-        surface s;
-        material mat;
-        const u32 surface_emitter = hit_surface(scene, spectral, primary, tr.origin, tr.dist, w.b, s, mat);
-
-        const vec3 wiworld = -dir;
-        const vec3 wi = s.shading.to_local(wiworld);
-        const real wig = dot(wiworld, s.geo.n);
-        if (wig*wi.z<=real(0))
-            break;
-
-        bsdf_sample_t bs;
-        if (!sample_bsdf(mat, wi, backward, rnd, bs) || !(bs.pdf>real(0)))
-            break;
-        const vec3 woworld = normalize(s.shading.to_world(bs.wo));
-        const real wog = dot(woworld, s.geo.n);
-        if (wog*bs.wo.z<=real(0))
-            break;
-
-        // append_vertex: the densities of sampling it, and the previous vertex from it
-        if (count==capacity) {
-            status |= status_scratch_overflow;
-            break;
-        }
-        if (last.wp==s.wp)
-            break;
-        const bdpt_point point = { s.wp, s.geo.n, true };
-        bdpt_vertex<P> v;
-        v.beam = w.b;
-        v.wp = s.wp;
-        v.ng = s.geo.n;
-        v.shading = s.shading;
-        v.mat = mat;
-        v.type = vertex_surface;
-        v.on_surface = 1;
-        v.delta = bs.discrete ? 1u : 0u;
-        v.tri = s.tri;
-        v.emitter = surface_emitter;
-        v.pdf = area_density(w.pdf_from_prev, last.wp, point);
-        v.pdf_rev = 0;
-        // continue_walk sets it so, before its Russian roulette
-        v.rr_weight = w.rr_weight;
-        verts[count-1].pdf_rev = area_density(pdf_bsdf(mat, bs.wo, wi), s.wp, last);
-        verts[count++] = v;
-        w.pdf_from_prev = bs.discrete ? real(0) : bs.pdf;
-        last = point;
-        last_geo = { s.wp, geo_surface, s.tri };
-
-        // the beam after the interaction (the adjoint BSDF for shading normals)
-        const real scale = s.shading.n==s.geo.n ? real(1) :
-                           shading_normals_correction(backward, wig, wog, wi.z, bs.wo.z);
-        w.b.transform_surface_interaction(s, woworld, bs.M, scale, backward);
-        w.throughput *= scale * bs.M.m00;
-        if (backward && bs.eta!=real(1))
-            w.throughput /= sqr(bs.eta);
 
         // continue_walk
         if (count>opts.max_depth+1)
@@ -435,17 +539,27 @@ WT_GPU_FN u32 bdpt_random_walk(const WT_GPU_THREAD plt_scene& scene, const WT_GP
  */
 
 /**
- * @brief `vertex_t::interact` of a surface vertex `v`: the beam that arrived
- *        at it, scattered towards `next` (`backward`: of a sensor subpath),
- *        into `b`, but its envelope (see `beam_t::scatter`). False if the BSDF
- *        does not scatter so.
+ * @brief `vertex_t::interact` of a surface or diffraction vertex `v`: the
+ *        beam that arrived at it, scattered towards `next` (`backward`: of a
+ *        sensor subpath), into `b`; of a surface, but its envelope (see
+ *        `beam_t::scatter`). False if the vertex does not scatter so.
  */
 template <bool P>
-WT_GPU_FN bool scatter_towards(const WT_GPU_GLOBAL bdpt_vertex<P>& v, vec3 next, bool backward,
-                               WT_GPU_THREAD beam_t<P>& b) {
+WT_GPU_FN bool scatter_towards(const WT_GPU_GLOBAL bdpt_vertex<P>& v, const WT_GPU_THREAD fsd_memory& apertures,
+                               vec3 next, bool backward, WT_GPU_THREAD beam_t<P>& b) {
+    const vec3 woworld = normalize(next - v.wp);
+    if (v.type==vertex_fsd) {
+        // the diffracted beam, weighted by the aperture's ASF (`f`, which is its density)
+        const real f = fsd_pdf_of(v, apertures, woworld);
+        if (f==real(0))
+            return false;
+        b = v.beam;
+        b.transform_region_interaction(v.wp, dot(v.wp - b.origin(), b.dir()), woworld, f);
+        return true;
+    }
+
     const frame sh = v.shading;
     const vec3 wiworld = -v.beam.envelope.r.d;
-    const vec3 woworld = normalize(next - v.wp);
     const vec3 wi = sh.to_local(wiworld);
     const vec3 wo = sh.to_local(woworld);
     const real wig = dot(wiworld, v.ng);
@@ -590,21 +704,24 @@ template <bool P, typename Geometry>
 WT_GPU_FN bdpt_connection_t<P> connect_to_emitter(const WT_GPU_THREAD plt_scene& scene,
                                                   const WT_GPU_THREAD Geometry& geometry, u32 spectral, i32 t,
                                                   const WT_GPU_GLOBAL bdpt_vertex<P>* sv,
+                                                  const WT_GPU_THREAD fsd_memory& apertures,
                                                   WT_GPU_THREAD rng& rnd, WT_GPU_THREAD u32& status) {
     bdpt_connection_t<P> c;
     c.L = {};
     const WT_GPU_GLOBAL bdpt_vertex<P>& last = sv[t-1];
-    if (last.mat.delta_only!=0)
+    if (!is_connectible(last))
         return c;
 
     const emitter_direct_t ed = sample_emitter_direct(scene, spectral, last.wp, rnd);
     if (!(ed.I>real(0)))
         return c;
-    const real I = ed.I * last.rr_weight * abs(dot(ed.wo, last.shading.n));
+    real I = ed.I * last.rr_weight;
+    if (last.on_surface!=0)
+        I *= abs(dot(ed.wo, ns_of(last)));
 
     // the beam that arrived at the last vertex, towards the emitter point
     beam_t<P> db;
-    if (!scatter_towards(last, ed.geo.wp, true, db) || db.S.s0==real(0) || I==real(0))
+    if (!scatter_towards(last, apertures, ed.geo.wp, true, db) || db.S.s0==real(0) || I==real(0))
         return c;
     if (shadowed(scene, geometry, geo_of(last), ed.geo, status))
         return c;
@@ -614,7 +731,7 @@ WT_GPU_FN bdpt_connection_t<P> connect_to_emitter(const WT_GPU_THREAD plt_scene&
     const bool area = ed.geo.kind==geo_surface;
     const bdpt_point e = { ed.geo.wp, area ? scene.bvh.tris[ed.geo.index].n : vec3{ 0,0,1 }, area };
     c.mis.sensor_rev[0] = pdf_next_from_emitter(scene, ed.emitter, e.wp, e.ng, point_of(last));
-    c.mis.emitter_rev[0] = pdf_surface(last, sv[t-2].wp, e);
+    c.mis.emitter_rev[0] = vertex_pdf(last, apertures, sv[t-2].wp, e);
     c.mis.emitter_pdf0 = pdf_emitter(scene, ed.emitter);
     c.mis.sensor_revs = 1;
     c.mis.emitter_revs = 1;
@@ -626,26 +743,30 @@ WT_GPU_FN bdpt_connection_t<P> connect_to_emitter(const WT_GPU_THREAD plt_scene&
 /**
  * @brief `connect_subpaths` with t==1: connects the emitter subpath's last
  *        vertex to a sampled sensor point (`sensor_t::sample_direct`).
+ *        Diffractions connect only to virtual plane sensors, as the CPU's.
  */
 template <bool P, typename Geometry>
 WT_GPU_FN bdpt_connection_t<P> connect_to_sensor(const WT_GPU_THREAD plt_scene& scene,
                                                  const WT_GPU_THREAD Geometry& geometry, i32 s,
                                                  const WT_GPU_GLOBAL bdpt_vertex<false>* ev,
+                                                 const WT_GPU_THREAD fsd_memory& apertures,
                                                  WT_GPU_THREAD rng& rnd, WT_GPU_THREAD u32& status) {
     bdpt_connection_t<P> c;
     c.L = {};
     const WT_GPU_GLOBAL bdpt_vertex<false>& last = ev[s-1];
-    if (last.mat.delta_only!=0)
+    if (!is_connectible(last) || (last.type==vertex_fsd && scene.sensor.type!=sensor_virtual_plane))
         return c;
 
     const sensor_direct_t sd = sensor_sample_direct(scene.sensor, scene.film, last.wp, rnd);
     if (!(sd.importance>real(0)))
         return c;
-    const real importance = sd.importance * last.rr_weight * abs(dot(sd.wd, last.shading.n));
+    real importance = sd.importance * last.rr_weight;
+    if (last.on_surface!=0)
+        importance *= abs(dot(sd.wd, ns_of(last)));
 
     // the beam that arrived at the last vertex, towards the sensor point
     beam_t<false> eb;
-    if (!scatter_towards(last, sd.p, false, eb) || eb.S.s0==real(0) || importance==real(0))
+    if (!scatter_towards(last, apertures, sd.p, false, eb) || eb.S.s0==real(0) || importance==real(0))
         return c;
     if (shadowed(scene, geometry, vertex_geo{ sd.p, geo_point, 0 }, geo_of(last), status))
         return c;
@@ -657,7 +778,7 @@ WT_GPU_FN bdpt_connection_t<P> connect_to_sensor(const WT_GPU_THREAD plt_scene& 
     // the sensor point (`create_sensor(sensor_direct_sample_t)`)
     const bdpt_point e = { sd.p, { 0,0,1 }, scene.sensor.type==sensor_virtual_plane };
     c.mis.emitter_rev[0] = pdf_next_from_sensor(scene.sensor, sd.p, point_of(last));
-    c.mis.sensor_rev[0] = pdf_surface(last, ev[s-2].wp, e);
+    c.mis.sensor_rev[0] = vertex_pdf(last, apertures, ev[s-2].wp, e);
     c.mis.sensor_pdf0 = pdf_sensor(scene.sensor);
     c.mis.sensor_revs = 1;
     c.mis.emitter_revs = 1;
@@ -708,26 +829,30 @@ WT_GPU_FN bdpt_connection_t<P> connect_through_sensor(const WT_GPU_THREAD plt_sc
 
 /**
  * @brief `connect_subpaths` with s>=2 and t>=2: connects the subpaths' last
- *        vertices.
+ *        vertices. Diffractions are connectible, but contribute nothing so:
+ *        the CPU's connections ignore their scattering (`ignore_fsd`),
+ *        weighting their beams by 0.
  */
 template <bool P, typename Geometry>
 WT_GPU_FN bdpt_connection_t<P> connect_vertices(const WT_GPU_THREAD plt_scene& scene,
                                                 const WT_GPU_THREAD Geometry& geometry, i32 s, i32 t,
                                                 const WT_GPU_GLOBAL bdpt_vertex<P>* sv,
                                                 const WT_GPU_GLOBAL bdpt_vertex<false>* ev,
+                                                const WT_GPU_THREAD fsd_memory& apertures,
                                                 WT_GPU_THREAD u32& status) {
     bdpt_connection_t<P> c;
     c.L = {};
     const WT_GPU_GLOBAL bdpt_vertex<false>& e = ev[s-1];
     const WT_GPU_GLOBAL bdpt_vertex<P>& v = sv[t-1];
     const vec3 dl = e.wp - v.wp;
-    if (e.mat.delta_only!=0 || v.mat.delta_only!=0 || dl==vec3{ 0,0,0 })
+    if (!is_connectible(e) || !is_connectible(v) || e.type==vertex_fsd || v.type==vertex_fsd ||
+        dl==vec3{ 0,0,0 })
         return c;
 
     // the beams that arrived at each, towards the other
     beam_t<false> eb;
     beam_t<P> db;
-    if (!scatter_towards(e, v.wp, false, eb) || !scatter_towards(v, e.wp, true, db))
+    if (!scatter_towards(e, apertures, v.wp, false, eb) || !scatter_towards(v, apertures, e.wp, true, db))
         return c;
 
     const real recp_d2 = 1 / length2(dl);
@@ -740,10 +865,10 @@ WT_GPU_FN bdpt_connection_t<P> connect_vertices(const WT_GPU_THREAD plt_scene& s
         return c;
     c.L = db.observe(eb.S, eb.Sframe);
 
-    c.mis.emitter_rev[0] = pdf_surface(v, sv[t-2].wp, point_of(e));
-    c.mis.emitter_rev[1] = pdf_surface(e, v.wp, point_of(ev[s-2]));
-    c.mis.sensor_rev[0] = pdf_surface(e, ev[s-2].wp, point_of(v));
-    c.mis.sensor_rev[1] = pdf_surface(v, e.wp, point_of(sv[t-2]));
+    c.mis.emitter_rev[0] = vertex_pdf(v, apertures, sv[t-2].wp, point_of(e));
+    c.mis.emitter_rev[1] = vertex_pdf(e, apertures, v.wp, point_of(ev[s-2]));
+    c.mis.sensor_rev[0] = vertex_pdf(e, apertures, ev[s-2].wp, point_of(v));
+    c.mis.sensor_rev[1] = vertex_pdf(v, apertures, e.wp, point_of(sv[t-2]));
     c.mis.sensor_revs = 2;
     c.mis.emitter_revs = 2;
     c.mis.delta_sensor = is_delta_sensor(scene.sensor);
@@ -759,8 +884,10 @@ WT_GPU_FN bdpt_connection_t<P> connect_vertices(const WT_GPU_THREAD plt_scene& s
  *        modulo the film's elements, and an emitter subpath; connects them,
  *        and splats the connections: those to the sensor into `light`, the
  *        others into the sensor element's block in `film`. The subpaths' vertices
- *        go to `sensor_verts` and `emitter_verts`, of `capacity` vertices each.
- *        Returns the path's spectral sample; adds status flags to `status`.
+ *        go to `sensor_verts` and `emitter_verts`, of `capacity` vertices each,
+ *        and the edges of their diffractions' apertures to `aperture_edges`, of
+ *        `aperture_capacity` edges. Returns the path's spectral sample; adds
+ *        status flags to `status`.
  */
 template <bool P, typename Geometry, typename Film>
 WT_GPU_FN u32 trace_bdpt_path(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_THREAD Geometry& geometry,
@@ -768,6 +895,7 @@ WT_GPU_FN u32 trace_bdpt_path(const WT_GPU_THREAD plt_scene& scene, const WT_GPU
                               const WT_GPU_THREAD path_scratch& scratch,
                               WT_GPU_GLOBAL bdpt_vertex<P>* sensor_verts,
                               WT_GPU_GLOBAL bdpt_vertex<false>* emitter_verts, u32 capacity,
+                              WT_GPU_GLOBAL fraunhofer::fsd_edge* aperture_edges, u32 aperture_capacity,
                               rng rnd, u64 path, u32 table, u32 spectral, WT_GPU_THREAD u32& status) {
     const plt_params opts = scene.params;
 
@@ -781,13 +909,16 @@ WT_GPU_FN u32 trace_bdpt_path(const WT_GPU_THREAD plt_scene& scene, const WT_GPU
     const u32 ey = element / scene.film.width;
 
     // the subpaths
+    fsd_memory apertures = { aperture_edges, aperture_capacity, 0, spec.k };
     vec2 offset;
     bdpt_walk_t<P> sw = start_sensor_subpath(scene, spec, ex, ey, rnd, offset, sensor_verts);
-    const u32 nt = bdpt_random_walk(scene, geometry, scratch, spectral, true, sw, sensor_verts, capacity, rnd, status);
+    const u32 nt = bdpt_random_walk(scene, geometry, scratch, spectral, true, sw, sensor_verts, capacity,
+                                    apertures, rnd, status);
     if (status & status_scratch_overflow)
         return spectral;
     bdpt_walk_t<false> ew = start_emitter_subpath(scene, ei, spectral, rnd, emitter_verts);
-    const u32 ns = bdpt_random_walk(scene, geometry, scratch, spectral, false, ew, emitter_verts, capacity, rnd, status);
+    const u32 ns = bdpt_random_walk(scene, geometry, scratch, spectral, false, ew, emitter_verts, capacity,
+                                    apertures, rnd, status);
     if (status & status_scratch_overflow)
         return spectral;
 
@@ -804,9 +935,9 @@ WT_GPU_FN u32 trace_bdpt_path(const WT_GPU_THREAD plt_scene& scene, const WT_GPU
         const bdpt_connection_t<P> c =
             s==0 ? connect_to_emitter_surface<P>(scene, spectral, t, sensor_verts) :
             t==0 ? connect_through_sensor<P>(scene, s, emitter_verts) :
-            s==1 ? connect_to_emitter(scene, geometry, spectral, t, sensor_verts, rnd, status) :
-            t==1 ? connect_to_sensor<P>(scene, geometry, s, emitter_verts, rnd, status) :
-                   connect_vertices(scene, geometry, s, t, sensor_verts, emitter_verts, status);
+            s==1 ? connect_to_emitter(scene, geometry, spectral, t, sensor_verts, apertures, rnd, status) :
+            t==1 ? connect_to_sensor<P>(scene, geometry, s, emitter_verts, apertures, rnd, status) :
+                   connect_vertices(scene, geometry, s, t, sensor_verts, emitter_verts, apertures, status);
         if (intensity_of(c.L)<=real(0))
             continue;
 
