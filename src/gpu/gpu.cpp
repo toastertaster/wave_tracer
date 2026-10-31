@@ -139,6 +139,8 @@ std::string wt::gpu::compiled_backends() {
     return "CUDA, OptiX";
 #elif defined(WT_GPU_CUDA)
     return "CUDA";
+#elif defined(WT_GPU_METAL)
+    return "Metal";
 #else
     return "";
 #endif
@@ -155,13 +157,22 @@ device_t::~device_t() noexcept = default;
 std::unique_ptr<device_t> device_t::create(const options_t& options) {
 #if defined(WT_GPU_CUDA)
     try {
-        return std::unique_ptr<device_t>(new device_t(create_cuda_backend(options.ordinal, options.use_optix)));
+        return std::unique_ptr<device_t>(new device_t(
+            create_cuda_backend(options.ordinal, options.use_hardware_ray_tracing)));
+    } catch (const std::exception& e) {
+        throw gpu_error_t(std::string("cannot use the GPU: ") + e.what());
+    }
+#elif defined(WT_GPU_METAL)
+    try {
+        return std::unique_ptr<device_t>(new device_t(
+            create_metal_backend(options.ordinal, options.use_hardware_ray_tracing)));
     } catch (const std::exception& e) {
         throw gpu_error_t(std::string("cannot use the GPU: ") + e.what());
     }
 #else
     (void)options;
-    throw gpu_error_t("this build of wave_tracer has no GPU backend (configure it with -DGPU_CUDA=ON)");
+    throw gpu_error_t("this build of wave_tracer has no GPU backend "
+                      "(configure it with -DGPU_CUDA=ON, or -DGPU_METAL=ON on macOS)");
 #endif
 }
 

@@ -55,10 +55,14 @@ public:
 class device_t {
 public:
     struct options_t {
-        /** @brief Device index within the backend (CUDA device ordinal). */
+        /** @brief Device index within the backend (CUDA device ordinal, or index into Metal's devices). */
         int ordinal = 0;
-        /** @brief Use OptiX for ray queries, when built with GPU_OPTIX and GPU_DBL_PRECISION=OFF. */
-        bool use_optix = true;
+        /**
+         * @brief Trace ray queries with the GPU's hardware ray tracing: OptiX, when
+         *        built with GPU_OPTIX and GPU_DBL_PRECISION=OFF, or Metal's ray tracing,
+         *        on GPUs that have it. Otherwise rays use the ported BVH traversal.
+         */
+        bool use_hardware_ray_tracing = true;
     };
 
     /**

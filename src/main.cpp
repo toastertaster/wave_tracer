@@ -554,7 +554,7 @@ void initialize_renderer(
         const std::optional<std::filesystem::path>& output_dir_path,
         const std::optional<std::filesystem::path>& scene_data_path,
         const std::optional<std::uint32_t>& cpu_threadpool_size,
-        bool use_gpu, bool use_optix) {
+        bool use_gpu, bool use_hardware_ray_tracing) {
     // data path
     context.scene_data_path = !scene_data_path ? scene_path.parent_path() : scene_data_path.value();
     // output path defaults to scene directory
@@ -586,7 +586,7 @@ void initialize_renderer(
 
     // GPU (experimental); throws, explaining why, if it cannot be used
     if (use_gpu) {
-        gpu_device = wt::gpu::device_t::create({ .use_optix = use_optix });
+        gpu_device = wt::gpu::device_t::create({ .use_hardware_ray_tracing = use_hardware_ray_tracing });
         context.gpu_device = gpu_device.get();
     }
 
@@ -788,7 +788,7 @@ int main(int argc, char* argv[]) {
 
     std::optional<std::uint32_t> cpu_threadpool_size;
     bool use_gpu = false;
-    bool no_optix = false;
+    bool no_hardware_ray_tracing = false;
 
     defines_t defines;
 
@@ -841,9 +841,14 @@ int main(int argc, char* argv[]) {
     render_opt->add_flag("--ray-tracing", context.renderer_force_ray_tracing,
                          "forces ray tracing only");
     render_opt->add_flag("--gpu", use_gpu,
-                         "render on the GPU (experimental; needs a build with GPU_CUDA)");
-    render_opt->add_flag("--no-optix", no_optix,
+                         "render on the GPU (experimental; needs a build with GPU_CUDA or GPU_METAL)");
+#if defined(WT_GPU_METAL)
+    render_opt->add_flag("--no-hw-rt", no_hardware_ray_tracing,
+                         "with --gpu, trace rays with the ported BVH traversal rather than Metal's hardware ray tracing");
+#else
+    render_opt->add_flag("--no-optix", no_hardware_ray_tracing,
                          "with --gpu, trace rays with the CUDA traversal rather than OptiX (in builds with GPU_OPTIX)");
+#endif
     render_opt->add_option_function<std::string>("--mesh_scale",
             [](const auto& v){
                 context.default_scale_for_imported_mesh_positions = wt::stoq_strict<wt::length_t>(v);
@@ -948,7 +953,7 @@ int main(int argc, char* argv[]) {
     
     cli_render.callback([&]() {
         initialize_renderer(scene_path, output_dir_path, scene_data_path,
-                cpu_threadpool_size, use_gpu, !no_optix);
+                cpu_threadpool_size, use_gpu, !no_hardware_ray_tracing);
 
         wt::logger::cout.set_sout_level(sout_verbosity);
         wt::logger::cwarn.set_sout_level(sout_verbosity);
@@ -981,7 +986,7 @@ int main(int argc, char* argv[]) {
 
     cli_renderui.callback([&]() {
         initialize_renderer(scene_path, output_dir_path, scene_data_path,
-                    cpu_threadpool_size, use_gpu, !no_optix);
+                    cpu_threadpool_size, use_gpu, !no_hardware_ray_tracing);
         // disable progress bars. GUI provides its own bars.
         initialize_logs(filelog_verbosity, true);
         

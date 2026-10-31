@@ -10,7 +10,7 @@
 #pragma once
 
 /*
- * Interface between wave_tracer and its GPU backends (CUDA/OptiX, later Metal).
+ * Interface between wave_tracer and its GPU backends (CUDA/OptiX, Metal).
  *
  * This header is C++17 and depends only on the standard library and the shared
  * kernel types (wt/gpu/kernel/), so backend sources compiled by GPU compilers
@@ -25,6 +25,7 @@
 #include <vector>
 
 #include <wt/gpu/kernel/bvh.hpp>
+#include <wt/gpu/kernel/queries.hpp>
 #include <wt/gpu/kernel/scene.hpp>
 
 namespace wt::gpu {
@@ -35,23 +36,9 @@ struct bvh_arrays_t {
     std::vector<compute_kernel::bvh_tri>  tris;
 };
 
-struct ray_query_t {
-    compute_kernel::ray ray;
-    compute_kernel::range range;
-};
-
-struct cone_query_t {
-    compute_kernel::cone cone;
-    compute_kernel::range range;
-    /** @brief Triangles are collected this many cross-section major axes past the closest hit. */
-    compute_kernel::real z_scale;
-};
-
-/** @brief Result of a ball query. */
-struct ball_hit_t {
-    std::uint32_t tri_count;    // may exceed the capacity the query was run with
-    std::uint32_t status;
-};
+using ray_query_t  = compute_kernel::ray_query;
+using cone_query_t = compute_kernel::cone_query;
+using ball_hit_t   = compute_kernel::ball_hit;
 
 /**
  * @brief A scene compiled for plt_path or plt_bdpt rendering of one sensor
@@ -175,6 +162,16 @@ public:
  *        Throws std::runtime_error if the device or OptiX is unavailable.
  */
 [[nodiscard]] std::unique_ptr<backend_t> create_cuda_backend(int ordinal, bool use_optix);
+#endif
+
+#if defined(WT_GPU_METAL)
+/**
+ * @brief Creates the Metal backend on Metal device `ordinal` (Apple M1 or later).
+ *        With `use_hardware_ray_tracing`, ray queries use Metal's ray tracing on
+ *        GPUs that support it. Throws std::runtime_error if the device is
+ *        unavailable or unsupported.
+ */
+[[nodiscard]] std::unique_ptr<backend_t> create_metal_backend(int ordinal, bool use_hardware_ray_tracing);
 #endif
 
 }
