@@ -268,6 +268,98 @@ struct fsd_sample_t {
     real weight;
 };
 
+/** @brief A try of the ASF's rejection sampling: a point, its ASF (`f`), and whether it is accepted. */
+struct fsd_try_t {
+    vec2 xi;
+    real f;
+    bool accepted;
+};
+
+/**
+ * @brief Try `index` of the rejection sampling of aperture `ap` (of `M>1`
+ *        edges; `sample_rejection`'s loop), with random numbers of its own: of
+ *        the stream of `key` and `index`. Any try can so be made first, by any
+ *        thread.
+ */
+WT_GPU_FN fsd_try_t fsd_try(const WT_GPU_GLOBAL real* lut, const WT_GPU_THREAD fsd_aperture& ap,
+                            const WT_GPU_GLOBAL fsd_edge* edges, u32x4 key, u64 index) {
+    rng rnd = rng::for_path(key.x, key.y + u32(index), key.z ^ u32(index>>32));
+    const vec2 x = fsd_sample_lobe(lut, ap, edges, rnd);
+    const fsd_densities_t d = fsd_densities(ap, edges, x);
+    return { x, d.f, rnd.r()*d.g < d.f*(real(1)/real(ap.count)) };
+}
+
+#if defined(__CUDA_ARCH__)
+/** @brief `v` of lane `src` of the warp's lanes `mask`, a 32-bit word at a time. */
+template <typename T>
+__device__ T shuffle_words(unsigned mask, const T& v, int src) {
+    static_assert(sizeof(T)%sizeof(u32)==0);
+    u32 w[sizeof(T)/sizeof(u32)];
+    memcpy(w, &v, sizeof(T));
+    for (auto& x : w)
+        x = __shfl_sync(mask, x, src);
+    T r;
+    memcpy(&r, w, sizeof(T));
+    return r;
+}
+#endif
+
+/** @brief Tries of a sample that a lane makes alone before its warp helps (see `fsd_first_accepted`). */
+constexpr u64 fsd_solo_tries = 16;
+
+/**
+ * @brief The first accepted of the `max_tries` tries (`fsd_try`, of stream
+ *        `key`) of rejection sampling aperture `ap`; its ASF is 0 if none is.
+ *
+ *        A sample may take hundreds of tries, in which a warp's lanes that
+ *        sample at once would otherwise wait for the one taking the most: on
+ *        CUDA, after `fsd_solo_tries` alone, they take each one's remaining
+ *        tries together instead, a try per lane.
+ */
+WT_GPU_FN fsd_try_t fsd_first_accepted(const WT_GPU_GLOBAL real* lut, const WT_GPU_THREAD fsd_aperture& ap,
+                                       const WT_GPU_GLOBAL fsd_edge* edges, u32x4 key, u64 max_tries) {
+    fsd_try_t first = { { 0,0 }, 0, false };
+#if defined(__CUDA_ARCH__)
+    const unsigned team = __activemask();
+    // the first tries alone: likely samples take few
+    const u64 solo = max_tries<fsd_solo_tries ? max_tries : fsd_solo_tries;
+    for (u64 tr=0; tr<solo && !first.accepted; ++tr)
+        first = fsd_try(lut, ap, edges, key, tr);
+
+    const unsigned lane = threadIdx.x % 32;
+    const u32 size = __popc(team);
+    const u32 rank = __popc(team & ((1u<<lane)-1));
+    for (unsigned pending=__ballot_sync(team, !first.accepted); pending!=0; pending &= pending-1) {
+        // the tries of lane `owner`'s sample
+        const int owner = __ffs(pending)-1;
+        const fsd_aperture oap = shuffle_words(team, ap, owner);
+        const auto oedges = shuffle_words(team, edges, owner);
+        const u32x4 okey = shuffle_words(team, key, owner);
+        const u64 otries = shuffle_words(team, max_tries, owner);
+        for (u64 base=fsd_solo_tries; base<otries; base+=size) {
+            fsd_try_t t = { { 0,0 }, 0, false };
+            if (base+rank<otries)
+                t = fsd_try(lut, oap, oedges, okey, base+rank);
+            // the first accepted: of the lowest rank, the lowest lane
+            const unsigned accepted = __ballot_sync(team, t.accepted);
+            if (accepted!=0) {
+                const fsd_try_t a = shuffle_words(team, t, __ffs(accepted)-1);
+                if (int(lane)==owner)
+                    first = a;
+                break;
+            }
+        }
+    }
+#else
+    for (u64 tr=0; tr<max_tries; ++tr) {
+        first = fsd_try(lut, ap, edges, key, tr);
+        if (first.accepted)
+            break;
+    }
+#endif
+    return first.accepted ? first : fsd_try_t{ { 0,0 }, 0, false };
+}
+
 /**
  * @brief `free_space_diffraction_t::sample`: samples the ASF by rejection
  *        (`sample_rejection`; an aperture of one edge, which the lookup
@@ -277,21 +369,19 @@ WT_GPU_FN fsd_sample_t fsd_sample(const WT_GPU_GLOBAL real* lut, const WT_GPU_TH
                                   const WT_GPU_GLOBAL fsd_edge* edges, real k, WT_GPU_THREAD rng& rnd) {
     const fsd_sample_t none = { { 0,0,1 }, 0, 0 };
 
-    const u32 M = ap.count;
-    const bool rejection = M>1;
-    const u64 max_tries = u64(M)*1024;
-    const real recp_M = real(1)/real(M);
-    vec2 xi = { 0,0 };
-    real pdf = 0;
-    for (u64 tr=0; tr<max_tries; ++tr) {
-        const vec2 x = fsd_sample_lobe(lut, ap, edges, rnd);
-        const fsd_densities_t d = fsd_densities(ap, edges, x);
-        if (!rejection || rnd.r()*d.g < d.f*recp_M) {
-            xi = x;
-            pdf = d.f * ap.recp_I;
-            break;
-        }
+    if (ap.count==0)
+        return none;
+    vec2 xi;
+    real f;
+    if (ap.count>1) {
+        const fsd_try_t t = fsd_first_accepted(lut, ap, edges, rnd.next(), u64(ap.count)*1024);
+        xi = t.xi;
+        f = t.f;
+    } else {
+        xi = fsd_sample_lobe(lut, ap, edges, rnd);
+        f = fsd_densities(ap, edges, xi).f;
     }
+    const real pdf = f * ap.recp_I;
     if (!(pdf>real(0)))
         return none;
 
