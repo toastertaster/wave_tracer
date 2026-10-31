@@ -52,6 +52,8 @@ Renders a scene file. Usage:
                               concurrency)
 -D, --define <NAME=VALUE>       define variables (used as "$variable" in the scene file)
 --ray-tracing                 forces ray tracing only
+--gpu                         render on the GPU (experimental; needs a build with ``GPU_CUDA``),
+                              see :doc:`gpu/gpu`
 --mesh_scale TEXT
                               default scale to apply to imported positions of external meshes;
                               can be overridden per shape in the scene file.
@@ -128,6 +130,8 @@ Renders a scene file using a graphical user interface. Usage:
                               concurrency)
 -D, --define <NAME=VALUE>       define variables (used as "$variable" in the scene file)
 --ray-tracing                 forces ray tracing only
+--gpu                         render on the GPU (experimental; needs a build with ``GPU_CUDA``),
+                              see :doc:`gpu/gpu`
 --mesh_scale TEXT
                               default scale to apply to imported positions of external meshes;
                               can be overridden per shape in the scene file.

@@ -20,8 +20,8 @@
  *     free-space diffraction, or ray tracing);
  *   - the plt_bdpt integrator (beams, with its Fraunhofer free-space
  *     diffraction, or ray tracing);
- *   - virtual_plane (coverage) sensors, and perspective sensors (but with
- *     forward plt_path), polarimetric or not, of any response: paths draw
+ *   - virtual_plane (coverage) sensors, and perspective sensors (but not
+ *     with forward plt_path), polarimetric or not, of any response: paths draw
  *     wavenumbers as the CPU's do (see `spectral_tables_t`);
  *   - point, spot and directional emitters, and area emitters of a constant
  *     radiance;
