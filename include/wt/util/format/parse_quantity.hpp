@@ -9,7 +9,10 @@
 
 #pragma once
 
+#include <charconv>
+#include <istream>
 #include <string>
+#include <system_error>
 
 #include <wt/math/common.hpp>
 #include <wt/math/quantity/defs.hpp>
@@ -22,6 +25,62 @@
 namespace wt {
 
 namespace detail {
+/**
+ * @brief Reads a decimal number from `ss`, consuming its characters only, so
+ *        that the unit that follows remains. (`ss >> val` would not do:
+ *        libc++ consumes every character that may appear in a hexadecimal
+ *        float, and so fails on "3.3cm", reading "3.3c".) An exponent is
+ *        read only if digits follow its `e`, which may begin a unit.
+ */
+inline bool read_number(std::istream &ss, f_t& val) {
+    std::string number;
+    const auto is_digit = [](int c) { return c>='0' && c<='9'; };
+    const auto read_digits = [&]() {
+        bool any = false;
+        while (is_digit(ss.peek())) {
+            number += char(ss.get());
+            any = true;
+        }
+        return any;
+    };
+
+    if (ss.peek()=='-')
+        number += char(ss.get());
+    else if (ss.peek()=='+')
+        ss.ignore();    // (from_chars does not take it)
+    bool digits = read_digits();
+    if (ss.peek()=='.') {
+        number += char(ss.get());
+        digits = read_digits() || digits;
+    }
+    if (!digits) {
+        ss.setstate(std::ios::failbit);
+        return false;
+    }
+
+    if (ss.peek()=='e' || ss.peek()=='E') {
+        std::string exponent{ char(ss.get()) };
+        if (ss.peek()=='+' || ss.peek()=='-')
+            exponent += char(ss.get());
+        if (is_digit(ss.peek())) {
+            number += exponent;
+            read_digits();
+        } else {
+            // not an exponent: leave its characters to the unit
+            for (auto i=exponent.size(); i>0; --i)
+                ss.unget();
+        }
+    }
+
+    const auto* end = number.data()+number.size();
+    const auto [ptr, ec] = std::from_chars(number.data(), end, val);
+    if (ec!=std::errc{} || ptr!=end) {
+        ss.setstate(std::ios::failbit);
+        return false;
+    }
+    return true;
+}
+
 inline bool parse_expression(std::istream &ss, f_t& val) {
     while (!!ss && std::isspace(ss.peek())) { ss.ignore(); }
     if (ss.peek()=='(') {
@@ -40,7 +99,7 @@ inline bool parse_expression(std::istream &ss, f_t& val) {
         assert(p==0);
     }
     else {
-        if (!(ss >> val))
+        if (!read_number(ss, val))
             return false;
     }
 
