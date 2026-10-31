@@ -997,6 +997,10 @@ int main(int argc, char* argv[]) {
         return cli.exit(e);
     }
 
+    // the GPU (its context) must close before exit: the CUDA runtime, linked statically, shuts down before
+    // globals are destroyed
+    context.gpu_device = nullptr;
+    gpu_device.reset();
 
     return terminate_program ? -1 : 0;
 }
