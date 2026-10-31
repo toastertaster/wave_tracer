@@ -392,62 +392,27 @@ __global__ void __launch_bounds__(block_size, 4) step_paths_kernel(k::plt_scene 
 }
 
 /**
- * @brief Traces `count` whole paths (see `start_path`), one per thread, path
- *        `i` with the scratch memory of slot `i`. For ray tracing, whose steps
- *        are cheap: moving path states between launches would take longer
- *        than the steps.
- */
-template <bool P>
-__global__ void __launch_bounds__(block_size, 3) run_paths_kernel(k::plt_scene scene, path_pool_t pool,
-                                        std::uint64_t base, k::u32 count, const path_entry_t* list,
-                                        std::uint32_t seed, k::u32 table, cuda_film_t film,
-                                        step_counters_t* counters, path_entry_t* overflow,
-                                        std::uint32_t* status) {
-    const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
-    if (i>=count) return;
-
-    pool.paths_started(table, count);
-    k::path_state_t<P> p = start_path<P>(scene, base, i, list, seed, table);
-    const cuda_bvh_geometry_t geometry = { scene.bvh };
-
-    k::u32 s = k::status_ok;
-    while (k::step_path(scene, geometry, film, pool.scratch(i), p, s)) {}
-
-    end_path(scene, film, pool, p, s, counters, overflow);
-    if (s!=k::status_ok)
-        atomicOr(status, s);
-}
-
-/**
- * @brief Traces `count` whole plt_bdpt paths (see `k::trace_bdpt_path`), with
- *        persistent warps: a warp takes the next paths, as many as it has
- *        lanes with slots (of `slots`; the counter `counters->taken` starts at
- *        0), once all of them finished their last. A lane traces paths with
- *        the vertices and scratch memory of the slot of its thread index,
- *        splatting into `film` and its light image `light`. Paths that outgrow
- *        them, which splat nothing, are listed in `overflow`.
+ * @brief Persistent warps, for kernels of whole paths: a warp takes the next
+ *        of `count` paths, as many as it has lanes with slots (of `slots`;
+ *        the counter `counters->taken` starts at 0), once all of them finished
+ *        their last. A lane traces path `i` with the memory of the slot of its
+ *        thread index, `trace(slot, i)`. The launch has whole warps.
  *
- *        A launch of a thread per path, or a wavefront of steps (as plt_path's),
- *        would idle at each launch's end, until its longest path, or step,
- *        finished: paths' work varies greatly (their lengths, diffusive
+ *        A launch of a thread per path, or a wavefront of steps (as plt_path's
+ *        beams), would idle at each launch's end, until its longest path, or
+ *        step, finished: paths' work varies greatly (their lengths, diffusive
  *        traversals, free-space diffractions' rejection sampling). A warp
  *        takes its paths together, so that its lanes trace neighbouring
  *        paths in step, as a launch's would.
  */
-template <bool P>
-__global__ void __launch_bounds__(block_size, 2) run_bdpt_paths_kernel(k::plt_scene scene, path_pool_t pool,
-                                        k::u32 slots, std::uint64_t base, k::u32 count, const path_entry_t* list,
-                                        std::uint32_t seed, k::u32 table, cuda_film_t film, cuda_film_t light,
-                                        step_counters_t* counters, path_entry_t* overflow,
-                                        std::uint32_t* status) {
+template <typename F>
+__device__ void take_paths(k::u32 slots, k::u32 count, step_counters_t* counters, F&& trace) {
     const k::u32 slot = blockIdx.x*blockDim.x + threadIdx.x;
     const k::u32 lane = threadIdx.x % 32;
     // the warp's lanes with slots are its first `lanes`
     const k::u32 lanes = __popc(__ballot_sync(~0u, slot<slots));
     if (lanes==0) return;
 
-    pool.paths_started(table, count);
-    const cuda_bvh_geometry_t geometry = { scene.bvh };
     for (;;) {
         k::u32 first = 0;
         if (lane==0)
@@ -457,24 +422,67 @@ __global__ void __launch_bounds__(block_size, 2) run_bdpt_paths_kernel(k::plt_sc
             return;
 
         const k::u32 i = first + lane;
-        if (lane<lanes && i<count) {
-            const path_entry_t e = path_entry(base, i, list, seed);
-            k::u32 s = k::status_ok;
-            const k::u32 spectral = k::trace_bdpt_path(scene, geometry, film, light, pool.scratch(slot),
-                                                       pool.sensor_verts<P>(slot), pool.emitter_verts(slot),
-                                                       pool.vertex_capacity, pool.apertures(slot),
-                                                       pool.aperture_capacity, path_rng(e), e.path, table,
-                                                       e.spectral, s);
-            if (s & k::status_scratch_overflow) {
-                overflow[atomicAdd(&counters->overflowed, 1u)] = { e.path, 0, e.seed, spectral };
-                s &= ~k::status_scratch_overflow;
-            }
-            pool.path_ended(spectral);
-            if (s!=k::status_ok)
-                atomicOr(status, s);
-        }
+        if (lane<lanes && i<count)
+            trace(slot, i);
         __syncwarp();
     }
+}
+
+/**
+ * @brief Traces `count` whole paths (see `start_path`), by persistent warps
+ *        (`take_paths`), with the scratch memory of `slots` slots. For ray
+ *        tracing, whose steps are cheap: moving path states between launches
+ *        would take longer than the steps.
+ */
+template <bool P>
+__global__ void __launch_bounds__(block_size, 3) run_paths_kernel(k::plt_scene scene, path_pool_t pool,
+                                        k::u32 slots, std::uint64_t base, k::u32 count, const path_entry_t* list,
+                                        std::uint32_t seed, k::u32 table, cuda_film_t film,
+                                        step_counters_t* counters, path_entry_t* overflow,
+                                        std::uint32_t* status) {
+    pool.paths_started(table, count);
+    const cuda_bvh_geometry_t geometry = { scene.bvh };
+    take_paths(slots, count, counters, [&](k::u32 slot, k::u32 i) {
+        k::path_state_t<P> p = start_path<P>(scene, base, i, list, seed, table);
+        k::u32 s = k::status_ok;
+        while (k::step_path(scene, geometry, film, pool.scratch(slot), p, s)) {}
+
+        end_path(scene, film, pool, p, s, counters, overflow);
+        if (s!=k::status_ok)
+            atomicOr(status, s);
+    });
+}
+
+/**
+ * @brief Traces `count` whole plt_bdpt paths (see `k::trace_bdpt_path`), by
+ *        persistent warps (`take_paths`), with the vertices and scratch memory
+ *        of `slots` slots, splatting into `film` and its light image `light`.
+ *        Paths that outgrow them, which splat nothing, are listed in `overflow`.
+ */
+template <bool P>
+__global__ void __launch_bounds__(block_size, 2) run_bdpt_paths_kernel(k::plt_scene scene, path_pool_t pool,
+                                        k::u32 slots, std::uint64_t base, k::u32 count, const path_entry_t* list,
+                                        std::uint32_t seed, k::u32 table, cuda_film_t film, cuda_film_t light,
+                                        step_counters_t* counters, path_entry_t* overflow,
+                                        std::uint32_t* status) {
+    pool.paths_started(table, count);
+    const cuda_bvh_geometry_t geometry = { scene.bvh };
+    take_paths(slots, count, counters, [&](k::u32 slot, k::u32 i) {
+        const path_entry_t e = path_entry(base, i, list, seed);
+        k::u32 s = k::status_ok;
+        const k::u32 spectral = k::trace_bdpt_path(scene, geometry, film, light, pool.scratch(slot),
+                                                   pool.sensor_verts<P>(slot), pool.emitter_verts(slot),
+                                                   pool.vertex_capacity, pool.apertures(slot),
+                                                   pool.aperture_capacity, path_rng(e), e.path, table,
+                                                   e.spectral, s);
+        if (s & k::status_scratch_overflow) {
+            overflow[atomicAdd(&counters->overflowed, 1u)] = { e.path, 0, e.seed, spectral };
+            s &= ~k::status_scratch_overflow;
+        }
+        pool.path_ended(spectral);
+        if (s!=k::status_ok)
+            atomicOr(status, s);
+    });
 }
 
 /**
@@ -483,12 +491,12 @@ __global__ void __launch_bounds__(block_size, 2) run_bdpt_paths_kernel(k::plt_sc
  *        paths end after a step or two), with the traversals in a kernel of
  *        their own. Ended paths' slots are refilled with new paths. Paths in
  *        flight carry over from one `trace` to the next, so that the GPU does
- *        not idle while a pass's last, longest, paths finish. Ray-traced
- *        paths, whose steps are cheap, run whole, one per thread.
+ *        not idle while a pass's last, longest, paths finish.
  *
- *        plt_bdpt paths run whole, in launches of persistent warps (see
- *        `run_bdpt_paths_kernel`), a slot of the pool for each thread the GPU
- *        runs at once (or as many as their vertices' memory allows).
+ *        Ray-traced paths, whose steps are cheap, and plt_bdpt paths run
+ *        whole, in launches of persistent warps (see `take_paths`), with a
+ *        slot of the pool for each thread the GPU runs at once (plt_bdpt: or
+ *        as many as their vertices' memory allows).
  */
 class cuda_plt_renderer_t final : public backend_renderer_t {
 public:
@@ -498,17 +506,20 @@ public:
           table_size(scene.emitter_count*scene.samples_per_emitter)
     {
         set_device(ordinal);
-        if (scene.params.bdpt!=0) {
-            // the threads of persistent warps the GPU runs at once
+        if (scene.params.bdpt!=0 || scene.params.ray_tracing_only!=0) {
+            // whole paths (`whole_paths`): the threads of persistent warps the GPU runs at once
             int multiprocessors = 0, blocks = 0;
             check(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, ordinal),
                   "querying the CUDA device");
-            dispatch([&](auto P) {
-                check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, run_bdpt_paths_kernel<P.value>,
-                                                                    block_size, 0),
+            const auto occupancy = [&](auto kernel) {
+                check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, block_size, 0),
                       "querying the path kernel's occupancy");
+            };
+            dispatch([&](auto P) {
+                if (scene.params.bdpt!=0) occupancy(run_bdpt_paths_kernel<P.value>);
+                else                      occupancy(run_paths_kernel<P.value>);
             });
-            bdpt_threads = k::u32(std::max(1, multiprocessors*blocks)) * block_size;
+            whole_path_threads = k::u32(std::max(1, multiprocessors*blocks)) * block_size;
         }
         tris.upload(scene.tris.data(), scene.tris.size());
         edges.upload(scene.edges.data(), scene.edges.size());
@@ -660,8 +671,8 @@ private:
     static constexpr k::u32 initial_aperture_capacity = 256;
     /** @brief plt_bdpt: memory for paths in flight, which bounds their count. */
     static constexpr std::size_t bdpt_pool_bytes = std::size_t(512)<<20;
-    /** @brief plt_bdpt: paths a launch traces at most (its list of overflowed paths holds as many). */
-    static constexpr k::u32 bdpt_launch_paths = 1u<<20;
+    /** @brief Whole paths a launch traces at most (its list of overflowed paths holds as many). */
+    static constexpr k::u32 launch_paths = 1u<<20;
     /** @brief Paths in flight few enough to finish in one launch, rather than a launch per step. */
     static constexpr k::u32 tail_size = 1024;
     /**
@@ -693,6 +704,11 @@ private:
         spectral_table_t table;
     };
 
+    /** @brief Whether paths run whole, by persistent warps (ray tracing, plt_bdpt), or as a wavefront. */
+    [[nodiscard]] bool whole_paths() const noexcept {
+        return params.params.bdpt!=0 || params.params.ray_tracing_only!=0;
+    }
+
     /** @brief plt_bdpt: the vertices a subpath holds, at `capacity`; at most as many as it makes. */
     [[nodiscard]] k::u32 vertex_capacity(k::u32 capacity) const noexcept {
         const auto max_vertices = std::uint64_t(params.params.max_depth) + 2;
@@ -706,8 +722,8 @@ private:
     /**
      * @brief Starts an empty pool of paths with `capacity` scratch triangles
      *        and edges each: as many as the main pool has scratch memory for
-     *        (plt_bdpt: as many as `bdpt_threads`, or as `bdpt_pool_bytes`
-     *        holds).
+     *        (plt_bdpt: as many as `whole_path_threads`, or as
+     *        `bdpt_pool_bytes` holds).
      */
     void begin(wavefront_t& wf, k::u32 capacity) {
         if (params.params.bdpt!=0) {
@@ -720,13 +736,24 @@ private:
             const std::size_t slot_size =
                 vertices*(sensor_vertex_size + sizeof(k::bdpt_vertex<false>)) + (capacity+edges)*sizeof(k::u32) +
                 apertures*sizeof(k::fraunhofer::fsd_edge);
-            const auto slots = k::u32(std::clamp<std::size_t>(bdpt_pool_bytes/slot_size, 1, bdpt_threads));
+            const auto slots = k::u32(std::clamp<std::size_t>(bdpt_pool_bytes/slot_size, 1, whole_path_threads));
             sensor_vertices.resize(std::size_t(slots)*vertices*sensor_vertex_size/sizeof(uint4));
             emitter_vertices.resize(std::size_t(slots)*vertices);
             scratch_tris.resize(std::size_t(slots)*capacity);
             scratch_edges.resize(std::size_t(slots)*edges);
             aperture_edges.resize(std::size_t(slots)*apertures);
-            overflow.resize(bdpt_launch_paths);
+            overflow.resize(launch_paths);
+            wf = { slots, capacity, 0, slots, 0 };
+            return;
+        }
+        if (params.params.ray_tracing_only!=0) {
+            // whole paths need only their scratch memory
+            const auto slots = k::u32(std::clamp<std::size_t>(std::size_t(pool_size)*initial_capacity/capacity,
+                                                              1, whole_path_threads));
+            scratch_tris.resize(std::size_t(slots)*capacity);
+            scratch_edges.resize(std::size_t(slots)*3*capacity);
+            scratch_aperture.resize(std::size_t(slots)*capacity);
+            overflow.resize(launch_paths);
             wf = { slots, capacity, 0, slots, 0 };
             return;
         }
@@ -806,33 +833,21 @@ private:
     void advance(wavefront_t& wf, path_source_t& source, std::uint32_t seed, k::u32 table, k::u32 keep,
                  bool count_table_paths = true) {
         const path_pool_t pool = this->pool(wf, count_table_paths);
-        if (params.params.bdpt!=0) {
-            // whole paths, by persistent warps, a thread per slot (nothing remains in flight)
+        if (whole_paths()) {
+            // by persistent warps, a thread per slot (nothing remains in flight)
             while (source.started<source.count) {
-                const auto n = k::u32(std::min<std::uint64_t>(bdpt_launch_paths, source.count-source.started));
+                const auto n = k::u32(std::min<std::uint64_t>(launch_paths, source.count-source.started));
                 const auto base = source.list ? source.started : source.first+source.started;
                 check(cudaMemset(counters.get(), 0, sizeof(step_counters_t)), "clearing the step counters");
                 dispatch([&](auto P) {
-                    run_bdpt_paths_kernel<P.value><<<grid_size(wf.slots), block_size>>>(
-                            params, pool, wf.slots, base, n, source.list, seed, table, film_view(), light_view(),
-                            counters.get(), overflow.get(), status_word.get());
-                });
-                check(cudaGetLastError(), "launching the path kernel");
-                source.started += n;
-                collect_overflowed();
-            }
-            return;
-        }
-        if (params.params.ray_tracing_only!=0) {
-            // whole paths, a pool's worth per launch (nothing remains in flight)
-            while (source.started<source.count) {
-                const auto n = k::u32(std::min<std::uint64_t>(wf.slots, source.count-source.started));
-                const auto base = source.list ? source.started : source.first+source.started;
-                check(cudaMemset(counters.get(), 0, sizeof(step_counters_t)), "clearing the step counters");
-                dispatch([&](auto P) {
-                    run_paths_kernel<P.value><<<grid_size(n), block_size>>>(
-                            params, pool, base, n, source.list, seed, table, film_view(),
-                            counters.get(), overflow.get(), status_word.get());
+                    if (params.params.bdpt!=0)
+                        run_bdpt_paths_kernel<P.value><<<grid_size(wf.slots), block_size>>>(
+                                params, pool, wf.slots, base, n, source.list, seed, table, film_view(),
+                                light_view(), counters.get(), overflow.get(), status_word.get());
+                    else
+                        run_paths_kernel<P.value><<<grid_size(wf.slots), block_size>>>(
+                                params, pool, wf.slots, base, n, source.list, seed, table, film_view(),
+                                counters.get(), overflow.get(), status_word.get());
                 });
                 check(cudaGetLastError(), "launching the path kernel");
                 source.started += n;
@@ -949,7 +964,7 @@ private:
     int ordinal;
     k::plt_scene params;
     bool polarimetric;                  // the sensor's: paths are `k::path_state_t<polarimetric>`
-    k::u32 bdpt_threads = 0;            // plt_bdpt: the threads of `run_bdpt_paths_kernel` the GPU runs at once
+    k::u32 whole_path_threads = 0;      // `whole_paths`: the threads of their kernel the GPU runs at once
 
     device_buffer_t<k::tri_shading>   tris;
     device_buffer_t<k::edge>          edges;
