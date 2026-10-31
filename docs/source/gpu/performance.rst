@@ -202,6 +202,12 @@ With beams:
      - 1.2 s
      - 2.5 s
      - 464 ms
+   * - ``veach_mis``
+     - res=480 spp=64
+     - 1.9 s
+     - 1.9 s
+     - 5.6 s
+     - 779 ms
    * - ``sionna_etoile`` (coverage)
      - res=512 spp=64
      - 4.5 s
@@ -214,6 +220,12 @@ With beams:
      - 15.2 s
      - 7.3 s
      - 12.6 s
+   * - ``bidir_room`` (plt_bdpt)
+     - res=96 spp=4
+     - 11.0 s
+     - 10.6 s
+     - 339 ms
+     - 8.45 s
 
 In ray-tracing mode (``--ray-tracing``), with the scenes' triangle counts:
 
@@ -291,6 +303,13 @@ In ray-tracing mode (``--ray-tracing``), with the scenes' triangle counts:
      - 103 ms
      - 554 ms
      - 45 ms
+   * - ``veach_mis``
+     - res=480 spp=64
+     - 3892
+     - 307 ms
+     - 521 ms
+     - 2.3 s
+     - 140 ms
    * - ``sionna_etoile`` (coverage)
      - res=512 spp=64
      - 13058
@@ -305,11 +324,17 @@ In ray-tracing mode (``--ray-tracing``), with the scenes' triangle counts:
      - 63 ms
      - 116 ms
      - 33 ms
+   * - ``bidir_room`` (plt_bdpt)
+     - res=96 spp=4
+     - 246244
+     - 21 ms
+     - 23 ms
+     - 24 ms
+     - 16 ms
 
 * **plt_path renders 1.7 to 4 times faster with beams, and 3 to 7 times faster with rays, on the M4's GPU than on its CPU**, and 2 to 4.5 times slower than on the GB10, a GPU with several times the M4's 32-bit floating-point throughput.
-* **Hardware ray tracing pays off with geometry**: ray-traced renders of the scenes of a thousand triangles or more take 25% to 50% less time with it (``box``: 323 ms to 159 ms; ``sionna_etoile``: 225 ms to 148 ms; ``sphere_polarization``: 63 ms to 41 ms), and ``glass_box`` and ``sionna_etoile`` with beams 15% to 20% less. On the test scenes of a few dozen triangles, whose BVH is a leaf or two, the ported traversal takes up to 16% less time; and beams, whose cone queries always traverse the BVH, gain less.
-* **plt_bdpt with beams is slower on the GPU than on the CPU** in ``sphere_polarization``. Its first pass takes about 2 s; the rest is spent re-tracing the paths that overflow their scratch memory (see :doc:`design`), whose beams overlap thousands of triangles and edges: a few hundred such paths, each traced by a single GPU thread, far slower than a CPU core. The GB10 spends most of its 12.6 s on them too.
-* ``veach_mis`` and ``bidir_room`` are missing: on macOS, their lengths in centimetres do not parse (libc++ reads the ``c`` of ``cm`` as part of the number).
+* **Hardware ray tracing pays off with geometry**: ray-traced renders of the scenes of a thousand triangles or more take 25% to 50% less time with it (``box``: 323 ms to 159 ms; ``veach_mis``: 521 ms to 307 ms; ``sionna_etoile``: 225 ms to 148 ms; ``sphere_polarization``: 63 ms to 41 ms; ``bidir_room``'s 21 ms, mostly a pass's fixed cost, only 9%), and ``glass_box`` and ``sionna_etoile`` with beams 15% to 20% less. On the test scenes of a few dozen triangles, whose BVH is a leaf or two, the ported traversal takes up to 16% less time; and beams, whose cone queries always traverse the BVH, gain less.
+* **plt_bdpt with beams is slower on the GPU than on the CPU**: ``sphere_polarization`` takes twice as long, and ``bidir_room`` thirty times. In ``sphere_polarization``, the first pass takes about 2 s; the rest is spent re-tracing the paths that overflow their scratch memory (see :doc:`design`), whose beams overlap thousands of triangles and edges: a few hundred such paths, each traced by a single GPU thread, far slower than a CPU core. The GB10 spends most of its 12.6 s on them too.
 
 What was measured, and decided, while tuning the Metal backend:
 
