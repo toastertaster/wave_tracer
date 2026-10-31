@@ -23,9 +23,9 @@
  * Host code builds these arrays from a bvh8w_t (`flatten` in src/gpu/gpu.cpp).
  */
 
-namespace wt::gpu::kernel {
+namespace wt { namespace gpu { namespace compute_kernel {
 
-constexpr int bvh_width = 8;
+WT_GPU_CONSTANT constexpr int bvh_width = 8;
 
 /**
  * @brief Internal node: 8 child boxes (SoA) and child pointers. Aligned, so
@@ -52,13 +52,13 @@ struct bvh_view {
     const WT_GPU_GLOBAL bvh_tri*  tris;
 };
 
-constexpr i32 bvh_root_ptr = 1;
+WT_GPU_CONSTANT constexpr i32 bvh_root_ptr = 1;
 
 /** @brief Bits of a leaf pointer for its triangle count, less 1 (the rest hold its first triangle). */
-constexpr u32 bvh_leaf_count_bits = 4;
-constexpr u32 bvh_max_leaf_count = 1u<<bvh_leaf_count_bits;
+WT_GPU_CONSTANT constexpr u32 bvh_leaf_count_bits = 4;
+WT_GPU_CONSTANT constexpr u32 bvh_max_leaf_count = 1u<<bvh_leaf_count_bits;
 /** @brief Leaf pointers address triangles below this. */
-constexpr u32 bvh_max_leaf_tris_ptr = 1u<<(31-bvh_leaf_count_bits);
+WT_GPU_CONSTANT constexpr u32 bvh_max_leaf_tris_ptr = 1u<<(31-bvh_leaf_count_bits);
 
 /** @brief The child pointer of a leaf of `count` (1 to `bvh_max_leaf_count`) triangles from `tris_ptr` (below `bvh_max_leaf_tris_ptr`). */
 WT_GPU_FN i32 bvh_leaf_ptr(u32 tris_ptr, u32 count) {
@@ -76,7 +76,7 @@ struct bvh_child_quad {
     i32 ptr[4];
 };
 
-constexpr int bvh_quads = bvh_width/4;
+WT_GPU_CONSTANT constexpr int bvh_quads = bvh_width/4;
 
 /** @brief Loads `p[0..3]` (16-byte aligned) with vector loads. */
 template <typename T>
@@ -121,11 +121,11 @@ WT_GPU_FN bvh_child_quad bvh_load_children(const WT_GPU_GLOBAL bvh_node& n, int 
 }
 
 /** @brief Nodes with at most this many triangles are tested as one leaf by ray and ball queries. */
-constexpr u32 bvh_treat_node_as_leaf_if_triangle_count_le = 16;
+WT_GPU_CONSTANT constexpr u32 bvh_treat_node_as_leaf_if_triangle_count_le = 16;
 
 /** @brief Query status flags. */
-constexpr u32 status_ok = 0;
-constexpr u32 status_stack_overflow = 1;
+WT_GPU_CONSTANT constexpr u32 status_ok = 0;
+WT_GPU_CONSTANT constexpr u32 status_stack_overflow = 1;
 
 struct stack_entry {
     real min_range;
@@ -157,7 +157,7 @@ struct ray_hit {
     u32 status;
 };
 
-constexpr int ray_stack_size = 64;
+WT_GPU_CONSTANT constexpr int ray_stack_size = 64;
 
 namespace detail {
 
@@ -288,7 +288,7 @@ struct cone_hit {
     u32 status;
 };
 
-constexpr int cone_stack_size = 128;
+WT_GPU_CONSTANT constexpr int cone_stack_size = 128;
 
 namespace detail {
 
@@ -383,7 +383,7 @@ WT_GPU_FN cone_hit intersect_cone(bvh_view bvh, cone cn, range rng, real z_scale
     return rec;
 }
 
-constexpr int ball_stack_size = 128;
+WT_GPU_CONSTANT constexpr int ball_stack_size = 128;
 
 namespace detail {
 
@@ -435,4 +435,4 @@ WT_GPU_FN u32 intersect_ball(bvh_view bvh, ball bl, WT_GPU_THREAD tri_sink& sink
     return status_ok;
 }
 
-}
+} } }

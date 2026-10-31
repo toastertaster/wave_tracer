@@ -35,7 +35,7 @@
 
 using namespace wt::gpu;
 using namespace wt::gpu::cuda;
-namespace k = wt::gpu::kernel;
+namespace k = wt::gpu::compute_kernel;
 
 namespace {
 

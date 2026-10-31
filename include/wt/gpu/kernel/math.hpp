@@ -24,8 +24,59 @@
  *     need IEEE-conforming arithmetic: never compile kernels with fast math.
  */
 
-namespace wt::gpu::kernel {
+namespace wt { namespace gpu { namespace compute_kernel {
 
+/**
+ * @brief erf(x) in single precision, for Metal, which has no erf: a Taylor series
+ *        for |x| < 0.5, and 1 - erfc(|x|) with Numerical Recipes' erfcc (relative
+ *        error of erfc below 1.2e-7) elsewhere. Against a double-precision erf,
+ *        the error is below 1.6e-7 absolute and 2.9e-7 relative (CUDA's erff:
+ *        about 3e-8 absolute).
+ */
+WT_GPU_FN float erf_approx(float x) {
+    const float t = x<0 ? -x : x;
+    if (t<0.5f) {
+        // erf(x) = 2/sqrt(pi) * sum_n (-1)^n x^(2n+1) / (n! (2n+1))
+        const float s = x*x;
+        float p = -1.f/1320;                    // n = 5: 1/(5! 11)
+        p = p*s + 1.f/216;                      // n = 4
+        p = p*s - 1.f/42;                       // n = 3
+        p = p*s + 1.f/10;                       // n = 2
+        p = p*s - 1.f/3;                        // n = 1
+        p = p*s + 1.f;
+        return 1.1283791670955126f * x * p;
+    }
+    const float u = 1.f / (1.f + .5f*t);
+    const float poly = -1.26551223f + u*(1.00002368f + u*(0.37409196f + u*(0.09678418f +
+                       u*(-0.18628806f + u*(0.27886807f + u*(-1.13520398f + u*(1.48851587f +
+                       u*(-0.82215223f + u*0.17087277f))))))));
+#if defined(__METAL_VERSION__)
+    const float erfc = u * metal::precise::exp(-t*t + poly);
+#else
+    const float erfc = u * expf(-t*t + poly);
+#endif
+    const float r = 1.f - erfc;
+    return x<0 ? -r : r;
+}
+
+#if defined(__METAL_VERSION__)
+// Metal is single precision only. The `precise` variants keep their accuracy
+// regardless of the compiler's fast-math setting.
+WT_GPU_FN float k_sqrt(float x)  { return metal::precise::sqrt(x); }
+WT_GPU_FN float k_fma(float a, float b, float c) { return metal::fma(a,b,c); }
+WT_GPU_FN float k_abs(float x)  { return metal::fabs(x); }
+WT_GPU_FN float k_sin(float x)  { return metal::precise::sin(x); }
+WT_GPU_FN float k_cos(float x)  { return metal::precise::cos(x); }
+WT_GPU_FN float k_erf(float x)  { return erf_approx(x); }
+WT_GPU_FN float k_tan(float x)  { return metal::precise::tan(x); }
+WT_GPU_FN float k_acos(float x)  { return metal::precise::acos(x); }
+WT_GPU_FN float k_atan2(float y, float x)  { return metal::precise::atan2(y,x); }
+WT_GPU_FN float k_exp(float x)  { return metal::precise::exp(x); }
+WT_GPU_FN float k_pow(float x, float y)  { return metal::precise::pow(x,y); }
+WT_GPU_FN float k_log(float x)  { return metal::precise::log(x); }
+WT_GPU_FN float k_floor(float x)  { return metal::floor(x); }
+WT_GPU_FN float k_round(float x)  { return metal::round(x); }
+#else
 WT_GPU_FN float  k_sqrt(float x)  { return sqrtf(x); }
 WT_GPU_FN double k_sqrt(double x) { return sqrt(x); }
 WT_GPU_FN float  k_fma(float a, float b, float c)    { return fmaf(a,b,c); }
@@ -54,6 +105,7 @@ WT_GPU_FN float  k_floor(float x)  { return floorf(x); }
 WT_GPU_FN double k_floor(double x) { return floor(x); }
 WT_GPU_FN float  k_round(float x)  { return roundf(x); }
 WT_GPU_FN double k_round(double x) { return round(x); }
+#endif
 
 /** @brief The float whose bits are `b`. */
 WT_GPU_FN float float_from_bits(u32 b) {
@@ -97,23 +149,23 @@ WT_GPU_FN real mod(real x, real y) { return x - y*floor(x/y); }
 
 /** @brief `limits<f_t>::epsilon()` */
 #if defined(WT_GPU_DBL_PRECISION)
-constexpr real epsilon = 2.220446049250313080847e-16;
+WT_GPU_CONSTANT constexpr real epsilon = 2.220446049250313080847e-16;
 #else
-constexpr real epsilon = 1.1920928955078125e-07f;
+WT_GPU_CONSTANT constexpr real epsilon = 1.1920928955078125e-07f;
 #endif
 
-constexpr real pi = real(3.14159265358979323846);
-constexpr real two_pi = real(6.28318530717958647692);
-constexpr real pi_2 = real(1.57079632679489661923);
-constexpr real pi_4 = real(0.78539816339744830962);
-constexpr real inv_pi = real(0.31830988618379067154);
-constexpr real inv_two_pi = real(0.15915494309189533577);
-constexpr real inv_four_pi = real(0.07957747154594766788);
-constexpr real inv_sqrt_two = real(0.70710678118654752440);
-constexpr real inv_sqrt_two_pi = real(0.39894228040143267794);
-constexpr real sqrt_pi = real(1.77245385090551602730);
-constexpr real inv_sqrt_pi = real(0.56418958354775628695);
-constexpr real sqrt_pi_2 = real(1.25331413731550025121);
+WT_GPU_CONSTANT constexpr real pi = real(3.14159265358979323846);
+WT_GPU_CONSTANT constexpr real two_pi = real(6.28318530717958647692);
+WT_GPU_CONSTANT constexpr real pi_2 = real(1.57079632679489661923);
+WT_GPU_CONSTANT constexpr real pi_4 = real(0.78539816339744830962);
+WT_GPU_CONSTANT constexpr real inv_pi = real(0.31830988618379067154);
+WT_GPU_CONSTANT constexpr real inv_two_pi = real(0.15915494309189533577);
+WT_GPU_CONSTANT constexpr real inv_four_pi = real(0.07957747154594766788);
+WT_GPU_CONSTANT constexpr real inv_sqrt_two = real(0.70710678118654752440);
+WT_GPU_CONSTANT constexpr real inv_sqrt_two_pi = real(0.39894228040143267794);
+WT_GPU_CONSTANT constexpr real sqrt_pi = real(1.77245385090551602730);
+WT_GPU_CONSTANT constexpr real inv_sqrt_pi = real(0.56418958354775628695);
+WT_GPU_CONSTANT constexpr real sqrt_pi_2 = real(1.25331413731550025121);
 
 WT_GPU_FN bool isnan(real x) { return x!=x; }
 WT_GPU_FN bool isfinite(real x) { return abs(x)<inf(); }
@@ -225,4 +277,4 @@ WT_GPU_FN vec2 normalize(vec2 a) { return a / length(a); }
 // glm::sign
 WT_GPU_FN real sign(real x) { return real(real(0)<x) - real(x<real(0)); }
 
-}
+} } }

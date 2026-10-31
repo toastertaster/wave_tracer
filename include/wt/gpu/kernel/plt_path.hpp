@@ -44,18 +44,18 @@
  * its index, the backend re-traces it with more room, skipping those splats.
  */
 
-namespace wt::gpu::kernel {
+namespace wt { namespace gpu { namespace compute_kernel {
 
 /** @brief A path outgrew its scratch memory (see above). */
-constexpr u32 status_scratch_overflow = 2;
+WT_GPU_CONSTANT constexpr u32 status_scratch_overflow = 2;
 /** @brief A path made `max_path_iterations` steps (counting null interactions) and was stopped. */
-constexpr u32 status_iteration_limit = 4;
+WT_GPU_CONSTANT constexpr u32 status_iteration_limit = 4;
 
 /**
  * @brief Steps a path may take, counting null interactions, which do not
  *        count towards `max_depth`. (The CPU recurses without a limit.)
  */
-constexpr u32 max_path_iterations = 1u<<14;
+WT_GPU_CONSTANT constexpr u32 max_path_iterations = 1u<<14;
 
 /**
  * @brief A path's scratch memory: `tri_capacity` triangles, `edge_capacity`
@@ -557,9 +557,9 @@ WT_GPU_FN bool is_delta(const WT_GPU_THREAD material& m) {
  * Path vertices, visibility
  */
 
-constexpr u32 geo_point = 0;
-constexpr u32 geo_surface = 1;
-constexpr u32 geo_edge = 2;
+WT_GPU_CONSTANT constexpr u32 geo_point = 0;
+WT_GPU_CONSTANT constexpr u32 geo_surface = 1;
+WT_GPU_CONSTANT constexpr u32 geo_edge = 2;
 
 /** @brief A path vertex's geometry (`vertex_geo_variant_t`, or an `intersection_edge_t`). */
 struct vertex_geo {
@@ -1009,7 +1009,7 @@ struct alignas(16) path_state_t {
     WT_GPU_FN void splat(const WT_GPU_THREAD film_desc& desc, film_response response, WT_GPU_THREAD Film& film,
                          u32 ex, u32 ey, vec2 offset, real watts) {
         if (splats++>=skip)
-            kernel::splat(desc, response, film, ex, ey, offset, watts);
+            compute_kernel::splat(desc, response, film, ex, ey, offset, watts);
     }
 };
 
@@ -1113,7 +1113,7 @@ WT_GPU_FN u32 sample_emitter(const WT_GPU_THREAD plt_scene& scene, real u) {
 }
 
 /** @brief `start_path`'s `spectral` argument: choose a spectral sample of the table (rather than this one). */
-constexpr u32 choose_spectral = 0xffffffffu;
+WT_GPU_CONSTANT constexpr u32 choose_spectral = 0xffffffffu;
 
 /**
  * @brief Which of an emitter's `count` spectral samples path `path` takes: a
@@ -1636,4 +1636,4 @@ WT_GPU_FN bool step_path(const WT_GPU_THREAD plt_scene& scene,
            interact(scene, geometry, film, scratch, tr, p, status);
 }
 
-}
+} } }

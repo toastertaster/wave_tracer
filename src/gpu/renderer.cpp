@@ -69,7 +69,7 @@ using namespace wt::gpu;
 
 namespace {
 
-using kernel::real;
+using compute_kernel::real;
 
 std::string type_of(const scene::scene_element_t& element) {
     return element.description().type;
@@ -77,10 +77,10 @@ std::string type_of(const scene::scene_element_t& element) {
 
 /**
  * @brief plt_bdpt's free-space diffraction: the lookup tables its sampler
- *        samples edges' diffraction lobes with, as `kernel::plt_scene::fsd_lut`.
+ *        samples edges' diffraction lobes with, as `compute_kernel::plt_scene::fsd_lut`.
  */
 std::vector<real> compile_fsd_lut(const integrator::plt_bdpt_t& integrator) {
-    namespace kf = kernel::fraunhofer;
+    namespace kf = compute_kernel::fraunhofer;
     using lut_t = fraunhofer::fsd_sampler::fsd_lut_t;
     static_assert(lut_t::theta_samples==kf::fsd_theta_samples && lut_t::radius_samples==kf::fsd_radius_samples,
                   "the kernels' free-space diffraction lookup tables differ from the CPU's");
@@ -157,7 +157,7 @@ void compile_direction_transform(const transform_t& t, real (&out)[9]) {
 std::vector<const emitter::emitter_t*> compile_emitters(const scene_t& scene, const sensor::sensor_t& sensor,
                                                         const ads::bvh8w_t& bvh, plt_scene_t& out,
                                                         std::vector<std::uint32_t>& shape_emitter) {
-    shape_emitter.assign(scene.shapes().size(), kernel::no_emitter);
+    shape_emitter.assign(scene.shapes().size(), compute_kernel::no_emitter);
     std::vector<const emitter::emitter_t*> emitters;
     std::vector<double> pdfs;
     for (const auto& e : scene.emitters()) {
@@ -166,13 +166,13 @@ std::vector<const emitter::emitter_t*> compile_emitters(const scene_t& scene, co
         if (!(pdf>0))
             continue;
 
-        kernel::emitter k{};
+        compute_kernel::emitter k{};
         k.pmf = real(pdf);
         if (const auto* point = dynamic_cast<const emitter::point_t*>(e.get()); point) {
-            k.type = kernel::emitter_point;
+            k.type = compute_kernel::emitter_point;
             k.position = to_kernel(point->get_position());
         } else if (const auto* spot = dynamic_cast<const emitter::spot_t*>(e.get()); spot) {
-            k.type = kernel::emitter_spot;
+            k.type = compute_kernel::emitter_spot;
             k.position = to_kernel(spot->position());
             compile_direction_transform(spot->to_world_transform(), k.dir_to_world);
             compile_direction_transform(spot->to_world_transform().inverse(), k.dir_to_local);
@@ -184,7 +184,7 @@ std::vector<const emitter::emitter_t*> compile_emitters(const scene_t& scene, co
             k.recp_cutoff_range = real(f_t(1) / (cutoff-falloff));
             k.cutoff_solid_angle = real(m::two_pi * (1-std::cos(cutoff)));
         } else if (const auto* directional = dynamic_cast<const emitter::directional_t*>(e.get()); directional) {
-            k.type = kernel::emitter_directional;
+            k.type = compute_kernel::emitter_directional;
             k.target = to_kernel(directional->target_frame());
             k.target_centre = to_kernel(directional->target_centre());
             k.target_radius = real(u::to_m(directional->target_disc_radius()));
@@ -202,7 +202,7 @@ std::vector<const emitter::emitter_t*> compile_emitters(const scene_t& scene, co
             shape_emitter[shape_idx] = std::uint32_t(emitters.size());
 
             // the shape's (BVH) triangles, and their inclusive CDF by area
-            k.type = kernel::emitter_area;
+            k.type = compute_kernel::emitter_area;
             k.first_tri = std::uint32_t(out.area_tris.size());
             double total = 0;
             std::vector<double> cdf;
@@ -288,7 +288,7 @@ bool ior_has_transmission(const c_t ior) noexcept {
 
 /**
  * @brief The textures of the scene's materials that vary over surfaces (see
- *        `kernel::texture`): bitmaps, at transformed UVs, scaled by constant
+ *        `compute_kernel::texture`): bitmaps, at transformed UVs, scaled by constant
  *        textures. Materials register theirs (`register_bsdf`) before they
  *        are compiled at any wavenumber.
  */
@@ -323,11 +323,11 @@ public:
     }
 
     /**
-     * @brief The normal map of a material (`kernel::material_shading`): of a
+     * @brief The normal map of a material (`compute_kernel::material_shading`): of a
      *        `normalmap_t` that the BSDF's shading frame comes from.
      */
-    [[nodiscard]] kernel::material_shading shading_of(const bsdf::bsdf_t& bsdf) const {
-        kernel::material_shading ret{ .normalmap = kernel::no_texture, .normalmap_flip = 0 };
+    [[nodiscard]] compute_kernel::material_shading shading_of(const bsdf::bsdf_t& bsdf) const {
+        compute_kernel::material_shading ret{ .normalmap = compute_kernel::no_texture, .normalmap_flip = 0 };
         // the BSDFs that pass shading_frame on to the nested BSDF (composite_t does not)
         const bsdf::bsdf_t* b = &bsdf;
         for (;;) {
@@ -336,7 +336,7 @@ public:
             } else if (const auto* scale = dynamic_cast<const bsdf::scale_t*>(b); scale) {
                 b = scale->nested_bsdf().get();
             } else if (const auto* normalmap = dynamic_cast<const bsdf::normalmap_t*>(b); normalmap) {
-                if (ret.normalmap!=kernel::no_texture)
+                if (ret.normalmap!=compute_kernel::no_texture)
                     throw gpu_error_t(std::format(
                         "GPU rendering does not support nested normal maps (BSDF <{}>)", bsdf.get_id()));
                 ret.normalmap = registered.at(normalmap->normalmap_texture().get());
@@ -352,7 +352,7 @@ public:
     [[nodiscard]] compiled_t compile(const texture::texture_t& texture, const wavenumber_t k,
                                      const bsdf::bsdf_t& of) const {
         const auto c = canonical(texture, k, of);
-        return { c.factor, c.bitmap ? registered.at(&texture) : kernel::no_texture };
+        return { c.factor, c.bitmap ? registered.at(&texture) : compute_kernel::no_texture };
     }
 
     /** @brief The roughness texture of a roughness-parametrized fractal or gaussian surface profile, or nullptr. */
@@ -365,13 +365,13 @@ public:
         return nullptr;
     }
 
-    std::vector<kernel::texture> textures;
-    std::vector<kernel::bitmap> bitmaps;
+    std::vector<compute_kernel::texture> textures;
+    std::vector<compute_kernel::bitmap> bitmaps;
     std::vector<std::uint32_t> texels;
     std::vector<real> texel_luts;
 
 private:
-    /** @brief A texture in the form of `kernel::texture`: factor * bitmap(M*uv + t), or a constant (no bitmap). */
+    /** @brief A texture in the form of `compute_kernel::texture`: factor * bitmap(M*uv + t), or a constant (no bitmap). */
     struct canonical_t {
         f_t factor = 1;
         const texture::bitmap_t* bitmap = nullptr;
@@ -419,7 +419,7 @@ private:
             return;
 
         // glm matrices are column-major
-        kernel::texture t{};
+        compute_kernel::texture t{};
         t.bitmap = bitmap_index(*c.bitmap, of);
         t.rgb = c.bitmap->is_RGB() ? 1 : 0;
         t.M[0] = real(c.M[0][0]); t.M[1] = real(c.M[1][0]);
@@ -449,7 +449,7 @@ private:
     }
 
     /**
-     * @brief A bitmap, its texels as the CPU stores them (see `kernel::bitmap`): unorm integers, whose
+     * @brief A bitmap, its texels as the CPU stores them (see `compute_kernel::bitmap`): unorm integers, whose
      *        decoding tables it shares with other bitmaps of their width and colour encoding, or floats.
      */
     std::uint32_t bitmap_index(const texture::bitmap_t& bitmap, const bsdf::bsdf_t& of) {
@@ -468,22 +468,22 @@ private:
 
         // the texture2d_loader's texel types: unorm8 and unorm16 (PNG), f_t (EXR)
         const auto component_bytes = tex.component_bytes();
-        const auto format = component_bytes==1 ? kernel::texel_unorm8 :
-                            component_bytes==2 ? kernel::texel_unorm16 : kernel::texel_float32;
-        const std::uint32_t per_word = format==kernel::texel_unorm8 ? 4 : format==kernel::texel_unorm16 ? 2 : 1;
+        const auto format = component_bytes==1 ? compute_kernel::texel_unorm8 :
+                            component_bytes==2 ? compute_kernel::texel_unorm16 : compute_kernel::texel_float32;
+        const std::uint32_t per_word = format==compute_kernel::texel_unorm8 ? 4 : format==compute_kernel::texel_unorm16 ? 2 : 1;
         const std::uint64_t words = (count + per_word-1) / per_word;
         if (texels.size()+words > std::uint64_t(1)<<32)
             throw gpu_error_t("GPU rendering supports bitmaps of up to 16 GiB in all");
 
         const auto& config = tex.get_config();
-        kernel::bitmap bm{};
+        compute_kernel::bitmap bm{};
         bm.offset = std::uint32_t(texels.size());
         bm.format = format;
         bm.width = dim.x;
         bm.height = dim.y;
-        bm.layout = layout==pixel_layout_e::L ? kernel::layout_L :
-                    layout==pixel_layout_e::LA ? kernel::layout_LA :
-                    layout==pixel_layout_e::RGB ? kernel::layout_RGB : kernel::layout_RGBA;
+        bm.layout = layout==pixel_layout_e::L ? compute_kernel::layout_L :
+                    layout==pixel_layout_e::LA ? compute_kernel::layout_LA :
+                    layout==pixel_layout_e::RGB ? compute_kernel::layout_RGB : compute_kernel::layout_RGBA;
         bm.components = components;
         bm.filter = std::uint32_t(config.filter);
         bm.uwrap = std::uint32_t(config.uwrap);
@@ -511,11 +511,11 @@ private:
                 texels[bm.offset + i/per_word] |= encode(v) << (32/per_word * (i%per_word));
             }
         };
-        if (format==kernel::texel_unorm8) {
+        if (format==compute_kernel::texel_unorm8) {
             pack.template operator()<std::uint8_t>([](std::uint8_t v) { return std::uint32_t(v); });
             bm.colour_lut = decoding_lut<std::uint8_t>(tex.colour_encoding());
             bm.alpha_lut = decoding_lut<std::uint8_t>(bitmap::colour_encoding_type_e::linear);
-        } else if (format==kernel::texel_unorm16) {
+        } else if (format==compute_kernel::texel_unorm16) {
             pack.template operator()<std::uint16_t>([](std::uint16_t v) { return std::uint32_t(v); });
             bm.colour_lut = decoding_lut<std::uint16_t>(tex.colour_encoding());
             bm.alpha_lut = decoding_lut<std::uint16_t>(bitmap::colour_encoding_type_e::linear);
@@ -550,12 +550,12 @@ private:
     std::map<std::pair<std::size_t, f_t>, std::uint32_t> luts;     // decoding tables, by texel size and gamma
 };
 
-/** @brief The surface profile of a `surface_spm_t` at wavenumber `k` (see `kernel::material`). */
+/** @brief The surface profile of a `surface_spm_t` at wavenumber `k` (see `compute_kernel::material`). */
 void compile_surface_profile(const bsdf::surface_spm_t& spm, const wavenumber_t k, const textures_t& textures,
-                             kernel::material& m) {
+                             compute_kernel::material& m) {
     const auto& profile = *spm.surface_profile();
     if (dynamic_cast<const surface_profile::dirac_t*>(&profile)) {
-        m.profile = kernel::profile_dirac;
+        m.profile = compute_kernel::profile_dirac;
         return;
     }
 
@@ -564,14 +564,14 @@ void compile_surface_profile(const bsdf::surface_spm_t& spm, const wavenumber_t 
     if (!fractal && !gaussian)
         throw gpu_error_t(std::format(
             "GPU rendering does not support '{}' surface profiles yet (BSDF <{}>)", type_of(profile), spm.get_id()));
-    m.profile = fractal ? kernel::profile_fractal : kernel::profile_gaussian;
+    m.profile = fractal ? compute_kernel::profile_fractal : compute_kernel::profile_gaussian;
     if (fractal)
         m.gamma = real(fractal->get_gamma());
 
     // a textured roughness: the kernel derives the parameters where paths hit (`set_profile_roughness`)
     if (const auto* roughness = textures_t::roughness_texture(spm); roughness) {
         const auto r = textures.compile(*roughness, k, spm);
-        if (r.texture!=kernel::no_texture) {
+        if (r.texture!=compute_kernel::no_texture) {
             m.roughness = real(r.factor);
             m.roughness_texture = r.texture;
             return;
@@ -598,11 +598,11 @@ void compile_surface_profile(const bsdf::surface_spm_t& spm, const wavenumber_t 
     }
 }
 
-kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k, const textures_t& textures) {
-    kernel::material m{};
-    m.type = kernel::material_absorbing;
+compute_kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k, const textures_t& textures) {
+    compute_kernel::material m{};
+    m.type = compute_kernel::material_absorbing;
     m.scale = 1;
-    m.scale_texture = m.roughness_texture = m.reflectance_texture = kernel::no_texture;
+    m.scale_texture = m.roughness_texture = m.reflectance_texture = compute_kernel::no_texture;
 
     // unwrap the BSDFs that select, reorient or scale another (normal maps perturb the shading frame instead,
     // see `textures_t::shading_of`)
@@ -619,8 +619,8 @@ kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k, co
         } else if (const auto* scale = dynamic_cast<const bsdf::scale_t*>(b); scale) {
             const auto s = textures.compile(*scale->scale_texture(), k, *scale);
             m.scale *= real(s.factor);
-            if (s.texture!=kernel::no_texture) {
-                if (m.scale_texture!=kernel::no_texture)
+            if (s.texture!=compute_kernel::no_texture) {
+                if (m.scale_texture!=compute_kernel::no_texture)
                     throw gpu_error_t(std::format(
                         "GPU rendering supports one textured scale BSDF per material so far (BSDF <{}>)",
                         bsdf.get_id()));
@@ -637,17 +637,17 @@ kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k, co
     m.delta_only = b->is_delta_only(k) ? 1 : 0;
 
     if (const auto* diffuse = dynamic_cast<const bsdf::diffuse_t*>(b); diffuse) {
-        m.type = kernel::material_diffuse;
+        m.type = compute_kernel::material_diffuse;
         const auto r = textures.compile(*diffuse->reflectance(), k, *diffuse);
         // diffuse_t clamps the reflectance; the kernel clamps a textured one where paths hit
         m.reflectance_texture = r.texture;
-        m.reflectance = real(r.texture==kernel::no_texture ? m::clamp01<f_t>(r.factor) : r.factor);
+        m.reflectance = real(r.texture==compute_kernel::no_texture ? m::clamp01<f_t>(r.factor) : r.factor);
         return m;
     }
 
     if (const auto* spm = dynamic_cast<const bsdf::surface_spm_t*>(b); spm) {
         const auto eta = spm->IOR(k);
-        m.type = kernel::material_specular;
+        m.type = compute_kernel::material_specular;
         m.has_transmission = ior_has_transmission(eta) ? 1 : 0;
         m.eta = { real(eta.real()), real(eta.imag()) };
         m.reflection_scale = real(spm->reflectivity_scale(k));
@@ -657,7 +657,7 @@ kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber_t k, co
     }
 
     if (const auto* dielectric = dynamic_cast<const bsdf::dielectric_t*>(b); dielectric) {
-        m.type = kernel::material_dielectric;
+        m.type = compute_kernel::material_dielectric;
         m.eta = { real(dielectric->IOR(k)), 0 };
         m.reflection_scale = real(dielectric->reflectivity_scale(k));
         m.transmission_scale = real(dielectric->transmissivity_scale(k));
@@ -710,7 +710,7 @@ std::vector<const bsdf::bsdf_t*> compile_geometry(const scene_t& scene, const ad
     out.texel_luts = std::move(textures.texel_luts);
 
     // shading data in the BVH's triangle order (see flatten() in src/gpu/gpu.cpp)
-    const auto edge_id = [](const ads::tuid_t e) { return e ? std::uint32_t(e.uid) : kernel::no_edge; };
+    const auto edge_id = [](const ads::tuid_t e) { return e ? std::uint32_t(e.uid) : compute_kernel::no_edge; };
     out.tris.resize(bvh.triangles_count());
     for (std::size_t i=0; i<out.tris.size(); ++i) {
         const auto& t = bvh.tri(ads::tuid_t{ ads::idx_t(i) });
@@ -732,12 +732,12 @@ std::vector<const bsdf::bsdf_t*> compile_geometry(const scene_t& scene, const ad
         throw gpu_error_t("GPU rendering supports up to 2^31 edges");
     const auto* first_tri = &bvh.tri(ads::tuid_t{ 0 });
     const auto tri_index = [&](const ads::tri_t* t) {
-        return t ? std::uint32_t(t - first_tri) : kernel::no_triangle;
+        return t ? std::uint32_t(t - first_tri) : compute_kernel::no_triangle;
     };
     out.edges.resize(bvh.edges_count());
     for (std::size_t i=0; i<out.edges.size(); ++i) {
         const auto& e = bvh.edge(std::uint32_t(i));
-        out.edges[i] = kernel::edge{
+        out.edges[i] = compute_kernel::edge{
             .a = to_kernel(e.a), .b = to_kernel(e.b),
             .n1 = to_kernel(e.n1), .t1 = to_kernel(e.t1),
             .n2 = to_kernel(e.n2), .t2 = to_kernel(e.t2),
@@ -764,17 +764,17 @@ void compile_film(const sensor::film_t<Dims, polarimetric>& film, plt_scene_t& o
         throw gpu_error_t("GPU rendering supports films of up to 4 components");
     if (std::uint64_t(size.x)*size.y*components*(polarimetric ? 4 : 1) > std::uint64_t(1)<<32)
         throw gpu_error_t("GPU rendering supports films of up to 2^32 values");
-    if (film.reconstruction_filter_radius()>kernel::max_rf_radius)
+    if (film.reconstruction_filter_radius()>compute_kernel::max_rf_radius)
         throw gpu_error_t(std::format(
             "GPU rendering supports film reconstruction filters up to {} elements wide; "
-            "reduce the film's rfilter_scale", kernel::max_rf_radius));
+            "reduce the film's rfilter_scale", compute_kernel::max_rf_radius));
 
     auto& fd = out.film;
     fd.width = size.x;
     fd.height = size.y;
     fd.components = components;
     fd.polarimetric = polarimetric ? 1 : 0;
-    fd.rf_radius = kernel::i32(film.reconstruction_filter_radius());
+    fd.rf_radius = compute_kernel::i32(film.reconstruction_filter_radius());
     fd.rf_sigma = real(film.reconstruction_filter_stddev());
 }
 
@@ -786,13 +786,13 @@ void compile_matrix(const transform_t& t, real (&out)[16]) {
         out[4*r+c] = real(m[c][r]);
 }
 
-sensor_spectral_t compile_sensor(const sensor::sensor_t& sensor, const kernel::plt_params& params,
+sensor_spectral_t compile_sensor(const sensor::sensor_t& sensor, const compute_kernel::plt_params& params,
                                  plt_scene_t& out) {
     auto& s = out.sensor;
 
     if (const auto* plane = dynamic_cast<const sensor::virtual_plane_sensor_t*>(&sensor); plane) {
         // virtual_plane_sensor_t::Si, sample_direct (forward) and sample (backward)
-        s.type = kernel::sensor_virtual_plane;
+        s.type = compute_kernel::sensor_virtual_plane;
         const auto& f = plane->frame();
         const auto& o = plane->origin();
         const auto& extent = plane->extent();
@@ -821,7 +821,7 @@ sensor_spectral_t compile_sensor(const sensor::sensor_t& sensor, const kernel::p
             throw gpu_error_t(std::format(
                 "GPU rendering supports perspective sensors only with backward plt_path "
                 "(direction=\"backward\") or plt_bdpt; sensor <{}>", sensor.get_id()));
-        s.type = kernel::sensor_perspective;
+        s.type = compute_kernel::sensor_perspective;
         s.position = to_kernel(perspective.position());
         compile_matrix(perspective.film_to_camera_transform(), s.to_camera);
         compile_matrix(perspective.film_to_camera_transform().inverse(), s.to_film);
@@ -875,7 +875,7 @@ public:
     /** @brief Draws per pass, over all emitters, for sensors sensitive to more than one wavelength. */
     static constexpr std::uint32_t samples_per_table = 4096;
 
-    spectral_tables_t(const scene_t& scene, const sensor::sensor_t& sensor, const kernel::plt_params& params,
+    spectral_tables_t(const scene_t& scene, const sensor::sensor_t& sensor, const compute_kernel::plt_params& params,
                       sensor_spectral_t sensor_spectral,
                       std::vector<const emitter::emitter_t*> emitters,
                       std::vector<const bsdf::bsdf_t*> bsdfs,
@@ -933,7 +933,7 @@ private:
         const auto recp = recp_spectral_pd>zero && m::isfinite(recp_spectral_pd) ?
             recp_spectral_pd : wavenumber_t::zero();
 
-        kernel::spectral_sample s{};
+        compute_kernel::spectral_sample s{};
         s.k = real(u::to_inv_m(k));
         if (params.bdpt!=0 && recp>zero) {
             // plt_bdpt without MIS weighs by one over the wavenumber's density (of its emitter), rather than `recp`
@@ -968,10 +968,10 @@ private:
             current.materials.push_back(compile_bsdf(*bsdf, k, textures));
     }
 
-    /** @brief An emitter's `kernel::emission` at wavenumber `k`, times the spectral sampling weight `recp`. */
-    static kernel::emission compile_emission(const emitter::emitter_t& e, const wavenumber_t k,
+    /** @brief An emitter's `compute_kernel::emission` at wavenumber `k`, times the spectral sampling weight `recp`. */
+    static compute_kernel::emission compile_emission(const emitter::emitter_t& e, const wavenumber_t k,
                                              const wavenumber_t recp) {
-        kernel::emission ret{};
+        compute_kernel::emission ret{};
         const auto sourced = [&](const beam::sourcing_geometry_t& sourcing) {
             if (sourcing.surface || sourcing.initial_spatial_lengths.x!=sourcing.initial_spatial_lengths.y)
                 throw gpu_error_t(std::format(
@@ -1009,7 +1009,7 @@ private:
 
     const scene_t& scene;
     const sensor::sensor_t& sensor;
-    kernel::plt_params params;
+    compute_kernel::plt_params params;
     sensor_spectral_t sensor_spectral;
     std::vector<const emitter::emitter_t*> emitters;
     std::vector<const bsdf::bsdf_t*> bsdfs;
@@ -1099,12 +1099,12 @@ void renderer_t::finish() {
 }
 
 void renderer_t::check_status(std::uint32_t status) {
-    if (status & kernel::status_stack_overflow)
+    if (status & compute_kernel::status_stack_overflow)
         throw gpu_error_t("GPU BVH traversal overflowed its stack");
-    if ((status & kernel::status_iteration_limit) && !warned_iteration_limit) {
+    if ((status & compute_kernel::status_iteration_limit) && !warned_iteration_limit) {
         warned_iteration_limit = true;
         logger::cwarn()
-            << "(gpu) some paths took more than " << kernel::max_path_iterations
+            << "(gpu) some paths took more than " << compute_kernel::max_path_iterations
             << " steps and were stopped" << '\n';
     }
 }

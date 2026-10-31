@@ -25,11 +25,11 @@
  * in metres, radiometric quantities in SI units.
  */
 
-namespace wt::gpu::kernel {
+namespace wt { namespace gpu { namespace compute_kernel {
 
-constexpr u32 no_triangle = 0xffffffffu;
-constexpr u32 no_edge = 0xffffffffu;
-constexpr u32 no_emitter = 0xffffffffu;
+WT_GPU_CONSTANT constexpr u32 no_triangle = 0xffffffffu;
+WT_GPU_CONSTANT constexpr u32 no_edge = 0xffffffffu;
+WT_GPU_CONSTANT constexpr u32 no_emitter = 0xffffffffu;
 
 /** @brief Shading data of a BVH triangle (`bvh_view::tris` order). */
 struct tri_shading {
@@ -57,30 +57,30 @@ struct tri_uv {
     vec2 uv[3];
 };
 
-constexpr u32 no_texture = 0xffffffffu;
+WT_GPU_CONSTANT constexpr u32 no_texture = 0xffffffffu;
 
-constexpr u32 layout_L = 0;               // `bitmap::pixel_layout_e`
-constexpr u32 layout_LA = 1;
-constexpr u32 layout_RGB = 2;
-constexpr u32 layout_RGBA = 3;
+WT_GPU_CONSTANT constexpr u32 layout_L = 0;               // `bitmap::pixel_layout_e`
+WT_GPU_CONSTANT constexpr u32 layout_LA = 1;
+WT_GPU_CONSTANT constexpr u32 layout_RGB = 2;
+WT_GPU_CONSTANT constexpr u32 layout_RGBA = 3;
 
-constexpr u32 filter_nearest = 0;         // `bitmap::texture_filter_type_e`
-constexpr u32 filter_bilinear = 1;
-constexpr u32 filter_bicubic = 2;
+WT_GPU_CONSTANT constexpr u32 filter_nearest = 0;         // `bitmap::texture_filter_type_e`
+WT_GPU_CONSTANT constexpr u32 filter_bilinear = 1;
+WT_GPU_CONSTANT constexpr u32 filter_bicubic = 2;
 
-constexpr u32 wrap_black = 0;             // `bitmap::texture_wrap_mode_e`
-constexpr u32 wrap_white = 1;
-constexpr u32 wrap_clamp = 2;
-constexpr u32 wrap_repeat = 3;
-constexpr u32 wrap_mirror = 4;
+WT_GPU_CONSTANT constexpr u32 wrap_black = 0;             // `bitmap::texture_wrap_mode_e`
+WT_GPU_CONSTANT constexpr u32 wrap_white = 1;
+WT_GPU_CONSTANT constexpr u32 wrap_clamp = 2;
+WT_GPU_CONSTANT constexpr u32 wrap_repeat = 3;
+WT_GPU_CONSTANT constexpr u32 wrap_mirror = 4;
 
-constexpr u32 clamp_none = 0;             // `bitmap::texel_clamp_mode_e`
-constexpr u32 clamp_non_negative = 1;
-constexpr u32 clamp_non_positive = 2;
+WT_GPU_CONSTANT constexpr u32 clamp_none = 0;             // `bitmap::texel_clamp_mode_e`
+WT_GPU_CONSTANT constexpr u32 clamp_non_negative = 1;
+WT_GPU_CONSTANT constexpr u32 clamp_non_positive = 2;
 
-constexpr u32 texel_float32 = 0;          // 32-bit floating point, linear (of EXR files)
-constexpr u32 texel_unorm8 = 1;           // 8-bit unsigned normalized integers (of 8-bit PNG files)
-constexpr u32 texel_unorm16 = 2;          // 16-bit ... (of 16-bit PNG files)
+WT_GPU_CONSTANT constexpr u32 texel_float32 = 0;          // 32-bit floating point, linear (of EXR files)
+WT_GPU_CONSTANT constexpr u32 texel_unorm8 = 1;           // 8-bit unsigned normalized integers (of 8-bit PNG files)
+WT_GPU_CONSTANT constexpr u32 texel_unorm16 = 2;          // 16-bit ... (of 16-bit PNG files)
 
 /**
  * @brief A bitmap (`bitmap::texture2d_t`): its texels' components, in the
@@ -136,20 +136,20 @@ struct material_shading {
 };
 
 /** @brief No BSDF at the spectral sample's wavenumber: paths end here (`composite_t` without a matching bin). */
-constexpr u32 material_absorbing = 0;
+WT_GPU_CONSTANT constexpr u32 material_absorbing = 0;
 /**
  * @brief `surface_spm_t`: specular reflection and refraction, and, with a rough
  *        surface profile, scattering about them.
  */
-constexpr u32 material_specular = 1;
+WT_GPU_CONSTANT constexpr u32 material_specular = 1;
 /** @brief `diffuse_t`: Lambertian reflection. */
-constexpr u32 material_diffuse = 2;
+WT_GPU_CONSTANT constexpr u32 material_diffuse = 2;
 /** @brief `dielectric_t`: Fresnel reflection and refraction at a smooth dielectric interface. */
-constexpr u32 material_dielectric = 3;
+WT_GPU_CONSTANT constexpr u32 material_dielectric = 3;
 
-constexpr u32 profile_dirac = 0;          // `surface_profile::dirac_t`: smooth
-constexpr u32 profile_fractal = 1;        // `surface_profile::fractal_t`
-constexpr u32 profile_gaussian = 2;       // `surface_profile::gaussian_t`
+WT_GPU_CONSTANT constexpr u32 profile_dirac = 0;          // `surface_profile::dirac_t`: smooth
+WT_GPU_CONSTANT constexpr u32 profile_fractal = 1;        // `surface_profile::fractal_t`
+WT_GPU_CONSTANT constexpr u32 profile_gaussian = 2;       // `surface_profile::gaussian_t`
 
 /**
  * @brief A material at a spectral sample's wavenumber. Values with a texture
@@ -191,10 +191,10 @@ struct material {
     u32 reflectance_texture;
 };
 
-constexpr u32 emitter_point = 0;          // `emitter::point_t`
-constexpr u32 emitter_spot = 1;           // `emitter::spot_t`
-constexpr u32 emitter_directional = 2;    // `emitter::directional_t`
-constexpr u32 emitter_area = 3;           // `emitter::area_t`, of a constant radiance
+WT_GPU_CONSTANT constexpr u32 emitter_point = 0;          // `emitter::point_t`
+WT_GPU_CONSTANT constexpr u32 emitter_spot = 1;           // `emitter::spot_t`
+WT_GPU_CONSTANT constexpr u32 emitter_directional = 2;    // `emitter::directional_t`
+WT_GPU_CONSTANT constexpr u32 emitter_area = 3;           // `emitter::area_t`, of a constant radiance
 
 /** @brief An emitter, but for what depends on the wavenumber (see `emission`). */
 struct emitter {
@@ -246,8 +246,8 @@ struct emission {
     real intensity;
 };
 
-constexpr u32 sensor_virtual_plane = 0;
-constexpr u32 sensor_perspective = 1;
+WT_GPU_CONSTANT constexpr u32 sensor_virtual_plane = 0;
+WT_GPU_CONSTANT constexpr u32 sensor_perspective = 1;
 
 /**
  * @brief A `sensor::virtual_plane_sensor_t` (`type` sensor_virtual_plane), or
@@ -283,7 +283,7 @@ struct sensor_desc {
 };
 
 /** @brief Largest supported film reconstruction filter radius, in elements. */
-constexpr i32 max_rf_radius = 8;
+WT_GPU_CONSTANT constexpr i32 max_rf_radius = 8;
 
 /**
  * @brief A `sensor::film_t` (2D, scalar or polarimetric). Elements are accumulated by the
@@ -393,4 +393,4 @@ struct plt_scene {
     plt_params params;
 };
 
-}
+} } }

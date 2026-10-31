@@ -21,7 +21,7 @@
  * NumPy, which needs only 32-bit integer arithmetic.
  */
 
-namespace wt::gpu::kernel {
+namespace wt { namespace gpu { namespace compute_kernel {
 
 struct u32x4 {
     u32 x, y, z, w;
@@ -86,4 +86,4 @@ struct rng {
     }
 };
 
-}
+} } }

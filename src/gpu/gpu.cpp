@@ -21,7 +21,7 @@ using namespace wt::gpu;
 
 namespace {
 
-using kernel::real;
+using compute_kernel::real;
 
 bvh_arrays_t flatten(const ads::bvh8w_t& bvh) {
     bvh_arrays_t arrays;
@@ -30,7 +30,7 @@ bvh_arrays_t flatten(const ads::bvh8w_t& bvh) {
     for (std::size_t i=0; i<arrays.nodes.size(); ++i) {
         const auto& n = bvh.node(ads::idx_t(i));
         auto& k = arrays.nodes[i];
-        for (std::size_t c=0; c<kernel::bvh_width; ++c) {
+        for (std::size_t c=0; c<compute_kernel::bvh_width; ++c) {
             const auto mn = vec3_t{ u::to_m(n.min.read(c)) };
             const auto mx = vec3_t{ u::to_m(n.max.read(c)) };
             k.minx[c] = real(mn.x); k.miny[c] = real(mn.y); k.minz[c] = real(mn.z);
@@ -39,9 +39,9 @@ bvh_arrays_t flatten(const ads::bvh8w_t& bvh) {
             const auto ptr = n.child_ptrs[c];
             if (ptr<0) {
                 const auto& l = bvh.leaf_node(ads::idx_t(-ptr-1));
-                if (l.count<1 || l.count>kernel::bvh_max_leaf_count || l.tris_ptr>=kernel::bvh_max_leaf_tris_ptr)
+                if (l.count<1 || l.count>compute_kernel::bvh_max_leaf_count || l.tris_ptr>=compute_kernel::bvh_max_leaf_tris_ptr)
                     throw gpu_error_t("the BVH's leaves do not fit the GPU's encoding");
-                k.child[c] = kernel::bvh_leaf_ptr(l.tris_ptr, l.count);
+                k.child[c] = compute_kernel::bvh_leaf_ptr(l.tris_ptr, l.count);
             } else {
                 k.child[c] = ptr;
             }
@@ -60,7 +60,7 @@ bvh_arrays_t flatten(const ads::bvh8w_t& bvh) {
 }
 
 void check_status(std::uint32_t status) {
-    if (status & kernel::status_stack_overflow)
+    if (status & compute_kernel::status_stack_overflow)
         throw gpu_error_t("GPU BVH traversal overflowed its stack");
 }
 
@@ -69,7 +69,7 @@ constexpr std::size_t batch_size = std::size_t(1)<<16;
 /** @brief Triangles per cone or ball query on the first attempt; queries finding more are re-run. */
 constexpr std::uint32_t initial_triangle_capacity = 32;
 
-std::uint32_t tri_count(const kernel::cone_hit& h) noexcept { return h.tri_count; }
+std::uint32_t tri_count(const compute_kernel::cone_hit& h) noexcept { return h.tri_count; }
 std::uint32_t tri_count(const ball_hit_t& h) noexcept { return h.tri_count; }
 
 /**
@@ -199,7 +199,7 @@ std::vector<std::optional<geometry_t::ray_hit_t>> geometry_t::intersect(
     for (std::size_t i=0; i<rays.size(); ++i)
         queries[i] = { to_kernel(rays[i]), krange };
 
-    std::vector<kernel::ray_hit> hits(rays.size());
+    std::vector<compute_kernel::ray_hit> hits(rays.size());
     {
         const std::scoped_lock lock(mutex);
         for (std::size_t start=0; start<rays.size(); start+=batch_size)
@@ -231,7 +231,7 @@ std::vector<bool> geometry_t::shadow(std::span<const ray_t> rays, const pqrange_
         queries[i] = { to_kernel(rays[i]), krange };
 
     std::vector<std::uint8_t> occluded(rays.size());
-    std::uint32_t status = kernel::status_ok;
+    std::uint32_t status = compute_kernel::status_ok;
     {
         const std::scoped_lock lock(mutex);
         for (std::size_t start=0; start<rays.size(); start+=batch_size)
@@ -251,13 +251,13 @@ geometry_t::cone_hits_t geometry_t::intersect(
     for (std::size_t i=0; i<cones.size(); ++i)
         queries[i] = { to_kernel(cones[i]), krange, real(z_search_range_scale) };
 
-    std::vector<kernel::cone_hit> hits;
+    std::vector<compute_kernel::cone_hit> hits;
     cone_hits_t ret;
     {
         const std::scoped_lock lock(mutex);
         collect_triangle_lists(queries,
             [&](const cone_query_t* q, std::size_t n, std::uint32_t capacity,
-                kernel::cone_hit* h, std::uint32_t* tris) {
+                compute_kernel::cone_hit* h, std::uint32_t* tris) {
                 backend->intersect_cones(q, n, capacity, h, tris);
             },
             hits, ret.triangles);
@@ -275,7 +275,7 @@ geometry_t::cone_hits_t geometry_t::intersect(
 }
 
 geometry_t::triangle_lists_t geometry_t::intersect(std::span<const ball_t> balls) const {
-    std::vector<kernel::ball> queries(balls.size());
+    std::vector<compute_kernel::ball> queries(balls.size());
     for (std::size_t i=0; i<balls.size(); ++i)
         queries[i] = to_kernel(balls[i]);
 
@@ -283,7 +283,7 @@ geometry_t::triangle_lists_t geometry_t::intersect(std::span<const ball_t> balls
     triangle_lists_t ret;
     const std::scoped_lock lock(mutex);
     collect_triangle_lists(queries,
-        [&](const kernel::ball* q, std::size_t n, std::uint32_t capacity,
+        [&](const compute_kernel::ball* q, std::size_t n, std::uint32_t capacity,
             ball_hit_t* h, std::uint32_t* tris) {
             backend->intersect_balls(q, n, capacity, h, tris);
         },

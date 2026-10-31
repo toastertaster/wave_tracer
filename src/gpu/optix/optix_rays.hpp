@@ -46,12 +46,12 @@ public:
      * @param bvh the scene; must have triangles
      * @param device_tris `bvh.tris` in device memory, which must outlive this object
      */
-    ray_geometry_t(const context_t& context, const bvh_arrays_t& bvh, const kernel::bvh_tri* device_tris);
+    ray_geometry_t(const context_t& context, const bvh_arrays_t& bvh, const compute_kernel::bvh_tri* device_tris);
     ~ray_geometry_t() noexcept;
 
-    /** @brief As kernel::intersect_ray for each query (ranges must not start below 0); all pointers are device memory. */
-    void intersect(const ray_query_t* queries, std::size_t count, kernel::ray_hit* hits) const;
-    /** @brief As kernel::ray_occluded for each query (ranges must not start below 0); all pointers are device memory. */
+    /** @brief As compute_kernel::intersect_ray for each query (ranges must not start below 0); all pointers are device memory. */
+    void intersect(const ray_query_t* queries, std::size_t count, compute_kernel::ray_hit* hits) const;
+    /** @brief As compute_kernel::ray_occluded for each query (ranges must not start below 0); all pointers are device memory. */
     void occluded(const ray_query_t* queries, std::size_t count, std::uint8_t* occluded) const;
 
 private:

@@ -34,12 +34,12 @@
  * `deferred`), to trace them in batches.
  */
 
-namespace wt::gpu::kernel {
+namespace wt { namespace gpu { namespace compute_kernel {
 
-constexpr u32 vertex_sensor = 0;
-constexpr u32 vertex_emitter = 1;
-constexpr u32 vertex_surface = 2;
-constexpr u32 vertex_fsd = 3;             // a free-space diffraction
+WT_GPU_CONSTANT constexpr u32 vertex_sensor = 0;
+WT_GPU_CONSTANT constexpr u32 vertex_emitter = 1;
+WT_GPU_CONSTANT constexpr u32 vertex_surface = 2;
+WT_GPU_CONSTANT constexpr u32 vertex_fsd = 3;             // a free-space diffraction
 
 /**
  * @brief A subpath vertex (`plt_bdpt::vertex_t`), and the beam that arrived at
@@ -904,7 +904,7 @@ WT_GPU_FN bdpt_connection_t<P> connect_vertices(const WT_GPU_THREAD plt_scene& s
 
 /** @brief A deferral of `trace_bdpt_path` that takes no connections. */
 struct bdpt_no_deferral {
-    static constexpr bool may_defer = false;
+    static WT_GPU_CONSTANT constexpr bool may_defer = false;
     template <typename Observed>
     WT_GPU_FN bool defer(const WT_GPU_THREAD shadow_ray_t&, Observed, u32, u32, u32, vec2, bool) { return false; }
 };
@@ -1007,4 +1007,4 @@ WT_GPU_FN u32 trace_bdpt_path(const WT_GPU_THREAD plt_scene& scene, const WT_GPU
     return spectral;
 }
 
-}
+} } }

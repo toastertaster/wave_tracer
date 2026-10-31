@@ -9,8 +9,8 @@
 
 /*
  * OptiX device programs for ray queries, compiled to OptiX-IR and embedded
- * (cmake/wt_gpu.cmake). They return what kernel::intersect_ray and
- * kernel::ray_occluded return, using OptiX's hardware triangle intersection:
+ * (cmake/wt_gpu.cmake). They return what compute_kernel::intersect_ray and
+ * compute_kernel::ray_occluded return, using OptiX's hardware triangle intersection:
  * hit points agree with the CUDA traversal up to floating-point rounding, but
  * rays grazing an edge or vertex may hit a different neighbouring triangle.
  */
@@ -20,7 +20,7 @@
 #include "optix_params.hpp"
 
 using namespace wt::gpu;
-namespace k = wt::gpu::kernel;
+namespace k = wt::gpu::compute_kernel;
 
 // Defined (not declared extern) in a C linkage block, as in the OptiX SDK samples.
 extern "C" {
@@ -48,7 +48,7 @@ extern "C" __global__ void __raygen__closest() {
     if (hit) {
         const float bu = __uint_as_float(u), bv = __uint_as_float(v);
         h.dist = __uint_as_float(t);
-        // as kernel::intersect_ray_tri: weights of the first two vertices
+        // as compute_kernel::intersect_ray_tri: weights of the first two vertices
         h.baryx = 1.f - (bu + bv);
         h.baryy = bu;
         h.tri = prim;

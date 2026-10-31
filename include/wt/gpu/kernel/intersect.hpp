@@ -18,7 +18,7 @@
  * during BVH traversal, the port follows that variant.
  */
 
-namespace wt::gpu::kernel {
+namespace wt { namespace gpu { namespace compute_kernel {
 
 /*
  * Rays
@@ -386,7 +386,7 @@ WT_GPU_FN cone_tri_hit_t intersect_cone_tri(const WT_GPU_THREAD cone& cn,
         return cr.hit ? cone_tri_hit_t{ cr.dist, true } : none;
     }
 
-    const kernel::frame f = cn.frame();
+    const compute_kernel::frame f = cn.frame();
     const vec3 o = cn.r.o;
     // triangle in the cone's local frame
     const vec3 vs[3] = { f.to_local(a-o), f.to_local(b-o), f.to_local(c-o) };
@@ -458,4 +458,4 @@ WT_GPU_FN bool test_ball_tri(const WT_GPU_THREAD ball& bl, vec3 a, vec3 b, vec3 
            (is_point_in_triangle_wide(p, a,b,c) && bl.contains(p));
 }
 
-}
+} } }

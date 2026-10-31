@@ -13,12 +13,12 @@
 #include "scene.hpp"
 
 /*
- * Textures (`kernel::texture`): bitmap lookups (`bitmap::texture2d_tmpl_t`)
+ * Textures (`compute_kernel::texture`): bitmap lookups (`bitmap::texture2d_tmpl_t`)
  * and their spectral uplift (`texture::bitmap_t`), and materials resolved at
- * a surface point (see `kernel::material`).
+ * a surface point (see `compute_kernel::material`).
  */
 
-namespace wt::gpu::kernel {
+namespace wt { namespace gpu { namespace compute_kernel {
 
 struct vec4 {
     real x, y, z, w;
@@ -288,4 +288,4 @@ WT_GPU_FN void apply_textures(const WT_GPU_THREAD plt_scene& scene, u32 spectral
     resolve_material(scene, spectral, m, uv);
 }
 
-}
+} } }

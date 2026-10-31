@@ -24,12 +24,12 @@
  * per-path scratch memory and expanded to wedges (`utd::wedge_edge_t`) on use.
  */
 
-namespace wt::gpu::kernel {
+namespace wt { namespace gpu { namespace compute_kernel {
 
 /** @brief `utd::utd_min_sin_beta` */
-constexpr real utd_min_sin_beta = real(1e-3);
+WT_GPU_CONSTANT constexpr real utd_min_sin_beta = real(1e-3);
 /** @brief `utd_IS_sigma_scale` of src/interaction/fsd/free_space_diffraction.cpp */
-constexpr real utd_IS_sigma_scale = 45;
+WT_GPU_CONSTANT constexpr real utd_IS_sigma_scale = 45;
 
 /** @brief An aperture edge: `ads_edge | front_is_face1<<31`, and the part `[t1,t2]` of it in the region. */
 struct aperture_entry {
@@ -408,4 +408,4 @@ WT_GPU_FN fsd_sample_t fsd_sample(const WT_GPU_GLOBAL edge* edges,
     return { wo, 1/dpd };
 }
 
-}
+} } }

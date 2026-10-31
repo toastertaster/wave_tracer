@@ -28,7 +28,7 @@
  * for a scalar film, all four for a polarimetric one (`row_*` functions).
  */
 
-namespace wt::gpu::kernel {
+namespace wt { namespace gpu { namespace compute_kernel {
 
 /** @brief Stokes parameters vector (`stokes_parameters_t`). */
 struct stokes {
@@ -36,7 +36,7 @@ struct stokes {
 
     WT_GPU_FN stokes operator*(real s) const { return { s0*s, s1*s, s2*s, s3*s }; }
     WT_GPU_FN stokes operator+(stokes o) const { return { s0+o.s0, s1+o.s1, s2+o.s2, s3+o.s3 }; }
-    WT_GPU_FN stokes& operator+=(stokes o) { return *this = *this + o; }
+    WT_GPU_FN WT_GPU_THREAD stokes& operator+=(stokes o) { return *this = *this + o; }
 };
 
 /** @brief A row vector (of a Mueller operator) times Stokes parameters `S`. */
@@ -159,7 +159,7 @@ struct fresnel_t {
 };
 
 /** @brief The surface normal of the local shading frame. */
-constexpr vec3 local_normal = { 0,0,1 };
+WT_GPU_CONSTANT constexpr vec3 local_normal = { 0,0,1 };
 
 /**
  * @brief `wt::fresnel(eta_12, w, n)` (`w` pointing away from the surface of
@@ -220,4 +220,4 @@ WT_GPU_FN mueller_block mueller_fresnel(complex eta_12, bool reflection, vec3 w,
     return mueller_fresnel(complex{ f.ts,0 }, complex{ f.tp,0 }) * f.Z;
 }
 
-}
+} } }

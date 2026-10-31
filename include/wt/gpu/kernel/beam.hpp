@@ -19,7 +19,7 @@
  * wt/interaction/intersection.hpp.
  */
 
-namespace wt::gpu::kernel {
+namespace wt { namespace gpu { namespace compute_kernel {
 
 /*
  * Frames
@@ -536,4 +536,4 @@ struct beam_t {
     }
 };
 
-}
+} } }

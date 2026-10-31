@@ -185,7 +185,7 @@ struct ray_geometry_t::impl_t {
     device_buffer_t<float> vertices;
     device_buffer_t<unsigned char> gas;
     OptixTraversableHandle handle = 0;
-    const kernel::bvh_tri* tris = nullptr;     // owned by the CUDA geometry
+    const compute_kernel::bvh_tri* tris = nullptr;     // owned by the CUDA geometry
     device_buffer_t<launch_params_t> params;
     // Launches come from the geometry's queries and from renderers sharing it (plt_bdpt's
     // shadow rays), on any thread: each must queue its launch right after its parameters.
@@ -201,7 +201,7 @@ struct ray_geometry_t::impl_t {
 };
 
 ray_geometry_t::ray_geometry_t(const context_t& context, const bvh_arrays_t& bvh,
-                               const kernel::bvh_tri* device_tris)
+                               const compute_kernel::bvh_tri* device_tris)
     : pimpl(std::make_unique<impl_t>())
 {
     auto& p = *pimpl;
@@ -248,7 +248,7 @@ ray_geometry_t::ray_geometry_t(const context_t& context, const bvh_arrays_t& bvh
 
 ray_geometry_t::~ray_geometry_t() noexcept = default;
 
-void ray_geometry_t::intersect(const ray_query_t* queries, std::size_t count, kernel::ray_hit* hits) const {
+void ray_geometry_t::intersect(const ray_query_t* queries, std::size_t count, compute_kernel::ray_hit* hits) const {
     pimpl->launch(pimpl->context->sbt_closest,
                   { pimpl->handle, queries, pimpl->tris, hits, nullptr }, count);
 }

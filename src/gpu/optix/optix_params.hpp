@@ -20,9 +20,9 @@ struct launch_params_t {
     OptixTraversableHandle handle;
     const ray_query_t* queries;
     /** @brief Triangles in the BVH's order, for the normals that decide front faces. */
-    const kernel::bvh_tri* tris;
+    const compute_kernel::bvh_tri* tris;
     /** @brief Output of closest-hit launches. */
-    kernel::ray_hit* hits;
+    compute_kernel::ray_hit* hits;
     /** @brief Output of shadow launches. */
     std::uint8_t* occluded;
 };

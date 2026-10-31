@@ -30,7 +30,7 @@
  *     optionally wrapped in twosided, composite, scale and normalmap BSDFs;
  *   - constant and bitmap textures, transformed, or scaled by constant
  *     textures, for diffuse reflectances, BSDF scales, surface roughness
- *     (perceptual) and normal maps (see `kernel::texture`);
+ *     (perceptual) and normal maps (see `compute_kernel::texture`);
  *   - the bvh8w acceleration structure.
  */
 
@@ -122,7 +122,7 @@ private:
     std::unique_ptr<backend_renderer_t> backend;
     std::unique_ptr<spectral_tables_t> spectra;
 
-    kernel::plt_params params;
+    compute_kernel::plt_params params;
     std::uint64_t paths_per_spe;
     std::size_t film_elements;          // film elements' components
     bool polarimetric = false;          // ... each a Stokes parameters vector

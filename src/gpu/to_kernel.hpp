@@ -24,28 +24,28 @@
 
 namespace wt::gpu {
 
-inline kernel::vec3 to_kernel(const vec3_t& v) noexcept {
-    using kernel::real;
+inline compute_kernel::vec3 to_kernel(const vec3_t& v) noexcept {
+    using compute_kernel::real;
     return { real(v.x), real(v.y), real(v.z) };
 }
-inline kernel::vec3 to_kernel(const dir3_t& v) noexcept {
+inline compute_kernel::vec3 to_kernel(const dir3_t& v) noexcept {
     return to_kernel(vec3_t{ v });
 }
-inline kernel::vec3 to_kernel(const pqvec3_t& p) noexcept {
+inline compute_kernel::vec3 to_kernel(const pqvec3_t& p) noexcept {
     return to_kernel(vec3_t{ u::to_m(p) });
 }
-inline kernel::range to_kernel(const pqrange_t<>& r) noexcept {
-    using kernel::real;
+inline compute_kernel::range to_kernel(const pqrange_t<>& r) noexcept {
+    using compute_kernel::real;
     return { real(u::to_m(r.min)), real(u::to_m(r.max)) };
 }
-inline kernel::ray to_kernel(const ray_t& r) noexcept {
+inline compute_kernel::ray to_kernel(const ray_t& r) noexcept {
     return { to_kernel(r.o), to_kernel(r.d), to_kernel(r.invd) };
 }
-inline kernel::frame to_kernel(const frame_t& f) noexcept {
+inline compute_kernel::frame to_kernel(const frame_t& f) noexcept {
     return { to_kernel(f.t), to_kernel(f.b), to_kernel(f.n) };
 }
-inline kernel::cone to_kernel(const elliptic_cone_t& c) noexcept {
-    using kernel::real;
+inline compute_kernel::cone to_kernel(const elliptic_cone_t& c) noexcept {
+    using compute_kernel::real;
     return {
         .r = to_kernel(c.ray()),
         .x = to_kernel(c.x()),
@@ -57,8 +57,8 @@ inline kernel::cone to_kernel(const elliptic_cone_t& c) noexcept {
         .z_apex = real(u::to_m(c.get_z_apex())),
     };
 }
-inline kernel::ball to_kernel(const ball_t& b) noexcept {
-    using kernel::real;
+inline compute_kernel::ball to_kernel(const ball_t& b) noexcept {
+    using compute_kernel::real;
     return { to_kernel(b.centre), real(u::to_m(b.radius)) };
 }
 

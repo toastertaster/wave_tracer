@@ -22,7 +22,7 @@
  * them.
  */
 
-namespace wt::gpu::kernel {
+namespace wt { namespace gpu { namespace compute_kernel {
 
 /** @brief Inclusive range, as `wt::pqrange_t<>`. */
 struct range {
@@ -38,7 +38,7 @@ struct range {
         return min>max;
     }
     WT_GPU_FN range intersect(range o) const {
-        return { kernel::max(min,o.min), kernel::min(max,o.max) };
+        return { compute_kernel::max(min,o.min), compute_kernel::min(max,o.max) };
     }
     WT_GPU_FN range grow(real extent) const { return { min-extent, max+extent }; }
 
@@ -78,7 +78,7 @@ struct cone {
     real z_apex;        // -inf for a ray
 
     WT_GPU_FN bool is_ray() const { return tan_alpha==real(0) && x0==real(0); }
-    WT_GPU_FN kernel::frame frame() const { return { x, y, r.d }; }
+    WT_GPU_FN compute_kernel::frame frame() const { return { x, y, r.d }; }
 
     /** @brief Major and minor axes of the cross section at distance `z`. */
     WT_GPU_FN vec2 axes(real z) const {
@@ -106,4 +106,4 @@ struct ball {
     }
 };
 
-}
+} } }

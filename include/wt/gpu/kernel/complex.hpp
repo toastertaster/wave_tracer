@@ -15,7 +15,7 @@
  * Complex numbers (the operations of std::complex the kernels need).
  */
 
-namespace wt::gpu::kernel {
+namespace wt { namespace gpu { namespace compute_kernel {
 
 struct complex {
     real re, im;
@@ -53,4 +53,4 @@ WT_GPU_FN complex sqrt(complex z) {
 /** @brief exp(i·phase) */
 WT_GPU_FN complex expi(real phase) { return { cos(phase), sin(phase) }; }
 
-}
+} } }

@@ -32,18 +32,18 @@
  * diffraction of plt_path.
  */
 
-namespace wt::gpu::kernel::fraunhofer {
+namespace wt { namespace gpu { namespace compute_kernel { namespace fraunhofer {
 
 /** @brief The ASF's unit of length (`free_space_diffraction_t::fsd_unit`), in metres. */
-constexpr real fsd_unit = real(1e-3);
+WT_GPU_CONSTANT constexpr real fsd_unit = real(1e-3);
 /** @brief Scattered directions whose sines (squared) exceed this are not sampled (`wo2_cutoff`). */
-constexpr real fsd_wo2_cutoff = real(.85);
+WT_GPU_CONSTANT constexpr real fsd_wo2_cutoff = real(.85);
 
 /** @brief Power contained in χₑ×|𝛂1|² and in χₑ×|𝛂2|² (`fsd::PA1`, `PA2`). */
-constexpr real fsd_PA1 = real(0.0049361075794549872500);
-constexpr real fsd_PA2 = real(0.21899789398059305541);
+WT_GPU_CONSTANT constexpr real fsd_PA1 = real(0.0049361075794549872500);
+WT_GPU_CONSTANT constexpr real fsd_PA2 = real(0.21899789398059305541);
 /** @brief `fsd::P0_sigma`: the standard deviation of the 0-th order lobe. */
-constexpr real fsd_P0_sigma = real(0.288675134594813)/4;
+WT_GPU_CONSTANT constexpr real fsd_P0_sigma = real(0.288675134594813)/4;
 
 /**
  * @brief The sampler's lookup tables (`fsd_lut_t`), in `plt_scene::fsd_lut`:
@@ -51,9 +51,9 @@ constexpr real fsd_P0_sigma = real(0.288675134594813)/4;
  *        1), of `fsd_theta_samples` each, then of their radii, a row of
  *        `fsd_radius_samples` for each of as many angles.
  */
-constexpr u32 fsd_theta_samples = 2048;
-constexpr u32 fsd_radius_samples = 3072;
-constexpr u64 fsd_lut_size = 2*u64(fsd_theta_samples) + 2*u64(fsd_radius_samples)*fsd_radius_samples;
+WT_GPU_CONSTANT constexpr u32 fsd_theta_samples = 2048;
+WT_GPU_CONSTANT constexpr u32 fsd_radius_samples = 3072;
+WT_GPU_CONSTANT constexpr u64 fsd_lut_size = 2*u64(fsd_theta_samples) + 2*u64(fsd_radius_samples)*fsd_radius_samples;
 
 WT_GPU_FN u64 fsd_lut_theta(u32 lobe) { return u64(lobe)*fsd_theta_samples; }
 WT_GPU_FN u64 fsd_lut_radius(u32 lobe) {
@@ -305,7 +305,7 @@ __device__ T shuffle_words(unsigned mask, const T& v, int src) {
 #endif
 
 /** @brief Tries of a sample that a lane makes alone before its warp helps (see `fsd_first_accepted`). */
-constexpr u64 fsd_solo_tries = 16;
+WT_GPU_CONSTANT constexpr u64 fsd_solo_tries = 16;
 
 /**
  * @brief The first accepted of the `max_tries` tries (`fsd_try`, of stream
@@ -451,7 +451,7 @@ WT_GPU_FN edge_ellipse_hit_t intersect_edge_ellipse(vec2 p0, vec2 p1, vec2 r) {
 }
 
 /** @brief `gaussian_wavefront_t::beam_cross_section_envelope`: a beam's envelope is 3 standard deviations of its intensity. */
-constexpr real gaussian_cross_section_envelope = 3;
+WT_GPU_CONSTANT constexpr real gaussian_cross_section_envelope = 3;
 
 /** @brief A beam's Gaussian wavefront (`gaussian_wavefront_t`, centred): its intensity's standard deviations. */
 struct gaussian_wavefront {
@@ -834,4 +834,4 @@ WT_GPU_FN real wavefront_flux_over_triangles(const WT_GPU_THREAD plt_scene& scen
     return flux;
 }
 
-}
+} } } }
