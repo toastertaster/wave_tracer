@@ -100,6 +100,21 @@ public:
     }
 
     /**
+     * @brief Given a sensor and an emitter, samples a wavenumber from the emitter's spectrum (integrated over the
+     *        sensor's spectrum), as `sample_emitter_and_spectrum()` does once it has chosen the emitter.
+     * @param sensor used sensor
+     * @param emitter the emitter
+     * @param sampler sampler to use (overriding the scene's sampler)
+     */
+    [[nodiscard]] inline wavenumber_sample_t sample_spectrum(
+            const sensor::sensor_t* sensor,
+            const emitter::emitter_t* emitter,
+            sampler::sampler_t& sampler) const noexcept {
+        const auto* scs = get_scene_sensor(sensor);
+        return scs->sample_spectrum(emitter, sampler);
+    }
+
+    /**
      * @brief Given a sensor, samples an emitter from all scene emitters, as well as a wavenumber from the sampled emitter's spectrum (integrated over the sensor's spectrum), then sources a beam from the sampled emitter.
      *        Does NOT divide by the emitter or wavelength sampling density.
      * @param sensor used sensor

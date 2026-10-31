@@ -16,6 +16,9 @@
 #include <utility>
 #include <stdexcept>
 
+#include <cerrno>
+#include <cstring>
+
 #include <filesystem>
 #include <sstream>
 #include <format>
@@ -26,6 +29,7 @@
 
 #include <wt/version.hpp>
 #include <wt/wt_context.hpp>
+#include <wt/gpu/gpu.hpp>
 
 #include <wt/bitmap/bitmap.hpp>
 #include <wt/bitmap/write2d.hpp>
@@ -156,6 +160,7 @@ void print_stats_to_file(const std::filesystem::path& path,
 
 wt::wt_context_t context;
 std::unique_ptr<wt::thread_pool::tpool_t> threadpool;
+std::unique_ptr<wt::gpu::device_t> gpu_device;
 
 std::unique_ptr<wt::scene_t> scene;
 std::unique_ptr<wt::scene_renderer_t> scene_renderer;
@@ -548,7 +553,8 @@ void initialize_renderer(
         const std::filesystem::path& scene_path,
         const std::optional<std::filesystem::path>& output_dir_path,
         const std::optional<std::filesystem::path>& scene_data_path,
-        const std::optional<std::uint32_t>& cpu_threadpool_size) {
+        const std::optional<std::uint32_t>& cpu_threadpool_size,
+        bool use_gpu, bool use_hardware_ray_tracing) {
     // data path
     context.scene_data_path = !scene_data_path ? scene_path.parent_path() : scene_data_path.value();
     // output path defaults to scene directory
@@ -577,6 +583,12 @@ void initialize_renderer(
         std::make_unique<wt::thread_pool::tpool_t>() :
         std::make_unique<wt::thread_pool::tpool_t>(cpu_threadpool_size.value());
     context.threadpool = threadpool.get();
+
+    // GPU; throws, explaining why, if it cannot be used
+    if (use_gpu) {
+        gpu_device = wt::gpu::device_t::create({ .use_hardware_ray_tracing = use_hardware_ray_tracing });
+        context.gpu_device = gpu_device.get();
+    }
 
 
 #ifdef DEBUG_FP_EXCEPTIONS
@@ -775,6 +787,8 @@ int main(int argc, char* argv[]) {
     std::optional<std::filesystem::path> scene_data_path;
 
     std::optional<std::uint32_t> cpu_threadpool_size;
+    bool use_gpu = false;
+    bool no_hardware_ray_tracing = false;
 
     defines_t defines;
 
@@ -826,6 +840,15 @@ int main(int argc, char* argv[]) {
         ->take_all();
     render_opt->add_flag("--ray-tracing", context.renderer_force_ray_tracing,
                          "forces ray tracing only");
+    render_opt->add_flag("--gpu", use_gpu,
+                         "render on the GPU (needs a build with GPU_CUDA or GPU_METAL)");
+#if defined(WT_GPU_METAL)
+    render_opt->add_flag("--no-hw-rt", no_hardware_ray_tracing,
+                         "with --gpu, trace rays with the ported BVH traversal rather than Metal's hardware ray tracing");
+#else
+    render_opt->add_flag("--no-optix", no_hardware_ray_tracing,
+                         "with --gpu, trace rays with the CUDA traversal rather than OptiX (in builds with GPU_OPTIX)");
+#endif
     render_opt->add_option_function<std::string>("--mesh_scale",
             [](const auto& v){
                 context.default_scale_for_imported_mesh_positions = wt::stoq_strict<wt::length_t>(v);
@@ -930,7 +953,7 @@ int main(int argc, char* argv[]) {
     
     cli_render.callback([&]() {
         initialize_renderer(scene_path, output_dir_path, scene_data_path,
-                cpu_threadpool_size);
+                cpu_threadpool_size, use_gpu, !no_hardware_ray_tracing);
 
         wt::logger::cout.set_sout_level(sout_verbosity);
         wt::logger::cwarn.set_sout_level(sout_verbosity);
@@ -939,6 +962,8 @@ int main(int argc, char* argv[]) {
         
         // print version
         wt::wt_version_t{}.print_wt_version();
+        if (gpu_device)
+            wt::logger::cout(wt::verbosity_e::normal) << "GPU: " << gpu_device->description() << '\n';
 
         // render
         const auto scene_loader_defines = parse_defines(std::move(defines));
@@ -961,7 +986,7 @@ int main(int argc, char* argv[]) {
 
     cli_renderui.callback([&]() {
         initialize_renderer(scene_path, output_dir_path, scene_data_path,
-                    cpu_threadpool_size);
+                    cpu_threadpool_size, use_gpu, !no_hardware_ray_tracing);
         // disable progress bars. GUI provides its own bars.
         initialize_logs(filelog_verbosity, true);
         
@@ -980,6 +1005,10 @@ int main(int argc, char* argv[]) {
         return cli.exit(e);
     }
 
+    // the GPU (its context) must close before exit: the CUDA runtime, linked statically, shuts down before
+    // globals are destroyed
+    context.gpu_device = nullptr;
+    gpu_device.reset();
 
     return terminate_program ? -1 : 0;
 }

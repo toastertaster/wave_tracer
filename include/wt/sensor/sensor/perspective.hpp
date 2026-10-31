@@ -83,15 +83,6 @@ protected:
         return vec2_t{ d.x,d.y } / d.w;
     }
 
-    /**
-     * @brief Partial derivative of camera direction w.r.t. x film coordinate.
-     */
-    [[nodiscard]] inline auto direction_pdvx() const noexcept { return ddir_dx; }
-    /**
-     * @brief Partial derivative of camera direction w.r.t. y film coordinate.
-     */
-    [[nodiscard]] inline auto direction_pdvy() const noexcept { return ddir_dy; }
-
     [[nodiscard]] importance_intensity_beam_t Se(
             const ray_t& r,
             const SolidAngle auto recp_sa_density,
@@ -154,6 +145,24 @@ public:
         this->sourcing_tan_alpha = *sourcing_tan_alpha;
     }
     perspective_t(perspective_t&&) = default;
+
+    /**
+     * @brief The sensor-to-world transform.
+     */
+    [[nodiscard]] inline const auto& to_world_transform() const noexcept { return sensor_transform; }
+    /**
+     * @brief The transform of film (pixel) positions to camera-space points on the sensor (see `point_on_sensor`).
+     */
+    [[nodiscard]] inline const auto& film_to_camera_transform() const noexcept { return sensor_to_camera_trns; }
+
+    /**
+     * @brief Partial derivative of camera direction w.r.t. x film coordinate.
+     */
+    [[nodiscard]] inline auto direction_pdvx() const noexcept { return ddir_dx; }
+    /**
+     * @brief Partial derivative of camera direction w.r.t. y film coordinate.
+     */
+    [[nodiscard]] inline auto direction_pdvy() const noexcept { return ddir_dy; }
 
     [[nodiscard]] inline pqvec3_t position() const noexcept {
         return sensor_transform(pqvec3_t::zero(), transform_point);

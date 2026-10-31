@@ -46,6 +46,8 @@ public:
     [[nodiscard]] inline bool is_delta_position() const noexcept override { return true; }
     [[nodiscard]] inline bool is_delta_direction() const noexcept override { return false; }
 
+    [[nodiscard]] inline const auto& get_position() const noexcept { return position; }
+
     [[nodiscard]] inline spectral_radiant_intensity_t spectral_radiant_intensity(const wavenumber_t k) const noexcept {
         return spectrum->f(k) * spectral_radiant_intensity_t::unit;
     }

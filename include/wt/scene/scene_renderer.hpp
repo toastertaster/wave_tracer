@@ -10,6 +10,7 @@
 #pragma once
 
 #include <future>
+#include <memory>
 #include <vector>
 #include <queue>
 
@@ -30,6 +31,10 @@
 #include "interrupts.hpp"
 
 namespace wt {
+
+namespace gpu {
+class geometry_t;
+}
 
 namespace scene {
 
@@ -63,6 +68,11 @@ struct render_opts_t {
     /** @brief Preview interface to use, if any.
      */
     const preview_interface_t* previewer = nullptr;
+    /** @brief GPU rendering: the scene's ADS already uploaded to the context's GPU
+     *         (`gpu::device_t::upload`), which the render then shares. If null, the
+     *         render uploads the ADS itself, once for all its sensors.
+     */
+    std::shared_ptr<const gpu::geometry_t> gpu_geometry;
 };
 
 enum class rendering_state_t : std::uint8_t {
@@ -106,6 +116,8 @@ public:
 private:
     // multiplicative factor of desired parallelism for enqueueing parallel jobs
     static constexpr f_t parallel_jobs_factor = 1.5;
+    // GPU rendering: paths traced per pass (passes trace whole samples of all sensor elements)
+    static constexpr std::size_t gpu_paths_per_pass = std::size_t(1)<<22;
 
     std::future<scene::render_result_t> future;
 
@@ -155,6 +167,10 @@ private:
             const scene_t* scene,
             const wt_context_t& ctx, const ads::ads_t& ads,
             const scene::render_opts_t render_opts);
+    scene::render_result_t render_gpu(
+            const scene_t* scene,
+            const wt_context_t& ctx, const ads::ads_t& ads,
+            const scene::render_opts_t& render_opts);
 
 public:
     /**

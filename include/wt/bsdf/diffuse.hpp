@@ -31,6 +31,8 @@ public:
         : bsdf_t(std::move(id)), refl(std::move(reflectance)) {}
     diffuse_t(diffuse_t &&) = default;
 
+    [[nodiscard]] inline const auto& reflectance() const noexcept { return refl; }
+
     /**
      * @brief Spectral albedo. Returns std::nullopt when albedo cannot be computed.
      * @param k wavenumber

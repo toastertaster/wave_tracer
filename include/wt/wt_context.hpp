@@ -22,6 +22,8 @@ class preview_window_t;
 
 namespace thread_pool { class tpool_t; }
 
+namespace gpu { class device_t; }
+
 /**
  * @brief Used for logging and output verbosity adjustments.
  */
@@ -47,15 +49,26 @@ struct wt_context_t {
 
 
 	std::filesystem::path scene_data_path, output_path;
+    /**
+     * @brief Optional directory that contains wave_tracer's ``data`` directory (usually the wave_tracer source tree).
+     *        Lets wave_tracer find its runtime data regardless of the work directory, e.g. when embedded in another application.
+     */
+    std::optional<std::filesystem::path> data_root_path;
 
 
     /** @brief Thread pool */
     wt::thread_pool::tpool_t* threadpool;
 
+    /**
+     * @brief GPU to render on (see wt/gpu/gpu.hpp), owned by the application.
+     *        Null renders on the CPU.
+     */
+    const wt::gpu::device_t* gpu_device = nullptr;
+
 
     /**
      * @brief Resolves a resource path. 
-     *        If the path is relative, first searches in the ``scene_data_path`` directory (unless ``search_in_scene_data`` is false), then searches in work directory (``./``) directory, and finally in parent of work directory (``../``).
+     *        If the path is relative, first searches in the ``scene_data_path`` directory (unless ``search_in_scene_data`` is false), then in ``data_root_path`` (if set), then searches in work directory (``./``) directory, and finally in parent of work directory (``../``).
      *        Returns ``std::nullopt`` if file was not found.
      */
     [[nodiscard]] inline std::optional<std::filesystem::path> resolve_path(
@@ -68,6 +81,12 @@ struct wt_context_t {
             auto path_in_scene = scene_data_path / path;
             if (std::filesystem::is_regular_file(path_in_scene))
                 return path_in_scene;
+        }
+
+        if (data_root_path) {
+            auto path_in_data_root = *data_root_path / path;
+            if (std::filesystem::is_regular_file(path_in_data_root))
+                return path_in_data_root;
         }
 
         if (std::filesystem::is_regular_file(path))

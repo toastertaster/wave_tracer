@@ -140,6 +140,7 @@ public:
     }
 
     [[nodiscard]] inline const auto& nested_bsdf() const noexcept { return nested; }
+    [[nodiscard]] inline const auto& scale_texture() const noexcept { return scale; }
 
     [[nodiscard]] scene::element::info_t description() const override;
 

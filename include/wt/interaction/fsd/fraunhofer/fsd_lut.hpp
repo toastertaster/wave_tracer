@@ -71,6 +71,22 @@ private:
 public:
     fsd_lut_t(const wt_context_t &context);
 
+    static constexpr std::size_t theta_samples = Nsamples;
+    static constexpr std::size_t radius_samples = Msamples;
+
+    /**
+     * @brief The inverse CDF of the angle of samples of |𝛂1|² (`lobe` 0) or |𝛂2|² (`lobe` 1).
+     */
+    [[nodiscard]] inline const auto& iCDF_theta(int lobe) const noexcept {
+        return lobe==0 ? data->iCDFtheta1 : data->iCDFtheta2;
+    }
+    /**
+     * @brief The inverse CDFs of the radius of samples of |𝛂1|² (`lobe` 0) or |𝛂2|² (`lobe` 1), of each angle.
+     */
+    [[nodiscard]] inline const auto& iCDF_radius(int lobe) const noexcept {
+        return lobe==0 ? data->iCDF1 : data->iCDF2;
+    }
+
     /**
      * @brief Samples the |𝛂1|² function. 
      */

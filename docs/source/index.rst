@@ -37,6 +37,7 @@ Support for additional features, emitter, sensor and interaction models will be 
    scenes/scene
    ads/ads
    cli
+   gpu/gpu
    units
    theory
    bib

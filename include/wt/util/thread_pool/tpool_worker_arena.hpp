@@ -58,6 +58,10 @@ public:
     }
 
     [[nodiscard]] inline const auto& operator[](std::size_t idx) const noexcept { return arenas[idx]; }
+    /**
+     * @brief Access to any thread's resource. The caller must ensure that thread is not using it.
+     */
+    [[nodiscard]] inline auto& operator[](std::size_t idx) noexcept { return arenas[idx]; }
 
     [[nodiscard]] inline auto size() const noexcept { return arenas.size(); }
 

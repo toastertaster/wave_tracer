@@ -19,7 +19,9 @@ namespace wt {
  */
 class encoded_normal_t {
 private:
-    std::size_t enc{};
+    // Octahedral encoding, stored in single precision regardless of f_t so
+    // the structure stays 64 bits.
+    glm::vec<2, float> enc{};
 
 private:
     static constexpr inline vec2_t vec2_oct_wrap(vec2_t v) noexcept {
@@ -36,7 +38,7 @@ public:
 
         assert(m::isfinite(xy));
 
-        *reinterpret_cast<vec2_t*>(&enc) = xy;
+        enc = glm::vec<2, float>{ xy };
     }
 
     encoded_normal_t(encoded_normal_t&&) noexcept = default;
@@ -50,7 +52,7 @@ public:
     }
 
     explicit operator dir3_t() const noexcept {
-        auto enc = *reinterpret_cast<const vec2_t*>(&this->enc);
+        auto enc = vec2_t{ this->enc };
         enc = enc*f_t(2) - vec2_t{ 1 };
 
         const auto z = 1 - m::abs(enc.x) - m::abs(enc.y);
@@ -61,5 +63,7 @@ public:
         return m::normalize(n);
     }
 };
+
+static_assert(sizeof(encoded_normal_t) == 8);
 
 }

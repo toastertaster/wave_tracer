@@ -61,6 +61,7 @@ public:
     }
 
     [[nodiscard]] inline auto triangles_count() const noexcept { return tris.size(); }
+    [[nodiscard]] inline auto edges_count() const noexcept { return edges.size(); }
     [[nodiscard]] virtual std::size_t nodes_count() const noexcept = 0;
 
     [[nodiscard]] virtual const aabb_t& V() const noexcept = 0;

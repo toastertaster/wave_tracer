@@ -68,6 +68,7 @@ public:
     {}
 
     [[nodiscard]] std::size_t nodes_count() const noexcept override { return nodes.size(); }
+    [[nodiscard]] std::size_t leaf_nodes_count() const noexcept { return leaf_nodes.size(); }
 
     [[nodiscard]] inline const auto& vectorized_tri_data() const noexcept {
         return vectorized_data;

@@ -47,6 +47,12 @@ public:
                std::string id, 
                options_t opts) noexcept;
 
+    [[nodiscard]] inline const auto& get_options() const noexcept { return options; }
+    /**
+     * @brief The sampler of free-space diffractions, or nullptr (unless loaded for beam tracing).
+     */
+    [[nodiscard]] inline const auto* get_fsd_sampler() const noexcept { return fraunhofer_fsd_sampler.get(); }
+
     [[nodiscard]] sensor::sensor_write_flags_e sensor_write_flags() const noexcept override {
         return (sensor::sensor_write_flags_e)(
                 sensor::sensor_write_flags_e::writes_block_splats |

@@ -156,6 +156,10 @@ sample_ret_t fsd_sampler_t::sample(sampler::sampler_t& sampler,
 }
 
 
+const fsd_lut_t& fsd_sampler_t::lut() const noexcept {
+    return pimpl->fsd1_lut;
+}
+
 scene::element::info_t fsd_sampler_t::description() const {
     return {
         .id = "",

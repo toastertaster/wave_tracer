@@ -145,6 +145,10 @@ public:
     }
 
     [[nodiscard]] inline const auto& nested_bsdf() const noexcept { return nested; }
+    /** @brief The texture encoding the shading normal variations. */
+    [[nodiscard]] inline const auto& normalmap_texture() const noexcept { return normalmap; }
+    /** @brief Whether the normal map's x and y are flipped. */
+    [[nodiscard]] inline bool is_flipped() const noexcept { return flip; }
 
     [[nodiscard]] scene::element::info_t description() const override;
 

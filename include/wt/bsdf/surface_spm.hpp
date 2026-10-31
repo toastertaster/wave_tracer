@@ -54,6 +54,8 @@ public:
     {}
     surface_spm_t(surface_spm_t&&) = default;
 
+    [[nodiscard]] inline const auto& surface_profile() const noexcept { return profile; }
+
     [[nodiscard]] inline auto IOR(const wavenumber_t k) const noexcept {
         const auto eta_1 = extIOR->value(k);
         const auto eta_2 = IORn->value(k);

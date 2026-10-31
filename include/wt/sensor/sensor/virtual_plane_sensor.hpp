@@ -70,6 +70,11 @@ public:
     [[nodiscard]] inline const auto& frame() const noexcept { return sensor_frame; }
 
     /**
+     * @brief Returns the sensor's corner position: the origin of sensor element (0,0).
+     */
+    [[nodiscard]] inline const auto& origin() const noexcept { return sensor_origin; }
+
+    /**
      * @brief Returns the sensor's extent.
      */
     [[nodiscard]] inline const auto& extent() const noexcept { return sensor_extent; }

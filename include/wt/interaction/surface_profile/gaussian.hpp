@@ -141,6 +141,20 @@ public:
     {}
 
     /**
+     * @brief The profile's parameters at a texture query: the variance `sigma2`, the normalization `sigma2_norm`
+     *        of the PSD, and the `alpha` of the specular fraction (see `alpha()`).
+     */
+    [[nodiscard]] inline auto parameters(const texture_query_t& query) const noexcept { return gaussian_params(query); }
+    /** @brief The roughness texture of a profile parametrized by perceptual roughness, or nullptr. */
+    [[nodiscard]] inline const texture::texture_t* roughness_texture() const noexcept {
+        return roughness_parametrized ? roughness_tex.get() : nullptr;
+    }
+    /** @brief Whether the profile's textures are constant (the same everywhere on the surface). */
+    [[nodiscard]] inline bool has_constant_textures() const noexcept {
+        return roughness_parametrized ? roughness_tex->is_constant() : sigma_tex->is_constant();
+    }
+
+    /**
      * @brief Variance of the surface profile.
      */
     [[nodiscard]] variance_t variance(const texture_query_t& query) const noexcept override {
