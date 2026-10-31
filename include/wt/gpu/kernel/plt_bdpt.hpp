@@ -29,7 +29,7 @@
  * as plt_path's functions are. A path keeps its vertices, and the apertures of
  * its diffractions, in memory the backend provides, up to capacities; a path
  * that outgrows them, or its scratch memory, stops with `status_scratch_overflow`
- * before it splats anything, to be re-traced with more. A backend may also take
+ * before it splats anything, to be re-traced with more (`scratch_overflow`). A backend may also take
  * over the shadow rays of connections, and their splats (`trace_bdpt_path`'s
  * `deferred`), to trace them in batches.
  */
@@ -400,7 +400,8 @@ WT_GPU_FN u32 bdpt_random_walk(const WT_GPU_THREAD plt_scene& scene, const WT_GP
     // vertex is sampled with density `pdf_rev`; false if it may not be
     const auto append_vertex = [&](WT_GPU_THREAD bdpt_vertex<P>& v, real pdf_fwd, real pdf_rev) {
         if (count==capacity) {
-            status |= status_scratch_overflow;
+            // (a subpath has at most max_depth+2 vertices)
+            status |= scratch_overflow(u64(scene.params.max_depth)+2, capacity);
             return false;
         }
         if (last.wp==v.wp)

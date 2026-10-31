@@ -140,8 +140,12 @@ public:
                                  std::uint32_t capacity,
                                  ball_hit_t* hits, std::uint32_t* tris) = 0;
 
-    /** @brief Uploads a scene compiled for this geometry, for rendering with plt_path or plt_bdpt. */
-    [[nodiscard]] virtual std::unique_ptr<backend_renderer_t> create_plt_renderer(const plt_scene_t& scene) = 0;
+    /**
+     * @brief Uploads a scene compiled for this geometry, for rendering with
+     *        plt_path or plt_bdpt. (By value: a backend may keep it, for the
+     *        paths it traces on the CPU.)
+     */
+    [[nodiscard]] virtual std::unique_ptr<backend_renderer_t> create_plt_renderer(plt_scene_t scene) = 0;
 };
 
 /** @brief A GPU backend on one device. */
@@ -152,7 +156,8 @@ public:
     /** @brief e.g. "CUDA (OptiX 9.0) on NVIDIA GB10". */
     [[nodiscard]] virtual std::string description() const = 0;
 
-    [[nodiscard]] virtual std::unique_ptr<backend_geometry_t> upload(const bvh_arrays_t& bvh) = 0;
+    /** @brief Uploads a BVH. (By value: a backend may keep it, for the paths it traces on the CPU.) */
+    [[nodiscard]] virtual std::unique_ptr<backend_geometry_t> upload(bvh_arrays_t bvh) = 0;
 };
 
 #if defined(WT_GPU_CUDA)

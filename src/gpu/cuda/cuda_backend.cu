@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -27,6 +28,7 @@
 #include <wt/gpu/kernel/plt_path.hpp>
 #include <wt/gpu/kernel/plt_bdpt.hpp>
 #include "cuda_util.hpp"
+#include "../cpu_paths.hpp"
 
 #if defined(WT_GPU_OPTIX) && !defined(WT_GPU_DBL_PRECISION)
 #include "../optix/optix_rays.hpp"
@@ -126,13 +128,16 @@ struct cuda_film_t {
 
 /**
  * @brief A path to (re-)trace, skipping the splats an earlier attempt made,
- *        with its spectral sample (or `k::choose_spectral`, for a new path).
+ *        with its spectral sample (or `k::choose_spectral`, for a new path);
+ *        of a path that overflowed, the scratch capacity its re-trace needs
+ *        (`k::scratch_capacity_needed`).
  */
 struct path_entry_t {
     std::uint64_t path;
     std::uint32_t skip;
     std::uint32_t seed;
     std::uint32_t spectral;
+    std::uint32_t capacity;
 };
 
 /**
@@ -313,7 +318,7 @@ __global__ void fill_free_slots_kernel(k::u32* free_slots, k::u32 count) {
 
 /** @brief Path `base+i` with `seed` (and a spectral sample of its table), or `list[base+i]` if `list` is given. */
 __device__ path_entry_t path_entry(std::uint64_t base, k::u32 i, const path_entry_t* list, std::uint32_t seed) {
-    return list ? list[base+i] : path_entry_t{ base+i, 0, seed, k::choose_spectral };
+    return list ? list[base+i] : path_entry_t{ base+i, 0, seed, k::choose_spectral, 0 };
 }
 
 /** @brief A path's random number generator: its index and seed determine it. */
@@ -357,8 +362,9 @@ __device__ void end_path(const k::plt_scene& scene, cuda_film_t& film, const pat
     if (s & k::status_scratch_overflow) {
         // the path's generator says which path it is
         const std::uint64_t path = p.rnd.path_lo | std::uint64_t(p.rnd.path_hi)<<32;
-        overflow[atomicAdd(&counters->overflowed, 1u)] = { path, p.splats, p.rnd.seed, p.spectral };
-        s &= ~k::status_scratch_overflow;
+        overflow[atomicAdd(&counters->overflowed, 1u)] = {
+            path, p.splats, p.rnd.seed, p.spectral, k::scratch_capacity_needed(pool.tri_capacity, s) };
+        s &= ~(k::status_scratch_overflow | k::status_scratch_growth_mask);
     } else {
         k::end_path(scene, film, p);
     }
@@ -543,8 +549,9 @@ __global__ void __launch_bounds__(block_size, 2) run_bdpt_paths_kernel(k::plt_sc
                                                    pool.aperture_capacity, path_rng(e), e.path, table,
                                                    e.spectral, s);
         if (s & k::status_scratch_overflow) {
-            overflow[atomicAdd(&counters->overflowed, 1u)] = { e.path, 0, e.seed, spectral };
-            s &= ~k::status_scratch_overflow;
+            overflow[atomicAdd(&counters->overflowed, 1u)] = {
+                e.path, 0, e.seed, spectral, k::scratch_capacity_needed(pool.tri_capacity, s) };
+            s &= ~(k::status_scratch_overflow | k::status_scratch_growth_mask);
         }
         pool.path_ended(spectral);
         if (s!=k::status_ok)
@@ -569,7 +576,7 @@ __global__ void __launch_bounds__(block_size, 2) run_bdpt_paths_kernel(k::plt_sc
  */
 class cuda_plt_renderer_t final : public backend_renderer_t {
 public:
-    cuda_plt_renderer_t(int ordinal, k::bvh_view bvh, const plt_scene_t& scene
+    cuda_plt_renderer_t(int ordinal, k::bvh_view bvh, std::shared_ptr<const bvh_arrays_t> host_bvh, plt_scene_t scene
 #if defined(WT_GPU_USE_OPTIX)
                         , const optix::ray_geometry_t* optix_rays
 #endif
@@ -661,6 +668,9 @@ public:
         params.film = scene.film;
         params.params = scene.params;
         reserve_spectra(std::size_t(tables)*table_size);
+        // kept for the paths traced on the CPU (cpu_paths.hpp)
+        this->host_bvh = std::move(host_bvh);
+        host_arrays = std::move(scene);
     }
 
     std::uint32_t trace(std::uint64_t first, std::uint64_t count, std::uint32_t seed,
@@ -693,19 +703,9 @@ public:
             advance(main, none, 0, 0, 0);
         }
 
-        // paths that outgrew their scratch memory are re-traced with more room, with the spectral samples
-        // they had (kept in `retained`: the tables they came from may have been replaced since)
-        k::u32 capacity = initial_capacity;
-        std::vector<path_entry_t> pending;
-        while (!overflowed.empty()) {
-            if (capacity>=max_capacity)
-                throw std::runtime_error("a path found more than " + std::to_string(max_capacity) +
-                                         " triangles or edges in one query");
-            capacity *= 4;
-            std::swap(pending, overflowed);
-            overflowed.clear();
-
-            // the retained samples are the retries' table (no paths of the main pool are in flight)
+        // the retries' spectral samples: those the paths that overflowed had (kept in `retained`: the tables they
+        // came from may have been replaced since), uploaded as a table of their own, which all retries index
+        if (!overflowed.empty()) {
             const auto count = k::u32(retained.samples.size());
             reserve_spectra(count);
             upload_spectra(0, retained);
@@ -713,12 +713,63 @@ public:
             loaded[0] = { 0, count, ++generation, std::move(retained) };
             retained = {};
             retained_index.clear();
+        }
+
+        // paths that outgrew their scratch memory are re-traced with the room they asked for
+        // (`path_entry_t::capacity`), the least first, in a pool of that capacity: a path that overflows again, at a
+        // later query, asks for more, and joins the paths that asked for as much. Paths that ask for
+        // `cpu_capacity` or more are traced by the CPU meanwhile (see cpu_paths.hpp).
+        std::vector<path_entry_t> pending;
+        std::swap(pending, overflowed);
+        std::unique_ptr<cpu_paths::tracer_t<path_entry_t>> cpu;
+        retracing = true;
+        while (!pending.empty()) {
+            const auto heavy = std::partition(pending.begin(), pending.end(), [&](const auto& e) {
+                return e.capacity<cpu_capacity;
+            });
+            if (heavy!=pending.end()) {
+                if (!cpu)
+                    cpu = std::make_unique<cpu_paths::tracer_t<path_entry_t>>(
+                            host_scene(),
+                            [this](k::u32 c) { return cpu_paths::memory_t{ c, vertex_capacity(c), aperture_capacity(c) }; },
+                            max_capacity, film_size, weights_size);
+                cpu->add(&*heavy, std::size_t(pending.end()-heavy));
+                pending.erase(heavy, pending.end());
+                if (pending.empty())
+                    break;
+            }
+
+            const auto capacity = std::min_element(pending.begin(), pending.end(), [](const auto& a, const auto& b) {
+                return a.capacity<b.capacity;
+            })->capacity;
+            if (capacity>max_capacity)
+                throw std::runtime_error("a path found more than " + std::to_string(max_capacity) +
+                                         " triangles or edges in one query");
+            const auto group = std::partition(pending.begin(), pending.end(), [&](const auto& e) {
+                return e.capacity!=capacity;
+            });
+            const auto paths = std::size_t(pending.end()-group);
 
             wavefront_t retry;
             begin(retry, capacity);
-            path_list.upload(pending.data(), pending.size());
-            path_source_t source = { 0, pending.size(), path_list.get() };
+            path_list.upload(&*group, paths);
+            pending.erase(group, pending.end());
+            path_source_t source = { 0, paths, path_list.get() };
             advance(retry, source, 0, 0, 0, /* count table paths */ false);
+            pending.insert(pending.end(), overflowed.begin(), overflowed.end());
+            overflowed.clear();
+        }
+        retracing = false;
+        if (cpu) {
+            host_status |= cpu->wait();
+            if (cpu_film.empty()) {
+                cpu_film.assign(film_size, 0);
+                cpu_weights.assign(params.params.block_splats() ? weights_size : 0, 0);
+                cpu_light.assign(params.params.bdpt!=0 ? film_size : 0, 0);
+            }
+            cpu->add_films(cpu_film.data(), cpu_weights.empty() ? nullptr : cpu_weights.data(),
+                           cpu_light.empty() ? nullptr : cpu_light.data());
+            cpu.reset();
         }
         // the retries reuse the main pool's memory and spectral tables: start them anew
         main = {};
@@ -731,10 +782,12 @@ public:
     void read_film(double* values, double* weights) override {
         set_device(ordinal);
         film.download(values, film_size);
+        add_cpu(cpu_film, values);
         if (weights) {
             if (!params.params.block_splats())
                 throw std::logic_error("forward transport accumulates no film weights");
             film_weights.download(weights, weights_size);
+            add_cpu(cpu_weights, weights);
         }
     }
 
@@ -743,6 +796,7 @@ public:
         if (params.params.bdpt==0)
             throw std::logic_error("only plt_bdpt accumulates a light image");
         light_film.download(values, film_size);
+        add_cpu(cpu_light, values);
     }
 
 private:
@@ -757,6 +811,13 @@ private:
     static constexpr k::u32 initial_aperture_capacity = 256;
     /** @brief plt_bdpt: memory for paths in flight, which bounds their count. */
     static constexpr std::size_t bdpt_pool_bytes = std::size_t(512)<<20;
+    /**
+     * @brief Overflowed paths that ask for this scratch capacity or more are
+     *        traced by the CPU (cpu_paths.hpp), while the GPU re-traces the
+     *        others: paths that overflow twice are few, and long (see the
+     *        Metal backend's measurements).
+     */
+    static constexpr k::u32 cpu_capacity = 16*initial_capacity;
     /** @brief Whole paths a launch traces at most (its list of overflowed paths holds as many). */
     static constexpr k::u32 launch_paths = 1u<<20;
     /** @brief plt_bdpt: connections a launch defers at most (see `cuda_deferral_t`), if OptiX traces rays. */
@@ -1043,7 +1104,8 @@ private:
 
     /**
      * @brief The last launch's counters; appends the paths that overflowed to
-     *        `overflowed`, with their spectral samples copied to `retained`.
+     *        `overflowed`, with their spectral samples copied to `retained`
+     *        (but for re-traced paths, see `finish`).
      */
     step_counters_t collect_overflowed() {
         step_counters_t c;
@@ -1052,8 +1114,10 @@ private:
             const auto offset = overflowed.size();
             overflowed.resize(offset+c.overflowed);
             overflow.download(overflowed.data()+offset, c.overflowed);
-            for (auto i=offset; i<overflowed.size(); ++i)
-                overflowed[i].spectral = retain(overflowed[i].spectral);
+            // (re-traced paths' samples are in the retries' table already, see `finish`)
+            if (!retracing)
+                for (auto i=offset; i<overflowed.size(); ++i)
+                    overflowed[i].spectral = retain(overflowed[i].spectral);
         }
         return c;
     }
@@ -1091,7 +1155,42 @@ private:
     [[nodiscard]] std::uint32_t read_status() const {
         std::uint32_t status;
         status_word.download(&status, 1);
-        return status;
+        return status | host_status;
+    }
+
+    /** @brief Adds the splats of the paths traced on the CPU (if any) to a film read from the GPU. */
+    static void add_cpu(const std::vector<double>& cpu, double* values) {
+        for (std::size_t i=0; i<cpu.size(); ++i)
+            values[i] += cpu[i];
+    }
+
+    /**
+     * @brief The scene with host pointers to its arrays, the BVH and the
+     *        retries' spectral samples (`loaded[0]`, see `finish`), for the
+     *        CPU's paths (see cpu_paths.hpp).
+     */
+    [[nodiscard]] k::plt_scene host_scene() const {
+        k::plt_scene h = params;
+        const auto host = [](const auto& v) { return v.empty() ? nullptr : v.data(); };
+        h.bvh = { host(host_bvh->nodes), host(host_bvh->tris) };
+        h.tris = host(host_arrays.tris);
+        h.edges = host(host_arrays.edges);
+        h.emitters = host(host_arrays.emitters);
+        h.emitter_cdf = host(host_arrays.emitter_cdf);
+        h.area_tris = host(host_arrays.area_tris);
+        h.area_cdf = host(host_arrays.area_cdf);
+        h.tri_uvs = host(host_arrays.tri_uvs);
+        h.material_shadings = host(host_arrays.material_shadings);
+        h.textures = host(host_arrays.textures);
+        h.bitmaps = host(host_arrays.bitmaps);
+        h.texels = host(host_arrays.texels);
+        h.texel_luts = host(host_arrays.texel_luts);
+        h.fsd_lut = host(host_arrays.fsd_lut);
+        const spectral_table_t& t = loaded[0].table;
+        h.spectra = host(t.samples);
+        h.emissions = host(t.emissions);
+        h.materials = host(t.materials);
+        return h;
     }
 
     int ordinal;
@@ -1160,18 +1259,27 @@ private:
     /** @brief Their spectral samples, indexed by `path_entry_t::spectral`; by (table generation, sample). */
     spectral_table_t                   retained;
     std::unordered_map<std::uint64_t, k::u32> retained_index;
+    /** @brief Whether `finish` is re-tracing paths that overflowed. */
+    bool retracing = false;
+
+    // the paths traced on the CPU: the scene in host memory, their splats, and their status flags
+    std::shared_ptr<const bvh_arrays_t> host_bvh;
+    plt_scene_t                        host_arrays;
+    std::vector<double>                cpu_film, cpu_weights, cpu_light;
+    std::uint32_t                      host_status = 0;
 };
 
 
 class cuda_geometry_t final : public backend_geometry_t {
 public:
-    cuda_geometry_t(int ordinal, const bvh_arrays_t& bvh
+    cuda_geometry_t(int ordinal, bvh_arrays_t bvh_arrays
 #if defined(WT_GPU_USE_OPTIX)
                     , const optix::context_t* optix
 #endif
                     )
-        : ordinal(ordinal)
+        : ordinal(ordinal), host_bvh(std::make_shared<const bvh_arrays_t>(std::move(bvh_arrays)))
     {
+        const bvh_arrays_t& bvh = *host_bvh;
         set_device(ordinal);
         nodes.upload(bvh.nodes.data(), bvh.nodes.size());
         tris.upload(bvh.tris.data(), bvh.tris.size());
@@ -1249,13 +1357,13 @@ public:
         tri_lists.download(out_tris, count*capacity);
     }
 
-    [[nodiscard]] std::unique_ptr<backend_renderer_t> create_plt_renderer(const plt_scene_t& scene) override {
+    [[nodiscard]] std::unique_ptr<backend_renderer_t> create_plt_renderer(plt_scene_t scene) override {
         if (scene.tris.size()!=tri_count)
             throw std::runtime_error("the compiled scene does not match the uploaded geometry");
 #if defined(WT_GPU_USE_OPTIX)
-        return std::make_unique<cuda_plt_renderer_t>(ordinal, view(), scene, optix_rays.get());
+        return std::make_unique<cuda_plt_renderer_t>(ordinal, view(), host_bvh, std::move(scene), optix_rays.get());
 #else
-        return std::make_unique<cuda_plt_renderer_t>(ordinal, view(), scene);
+        return std::make_unique<cuda_plt_renderer_t>(ordinal, view(), host_bvh, std::move(scene));
 #endif
     }
 
@@ -1265,6 +1373,8 @@ private:
     }
 
     int ordinal;
+    /** @brief The BVH in host memory, for the paths renders trace on the CPU (cpu_paths.hpp). */
+    std::shared_ptr<const bvh_arrays_t> host_bvh;
 
     device_buffer_t<k::bvh_node> nodes;
     device_buffer_t<k::bvh_tri>  tris;
@@ -1321,11 +1431,11 @@ public:
                std::to_string(properties.major) + "." + std::to_string(properties.minor) + ")";
     }
 
-    [[nodiscard]] std::unique_ptr<backend_geometry_t> upload(const bvh_arrays_t& bvh) override {
+    [[nodiscard]] std::unique_ptr<backend_geometry_t> upload(bvh_arrays_t bvh) override {
 #if defined(WT_GPU_USE_OPTIX)
-        return std::make_unique<cuda_geometry_t>(ordinal, bvh, optix_context.get());
+        return std::make_unique<cuda_geometry_t>(ordinal, std::move(bvh), optix_context.get());
 #else
-        return std::make_unique<cuda_geometry_t>(ordinal, bvh);
+        return std::make_unique<cuda_geometry_t>(ordinal, std::move(bvh));
 #endif
     }
 

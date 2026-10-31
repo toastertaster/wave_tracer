@@ -40,8 +40,9 @@
  *
  * Cone queries return triangle lists, which paths keep in fixed-capacity
  * scratch memory. A path that outgrows it stops with `status_scratch_overflow`
- * and reports how many splats it made; as its random numbers depend only on
- * its index, the backend re-traces it with more room, skipping those splats.
+ * and reports how many splats it made, and how much more memory it needs
+ * (`scratch_overflow`); as its random numbers depend only on its index, the
+ * backend re-traces it with that much more room, skipping those splats.
  */
 
 namespace wt { namespace gpu { namespace compute_kernel {
@@ -50,6 +51,50 @@ namespace wt { namespace gpu { namespace compute_kernel {
 WT_GPU_CONSTANT constexpr u32 status_scratch_overflow = 2;
 /** @brief A path made `max_path_iterations` steps (counting null interactions) and was stopped. */
 WT_GPU_CONSTANT constexpr u32 status_iteration_limit = 4;
+
+/**
+ * @brief With `status_scratch_overflow`, status bits 8 to 23: bit 8+j says
+ *        that memory the path outgrew must grow 4^j-fold (j>=1) to hold what
+ *        a query found. A path's statuses are or-ed together; the largest
+ *        set bit says how much its re-trace needs (`scratch_growth`). The
+ *        backends grow all of a path's memory (its triangles, edges, aperture
+ *        and plt_bdpt vertices) in proportion.
+ */
+WT_GPU_CONSTANT constexpr u32 status_scratch_growth_shift = 8;
+WT_GPU_CONSTANT constexpr u32 status_scratch_growth_bits = 16;
+WT_GPU_CONSTANT constexpr u32 status_scratch_growth_mask =
+    ((1u<<status_scratch_growth_bits)-1) << status_scratch_growth_shift;
+
+/**
+ * @brief The status of a query that needed `needed` entries of memory of
+ *        `capacity` (more than it has): `status_scratch_overflow`, and the
+ *        fourfold growths that hold them.
+ */
+WT_GPU_FN u32 scratch_overflow(u64 needed, u32 capacity) {
+    u32 j = 1;
+    for (u64 c=u64(capacity)*4; c<needed && j+1<status_scratch_growth_bits; c*=4)
+        ++j;
+    return status_scratch_overflow | (1u << (status_scratch_growth_shift+j));
+}
+
+/**
+ * @brief The fourfold growths of its memory that a path with status `status`
+ *        needs (`scratch_overflow`): at least 1 if it overflowed, 0 if not.
+ */
+WT_GPU_FN u32 scratch_growth(u32 status) {
+    if (!(status & status_scratch_overflow))
+        return 0;
+    u32 j = 0;
+    for (u32 b=(status & status_scratch_growth_mask) >> status_scratch_growth_shift; b>1; b>>=1)
+        ++j;
+    return j>0 ? j : 1;
+}
+
+/** @brief The scratch capacity that a path that overflowed memory of `capacity` with status `status` needs. */
+WT_GPU_FN u32 scratch_capacity_needed(u32 capacity, u32 status) {
+    const u64 c = u64(capacity) << (2*scratch_growth(status));
+    return c<0xffffffffull ? u32(c) : 0xffffffffu;
+}
 
 /**
  * @brief Steps a path may take, counting null interactions, which do not
@@ -702,7 +747,7 @@ WT_GPU_FN traversal_t traverse(const WT_GPU_THREAD Geometry& geometry, const WT_
         const cone_hit ch = geometry.intersect_cone(envelope, range{ dist, inf() }, 2, sink);
         status |= ch.status;
         if (ch.tri_count>scratch.tri_capacity) {
-            status |= status_scratch_overflow;
+            status |= scratch_overflow(ch.tri_count, scratch.tri_capacity);
             return ret;
         }
 
@@ -1418,7 +1463,7 @@ WT_GPU_FN bool trace_step(const WT_GPU_THREAD plt_scene& scene,
         const cone_hit ch = geometry.intersect_cone(b.envelope, range{ dist - zdist/2, dist + zdist/2 }, 1, sink);
         status |= ch.status;
         if (ch.tri_count>scratch.tri_capacity) {
-            status |= status_scratch_overflow;
+            status |= scratch_overflow(ch.tri_count, scratch.tri_capacity);
             return false;
         }
         tr.tri_count = ch.tri_count;
@@ -1500,7 +1545,7 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
     u32 edge_count = 0;
     if ((is_ballistic && !b.is_ray() && !ray_trace) || (!is_ballistic && opts.fsd!=0)) {
         if (!collect_edges(scene, scratch.tris, tr.tri_count, scratch.edges, scratch.edge_capacity, edge_count)) {
-            status |= status_scratch_overflow;
+            status |= scratch_overflow(edge_count, scratch.edge_capacity);
             return false;
         }
     }

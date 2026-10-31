@@ -216,14 +216,14 @@ With beams:
      - 1.30 s
    * - ``cornell-box/sphere_polarization`` (plt_bdpt, Stokes)
      - res=128 spp=8
-     - 14.4 s
-     - 15.2 s
+     - 7.8 s
+     - 8.2 s
      - 7.3 s
      - 12.6 s
    * - ``bidir_room`` (plt_bdpt)
      - res=96 spp=4
-     - 11.0 s
-     - 10.6 s
+     - 360 ms
+     - 361 ms
      - 339 ms
      - 8.45 s
 
@@ -334,7 +334,7 @@ In ray-tracing mode (``--ray-tracing``), with the scenes' triangle counts:
 
 * **plt_path renders 1.7 to 4 times faster with beams, and 3 to 7 times faster with rays, on the M4's GPU than on its CPU**, and 2 to 4.5 times slower than on the GB10, a GPU with several times the M4's 32-bit floating-point throughput.
 * **Hardware ray tracing pays off with geometry**: ray-traced renders of the scenes of a thousand triangles or more take 25% to 50% less time with it (``box``: 323 ms to 159 ms; ``veach_mis``: 521 ms to 307 ms; ``sionna_etoile``: 225 ms to 148 ms; ``sphere_polarization``: 63 ms to 41 ms; ``bidir_room``'s 21 ms, mostly a pass's fixed cost, only 9%), and ``glass_box`` and ``sionna_etoile`` with beams 15% to 20% less. On the test scenes of a few dozen triangles, whose BVH is a leaf or two, the ported traversal takes up to 16% less time; and beams, whose cone queries always traverse the BVH, gain less.
-* **plt_bdpt with beams is slower on the GPU than on the CPU**: ``sphere_polarization`` takes twice as long, and ``bidir_room`` thirty times. In ``sphere_polarization``, the first pass takes about 2 s; the rest is spent re-tracing the paths that overflow their scratch memory (see :doc:`design`), whose beams overlap thousands of triangles and edges: a few hundred such paths, each traced by a single GPU thread, far slower than a CPU core. The GB10 spends most of its 12.6 s on them too.
+* **plt_bdpt with beams is no faster on the GPU than on the CPU** in these two scenes: most of their time goes to the paths that overflow their scratch memory (see :doc:`design`), whose beams overlap thousands of triangles and edges. Before such paths were traced by the CPU, the GPU took 14.7 s for ``sphere_polarization`` (its first pass about 2 s; then thousands of re-traces, the last few hundred each on a single GPU thread for seconds) and 10.9 s for ``bidir_room``; the GB10 spends most of its 12.6 s and 8.45 s on them too.
 
 What was measured, and decided, while tuning the Metal backend:
 

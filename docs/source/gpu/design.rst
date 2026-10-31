@@ -84,7 +84,10 @@ The backend organizes them so that the GPU keeps busy despite that:
 
 **Scratch memory.**
    A beam query returns all the triangles and edges within the beam's footprint, into a per-path buffer with room for 64.
-   A path whose query finds more is recorded and traced again, from its start, after the pass, with four times the room (up to :math:`2^{20}` entries); it skips the splats its earlier attempt made (``plt_bdpt`` paths that overflow splat nothing the first time).
+   A path whose query finds more stops, and is recorded with the room that query needed (rounded up to a power-of-four multiple of 64, up to :math:`2^{20}` entries); after the pass, it is traced again from its start, with the same random numbers, skipping the splats its earlier attempt made (``plt_bdpt`` paths that overflow splat nothing).
+   Re-traces run in a pool of paths asking for the same room, the least first; a path that overflows again, at a later query, asks for more and joins those paths. Paths that ask for 1024 entries or more (in ``sphere_polarization`` at 128×128 pixels and 8 samples per pixel, 18,829 of 131,072) are traced by the CPU's threads instead, with the kernels' own code compiled as host C++ (``src/gpu/cpu_paths.hpp``), while the GPU re-traces the others: their beams overlap so much geometry that a GPU thread takes seconds for one, and their memory leaves room for few at once, so that the GPU's last re-traces waited on a handful of them, while a CPU core traces them many times faster.
+   They are the paths the GPU would have traced: on the M4, a ``sphere_polarization`` render whose 18,000 heaviest paths the CPU traced differs from a GPU-only one by a relative L1 difference of :math:`10^{-5}`.
+   The CUDA backend keeps the compiled scene and the BVH in host memory for them; the Metal backend reads its buffers, in unified memory, from the CPU.
 
 **plt_bdpt connections.**
    ``plt_bdpt`` connects the vertices of its sensor and emitter subpaths, each connection needing a shadow ray.
@@ -115,4 +118,4 @@ Precision and limits
 * BVH traversals have fixed-size stacks: an overflow stops the render with an error.
 * Paths stop after :math:`2^{14}` steps, with a warning.
 * Scenes are compiled per sensor (emitters, materials, film), but share one upload of the geometry: a render uploads the BVH once for all its sensors, or uses an upload it is given (``render_opts_t::gpu_geometry``; the Rust bindings give their scene's).
-* One GPU renders; CPU threads do not take part in rendering.
+* One GPU renders; CPU threads trace only the heaviest of the re-traced paths (see `Executing paths`_).

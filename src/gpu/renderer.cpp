@@ -1065,7 +1065,7 @@ void renderer_t::create(const scene_t& scene, const sensor::sensor_t& sensor, co
     // after compiling, which refuses scenes the GPU cannot render before anything is uploaded
     geometry = upload();
     try {
-        backend = geometry->backend->create_plt_renderer(compiled);
+        backend = geometry->backend->create_plt_renderer(std::move(compiled));
     } catch (const gpu_error_t&) {
         throw;
     } catch (const std::exception& e) {

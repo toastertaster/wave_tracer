@@ -525,7 +525,9 @@ WT_GPU_FN gaussian_wavefront wavefront_at(const WT_GPU_THREAD cone& envelope, re
  *        that the beam `envelope` meets where its wavefront is `wf` (in its
  *        local frame), of wavenumber `k`, `total_power` of whose intensity
  *        passes the opening: its edges go to `edges[offset ..]`, up to
- *        `capacity` (more: status_scratch_overflow, and an empty aperture).
+ *        `capacity` (more: an empty aperture, and the `scratch_overflow` of
+ *        memory of `offset+capacity` edges, those before the aperture's and
+ *        its own).
  */
 WT_GPU_FN fsd_aperture build_fsd_aperture(const WT_GPU_THREAD plt_scene& scene,
                                           const WT_GPU_GLOBAL u32* edge_ids, u32 count,
@@ -547,6 +549,7 @@ WT_GPU_FN fsd_aperture build_fsd_aperture(const WT_GPU_THREAD plt_scene& scene,
     const auto mix2 = [](vec2 a, vec2 b, real t) { return a*(1-t) + b*t; };
 
     real P_total = 0;
+    u32 needed = 0;     // edges, also past `capacity` (then only counted)
     for (u32 j=0; j<count; ++j) {
         const edge ed = scene.edges[edge_ids[j]];
         // only the projected silhouette
@@ -585,18 +588,21 @@ WT_GPU_FN fsd_aperture build_fsd_aperture(const WT_GPU_THREAD plt_scene& scene,
                 const real ee2 = sqr(length2(e.e));
                 e.pdf = ee2*fsd_PA1*sqr(e.a_b) + ee2*fsd_PA2*sqr(e.h);
                 if (e.pdf>real(0)) {
-                    if (ap.count==capacity) {
-                        status |= status_scratch_overflow;
-                        ap.count = 0;
-                        return ap;
+                    if (needed++<capacity) {
+                        edges[offset + ap.count++] = e;
+                        P_total += e.pdf;
                     }
-                    edges[offset + ap.count++] = e;
-                    P_total += e.pdf;
                 }
             }
             v1 = v2;
             a = b;
         }
+    }
+
+    if (needed>capacity) {
+        status |= scratch_overflow(u64(offset)+needed, offset+capacity);
+        ap.count = 0;
+        return ap;
     }
 
     // power in the 0-th order lobe (the CPU's approximation)

@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "plt_shared.hpp"
+#include "../cpu_paths.hpp"
 
 using namespace wt::gpu;
 using namespace wt::gpu::metal_backend;
@@ -137,19 +138,9 @@ public:
             advance(main, none, 0, 0, 0);
         }
 
-        // paths that outgrew their scratch memory are re-traced with more room, with the spectral samples
-        // they had (kept in `retained`: the tables they came from may have been replaced since)
-        k::u32 capacity = initial_capacity;
-        std::vector<path_entry> pending;
-        while (!overflowed.empty()) {
-            if (capacity>=max_capacity)
-                throw std::runtime_error("a path found more than " + std::to_string(max_capacity) +
-                                         " triangles or edges in one query");
-            capacity *= 4;
-            std::swap(pending, overflowed);
-            overflowed.clear();
-
-            // the retained samples are the retries' table (no paths of the main pool are in flight)
+        // the retries' spectral samples: those the paths that overflowed had (kept in `retained`: the tables they
+        // came from may have been replaced since), uploaded as a table of their own, which all retries index
+        if (!overflowed.empty()) {
             const auto count = k::u32(retained.samples.size());
             reserve_spectra(count);
             upload_spectra(0, retained);
@@ -157,12 +148,58 @@ public:
             loaded[0] = { 0, count, ++generation, std::move(retained) };
             retained = {};
             retained_index.clear();
+        }
+
+        // paths that outgrew their scratch memory are re-traced with the room they asked for
+        // (`path_entry::capacity`), the least first, in a pool of that capacity: a path that overflows again, at a
+        // later query, asks for more, and joins the paths that asked for as much. Paths that ask for
+        // `cpu_capacity` or more are traced by the CPU meanwhile (see cpu_paths.hpp).
+        std::vector<path_entry> pending;
+        std::swap(pending, overflowed);
+        std::unique_ptr<cpu_paths::tracer_t<path_entry>> cpu;
+        retracing = true;
+        while (!pending.empty()) {
+            const auto heavy = std::partition(pending.begin(), pending.end(), [&](const auto& e) {
+                return e.capacity<cpu_capacity;
+            });
+            if (heavy!=pending.end()) {
+                if (!cpu)
+                    cpu = std::make_unique<cpu_paths::tracer_t<path_entry>>(
+                            host_scene(),
+                            [this](k::u32 c) { return cpu_paths::memory_t{ c, vertex_capacity(c), aperture_capacity(c) }; },
+                            max_capacity, film_size, weights_size);
+                cpu->add(&*heavy, std::size_t(pending.end()-heavy));
+                pending.erase(heavy, pending.end());
+                if (pending.empty())
+                    break;
+            }
+
+            const auto capacity = std::min_element(pending.begin(), pending.end(), [](const auto& a, const auto& b) {
+                return a.capacity<b.capacity;
+            })->capacity;
+            if (capacity>max_capacity)
+                throw std::runtime_error("a path found more than " + std::to_string(max_capacity) +
+                                         " triangles or edges in one query");
+            const auto group = std::partition(pending.begin(), pending.end(), [&](const auto& e) {
+                return e.capacity!=capacity;
+            });
+            const auto paths = std::size_t(pending.end()-group);
 
             wavefront_t retry;
             begin(retry, capacity);
-            path_list.upload(pending.data(), pending.size());
-            path_source_t source = { 0, pending.size(), path_list.gpu_pointer() };
+            path_list.upload(&*group, paths);
+            pending.erase(group, pending.end());
+            path_source_t source = { 0, paths, path_list.gpu_pointer() };
             advance(retry, source, 0, 0, 0, /* count table paths */ false);
+            pending.insert(pending.end(), overflowed.begin(), overflowed.end());
+            overflowed.clear();
+        }
+        retracing = false;
+        if (cpu) {
+            status_word.data()[0] |= cpu->wait();
+            cpu->add_films(film_sum.data(), weights_sum.empty() ? nullptr : weights_sum.data(),
+                           light_sum.empty() ? nullptr : light_sum.data());
+            cpu.reset();
         }
         // the retries reuse the main pool's memory and spectral tables: start them anew
         main = {};
@@ -208,6 +245,14 @@ private:
      *        fill the GPU; unified memory affords more.
      */
     static constexpr std::size_t max_bdpt_pool_bytes = std::size_t(2)<<30;
+    /**
+     * @brief Overflowed paths that ask for this scratch capacity or more are
+     *        traced by the CPU (cpu_paths.hpp), while the GPU re-traces the
+     *        others: paths that overflow twice are few, and long. Measured on
+     *        an M4 (plt_bdpt with beams): bidir_room 10.9 s -> 0.33 s,
+     *        sphere_polarization 14.7 s -> 7.5 s; 256 or 4096 do no better.
+     */
+    static constexpr k::u32 cpu_capacity = 16*initial_capacity;
     /** @brief Whole paths a launch traces at most (its list of overflowed paths holds as many). */
     static constexpr k::u32 launch_paths = 1u<<20;
     /** @brief Paths in flight few enough to finish in one launch, rather than a launch per step. */
@@ -264,6 +309,37 @@ private:
         return p.bdpt!=0 || p.ray_tracing_only!=0;
     }
     [[nodiscard]] bool whole_paths() const noexcept { return whole_paths(params.params); }
+
+    /**
+     * @brief The scene with host pointers to its arrays, the BVH and the
+     *        spectral samples (unified memory: the same buffers), for the
+     *        CPU's paths (see cpu_paths.hpp).
+     */
+    [[nodiscard]] k::plt_scene host_scene() const {
+        k::plt_scene h = params;
+        const auto host = [](const auto& buffer, const auto* gpu) {
+            return gpu ? buffer.data() : nullptr;
+        };
+        h.bvh = { static_cast<const k::bvh_node*>(bvh.nodes.contents),
+                  static_cast<const k::bvh_tri*>(bvh.tris.contents) };
+        h.tris = host(tris, params.tris);
+        h.edges = host(edges, params.edges);
+        h.spectra = host(spectra, params.spectra);
+        h.emissions = host(sample_emissions, params.emissions);
+        h.materials = host(sample_materials, params.materials);
+        h.emitters = host(emitters, params.emitters);
+        h.emitter_cdf = host(emitter_cdf, params.emitter_cdf);
+        h.area_tris = host(area_tris, params.area_tris);
+        h.area_cdf = host(area_cdf, params.area_cdf);
+        h.tri_uvs = host(tri_uvs, params.tri_uvs);
+        h.material_shadings = host(material_shadings, params.material_shadings);
+        h.textures = host(textures, params.textures);
+        h.bitmaps = host(bitmaps, params.bitmaps);
+        h.texels = host(texels, params.texels);
+        h.texel_luts = host(texel_luts, params.texel_luts);
+        h.fsd_lut = host(fsd_lut, params.fsd_lut);
+        return h;
+    }
 
     /** @brief Uploads a scene array; its GPU address, or null if it is empty (as the kernels expect). */
     template <typename T>
@@ -587,7 +663,8 @@ private:
 
     /**
      * @brief The last launch's counters; appends the paths that overflowed to
-     *        `overflowed`, with their spectral samples copied to `retained`.
+     *        `overflowed`, with their spectral samples copied to `retained`
+     *        (but for re-traced paths, see `finish`).
      */
     step_counters collect_overflowed() {
         const step_counters c = *counters.data();
@@ -595,8 +672,10 @@ private:
             const auto offset = overflowed.size();
             overflowed.resize(offset+c.overflowed);
             overflow.download(overflowed.data()+offset, c.overflowed);
-            for (auto i=offset; i<overflowed.size(); ++i)
-                overflowed[i].spectral = retain(overflowed[i].spectral);
+            // (re-traced paths' samples are in the retries' table already, see `finish`)
+            if (!retracing)
+                for (auto i=offset; i<overflowed.size(); ++i)
+                    overflowed[i].spectral = retain(overflowed[i].spectral);
         }
         return c;
     }
@@ -690,6 +769,8 @@ private:
     /** @brief Their spectral samples, indexed by `path_entry::spectral`; by (table generation, sample). */
     spectral_table_t                   retained;
     std::unordered_map<std::uint64_t, k::u32> retained_index;
+    /** @brief Whether `finish` is re-tracing paths that overflowed. */
+    bool retracing = false;
 };
 
 }

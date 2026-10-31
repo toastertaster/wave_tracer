@@ -208,7 +208,7 @@ public:
         tri_lists.download(out_tris, count*capacity);
     }
 
-    [[nodiscard]] std::unique_ptr<backend_renderer_t> create_plt_renderer(const plt_scene_t& scene) override {
+    [[nodiscard]] std::unique_ptr<backend_renderer_t> create_plt_renderer(plt_scene_t scene) override {
         if (scene.tris.size()!=tri_count)
             throw std::runtime_error("the compiled scene does not match the uploaded geometry");
         return metal_backend::create_plt_renderer(context, { nodes.get(), tris.get(), accel }, scene);
@@ -281,7 +281,7 @@ public:
                to_string(context->device.name);
     }
 
-    [[nodiscard]] std::unique_ptr<backend_geometry_t> upload(const bvh_arrays_t& bvh) override {
+    [[nodiscard]] std::unique_ptr<backend_geometry_t> upload(bvh_arrays_t bvh) override {
         return std::make_unique<metal_geometry_t>(context, bvh, hardware_rays);
     }
 

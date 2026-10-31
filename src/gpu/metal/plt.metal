@@ -80,7 +80,7 @@ bvh_geometry geometry_of(const thread k::plt_scene& scene, acceleration_structur
 
 /** @brief Path `base+i` with `seed` (and a spectral sample of its table), or `list[base+i]` if there is a list. */
 path_entry entry_of(const thread plt_launch& l, u32 i) {
-    return l.list ? l.list[l.base+i] : path_entry{ l.base+i, 0, l.seed, k::choose_spectral };
+    return l.list ? l.list[l.base+i] : path_entry{ l.base+i, 0, l.seed, k::choose_spectral, 0 };
 }
 
 /** @brief A path's random number generator: its index and seed determine it. */
@@ -110,8 +110,9 @@ void end_path(const thread k::plt_scene& scene, const thread plt_launch& l, thre
     if (s & k::status_scratch_overflow) {
         // the path's generator says which path it is
         const u64 path = p.rnd.path_lo | u64(p.rnd.path_hi)<<32;
-        l.overflow[atomic_add(&l.counters->overflowed, 1u)] = { path, p.splats, p.rnd.seed, p.spectral };
-        s &= ~k::status_scratch_overflow;
+        l.overflow[atomic_add(&l.counters->overflowed, 1u)] = {
+            path, p.splats, p.rnd.seed, p.spectral, k::scratch_capacity_needed(l.pool.tri_capacity, s) };
+        s &= ~(k::status_scratch_overflow | k::status_scratch_growth_mask);
     } else {
         film_view film = l.film;
         k::end_path(scene, film, p);
@@ -321,8 +322,9 @@ kernel void run_bdpt_paths(constant k::plt_scene& scene_ [[buffer(0)]], constant
                                                 l.pool.aperture_capacity, path_rng(e), e.path, l.table,
                                                 e.spectral, s);
         if (s & k::status_scratch_overflow) {
-            l.overflow[atomic_add(&l.counters->overflowed, 1u)] = { e.path, 0, e.seed, spectral };
-            s &= ~k::status_scratch_overflow;
+            l.overflow[atomic_add(&l.counters->overflowed, 1u)] = {
+                e.path, 0, e.seed, spectral, k::scratch_capacity_needed(l.pool.tri_capacity, s) };
+            s &= ~(k::status_scratch_overflow | k::status_scratch_growth_mask);
         }
         l.pool.path_ended(spectral);
         if (s!=k::status_ok)

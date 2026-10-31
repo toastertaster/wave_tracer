@@ -64,13 +64,16 @@ struct film_view {
 
 /**
  * @brief A path to (re-)trace, skipping the splats an earlier attempt made,
- *        with its spectral sample (or `compute_kernel::choose_spectral`, for a new path).
+ *        with its spectral sample (or `compute_kernel::choose_spectral`, for a
+ *        new path); of a path that overflowed, the scratch capacity its
+ *        re-trace needs (`compute_kernel::scratch_capacity_needed`).
  */
 struct path_entry {
     u64 path;
     u32 skip;
     u32 seed;
     u32 spectral;
+    u32 capacity;
 };
 
 /**
