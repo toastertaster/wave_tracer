@@ -13,7 +13,7 @@ At a glance
 * **Beams cost far more than rays.** ``plt_path`` with beams takes 3 to 18 times longer than in ray-tracing mode; ``plt_bdpt`` with beams, hundreds of times longer (380× and 540× below). Ray tracing renders millions of paths per second on any of these scenes.
 * **A beam's cost grows with the geometry its footprint overlaps.** Finely tessellated meshes, and wide beams (of coarse films), make beam queries return many triangles and edges, all of which the path then processes.
 * **OptiX matters only for plt_bdpt.** It traces ``plt_bdpt``'s connection shadow rays (0 to 20% faster); ``plt_path``, with beams or rays, renders at the same speed with or without it.
-* **On Apple silicon (Metal)**, an M4's GPU renders ``plt_path`` 2 to 7 times faster than its CPU, and hardware ray tracing (M3 and later), which Metal's path kernels use for all their rays, renders ray-traced scenes of thousands of triangles up to twice as fast (see `Metal on Apple silicon`_).
+* **On Apple silicon (Metal)**, an M4's GPU renders ``plt_path`` 1.7 to 7 times faster than its CPU, and hardware ray tracing (M3 and later), which Metal's path kernels use for all their rays, renders ray-traced scenes of thousands of triangles up to twice as fast (see `Metal on Apple silicon`_).
 * **64-bit kernels are 3 to 8 times slower** on the GB10, a GPU with a low 64-bit floating-point rate.
 * **Small renders do not fill the GPU.** A pass has a fixed cost of tens of milliseconds for ``plt_path``, and of seconds for ``plt_bdpt`` with beams, whose longest paths dominate a small pass.
 
@@ -202,6 +202,12 @@ With beams:
      - 1.2 s
      - 2.5 s
      - 464 ms
+   * - ``sionna_etoile`` (coverage)
+     - res=512 spp=64
+     - 4.5 s
+     - 5.3 s
+     - 7.6 s
+     - 1.30 s
    * - ``cornell-box/sphere_polarization`` (plt_bdpt, Stokes)
      - res=128 spp=8
      - 14.4 s
@@ -285,6 +291,13 @@ In ray-tracing mode (``--ray-tracing``), with the scenes' triangle counts:
      - 103 ms
      - 554 ms
      - 45 ms
+   * - ``sionna_etoile`` (coverage)
+     - res=512 spp=64
+     - 13058
+     - 148 ms
+     - 225 ms
+     - 803 ms
+     - 71 ms
    * - ``cornell-box/sphere_polarization`` (plt_bdpt, Stokes)
      - res=128 spp=8
      - 20502
@@ -293,10 +306,10 @@ In ray-tracing mode (``--ray-tracing``), with the scenes' triangle counts:
      - 116 ms
      - 33 ms
 
-* **plt_path renders 2 to 4 times faster with beams, and 3 to 7 times faster with rays, on the M4's GPU than on its CPU**, and 2 to 4.5 times slower than on the GB10, a GPU with several times the M4's 32-bit floating-point throughput.
-* **Hardware ray tracing pays off with geometry**: ray-traced renders of the scenes of a thousand triangles or more take 25% to 50% less time with it (``box``: 323 ms to 159 ms; ``sphere_polarization``: 63 ms to 41 ms), and ``glass_box`` with beams 20% less. On the test scenes of a few dozen triangles, whose BVH is a leaf or two, the ported traversal takes up to 16% less time; and beams, whose cone queries always traverse the BVH, gain less.
+* **plt_path renders 1.7 to 4 times faster with beams, and 3 to 7 times faster with rays, on the M4's GPU than on its CPU**, and 2 to 4.5 times slower than on the GB10, a GPU with several times the M4's 32-bit floating-point throughput.
+* **Hardware ray tracing pays off with geometry**: ray-traced renders of the scenes of a thousand triangles or more take 25% to 50% less time with it (``box``: 323 ms to 159 ms; ``sionna_etoile``: 225 ms to 148 ms; ``sphere_polarization``: 63 ms to 41 ms), and ``glass_box`` and ``sionna_etoile`` with beams 15% to 20% less. On the test scenes of a few dozen triangles, whose BVH is a leaf or two, the ported traversal takes up to 16% less time; and beams, whose cone queries always traverse the BVH, gain less.
 * **plt_bdpt with beams is slower on the GPU than on the CPU** in ``sphere_polarization``. Its first pass takes about 2 s; the rest is spent re-tracing the paths that overflow their scratch memory (see :doc:`design`), whose beams overlap thousands of triangles and edges: a few hundred such paths, each traced by a single GPU thread, far slower than a CPU core. The GB10 spends most of its 12.6 s on them too.
-* ``veach_mis``, ``sionna_etoile`` and ``bidir_room`` are missing: on macOS, their lengths in centimetres do not parse (libc++ reads the ``c`` of ``cm`` as part of the number), and ``sionna_etoile``'s meshes are Git LFS objects.
+* ``veach_mis`` and ``bidir_room`` are missing: on macOS, their lengths in centimetres do not parse (libc++ reads the ``c`` of ``cm`` as part of the number).
 
 What was measured, and decided, while tuning the Metal backend:
 
