@@ -4,6 +4,7 @@ Gallery
 
 Scenes rendered on the GPU (an NVIDIA GB10, CUDA + OptiX build), with their render times, as the command line reports them (``Elapsed``).
 The images are the renders' tonemapped outputs, downscaled for this page, unless noted.
+The times of the renders with beams of ``cornell-box/box.xml``, ``sphere_polarization``, ``colourchecker`` and ``bidir_room`` are since the CPU traces the heaviest re-traced paths (``c3ffba8``; see :doc:`performance`), which changes their images only by rounding.
 To render one, run, from the repository's root:
 
 .. code-block:: sh
@@ -57,7 +58,7 @@ Scenes of ``scenes/``
      - ``plt_bdpt``, beams
      - 256×256, RGB
      - 64
-     - 77.2 s
+     - 11.2 s
    * - ``cornell-box/sphere_polarization.xml``
      - ``plt_bdpt``, rays
      - 384×384, Stokes
@@ -67,17 +68,17 @@ Scenes of ``scenes/``
      - ``plt_bdpt``, beams
      - 192×192, Stokes
      - 16
-     - 31.4 s
+     - 20.7 s
    * - ``colourchecker/colourchecker.xml``
      - backward ``plt_path``, beams
      - 192×144, Stokes
      - 4
-     - 22.7 s
+     - 2.24 s
    * - ``bidir_room/room.xml``
      - ``plt_bdpt``, beams
      - 192×109, RGB
      - 4
-     - 22.3 s
+     - 661 ms
 
 .. figure:: ../_static/gpu/veach_mis.jpg
    :width: 90%
@@ -119,7 +120,7 @@ Scenes of ``scenes/``
    .. grid-item-card:: ``sphere_polarization``, beams
       :img-top: ../_static/gpu/sphere_polarization_beams.jpg
 
-      ``plt_bdpt`` with beams, 192×192, 16 samples per pixel: 31.4 s. Beams make ``plt_bdpt`` paths hundreds of times costlier (see :doc:`performance`).
+      ``plt_bdpt`` with beams, 192×192, 16 samples per pixel: 20.7 s. Beams make ``plt_bdpt`` paths tens to hundreds of times costlier (see :doc:`performance`).
 
 
 Test scenes
