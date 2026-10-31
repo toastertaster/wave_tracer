@@ -302,9 +302,23 @@ __device__ T shuffle_words(unsigned mask, const T& v, int src) {
     memcpy(&r, w, sizeof(T));
     return r;
 }
+#elif defined(__METAL_VERSION__)
+/** @brief `v` of SIMD lane `src`, a 32-bit word at a time. */
+template <typename T>
+WT_GPU_FN T shuffle_words(T v, ushort src) {
+    static_assert(sizeof(T)%sizeof(u32)==0);
+    thread u32* w = reinterpret_cast<thread u32*>(&v);
+    for (u32 i=0; i<sizeof(T)/sizeof(u32); ++i)
+        w[i] = metal::simd_shuffle(w[i], src);
+    return v;
+}
+/** @brief The lowest lane of a SIMD-group vote. */
+WT_GPU_FN ushort first_lane(metal::simd_vote v) {
+    return ushort(metal::ctz(ulong(metal::simd_vote::vote_t(v))));
+}
 #endif
 
-/** @brief Tries of a sample that a lane makes alone before its warp helps (see `fsd_first_accepted`). */
+/** @brief Tries of a sample that a lane makes alone before its warp (SIMD-group) helps (see `fsd_first_accepted`). */
 WT_GPU_CONSTANT constexpr u64 fsd_solo_tries = 16;
 
 /**
@@ -313,8 +327,8 @@ WT_GPU_CONSTANT constexpr u64 fsd_solo_tries = 16;
  *
  *        A sample may take hundreds of tries, in which a warp's lanes that
  *        sample at once would otherwise wait for the one taking the most: on
- *        CUDA, after `fsd_solo_tries` alone, they take each one's remaining
- *        tries together instead, a try per lane.
+ *        CUDA and Metal, after `fsd_solo_tries` alone, they take each one's
+ *        remaining tries together instead, a try per lane.
  */
 WT_GPU_FN fsd_try_t fsd_first_accepted(const WT_GPU_GLOBAL real* lut, const WT_GPU_THREAD fsd_aperture& ap,
                                        const WT_GPU_GLOBAL fsd_edge* edges, u32x4 key, u64 max_tries) {
@@ -345,6 +359,38 @@ WT_GPU_FN fsd_try_t fsd_first_accepted(const WT_GPU_GLOBAL real* lut, const WT_G
             if (accepted!=0) {
                 const fsd_try_t a = shuffle_words(team, t, __ffs(accepted)-1);
                 if (int(lane)==owner)
+                    first = a;
+                break;
+            }
+        }
+    }
+#elif defined(__METAL_VERSION__)
+    // as CUDA's, with SIMD-group functions (which act on the active lanes, the team)
+    const u64 solo = max_tries<fsd_solo_tries ? max_tries : fsd_solo_tries;
+    for (u64 tr=0; tr<solo && !first.accepted; ++tr)
+        first = fsd_try(lut, ap, edges, key, tr);
+
+    const u32 size = metal::simd_sum(1u);
+    const u32 rank = metal::simd_prefix_exclusive_sum(1u);
+    for (ulong pending=ulong(metal::simd_vote::vote_t(metal::simd_ballot(!first.accepted)));
+         pending!=0; pending &= pending-1) {
+        // the tries of lane `owner`'s sample
+        const ushort owner = ushort(metal::ctz(pending));
+        const fsd_aperture oap = shuffle_words(ap, owner);
+        const auto oedges = shuffle_words(edges, owner);
+        const u32x4 okey = shuffle_words(key, owner);
+        const u64 otries = shuffle_words(max_tries, owner);
+        // whether this lane is `owner`: lane ids are not at hand, but the owner's shuffle of a lane's rank is its own
+        const bool owns = shuffle_words(rank, owner)==rank;
+        for (u64 base=fsd_solo_tries; base<otries; base+=size) {
+            fsd_try_t t = { { 0,0 }, 0, false };
+            if (base+rank<otries)
+                t = fsd_try(lut, oap, oedges, okey, base+rank);
+            // the first accepted: of the lowest rank, the lowest lane
+            const metal::simd_vote accepted = metal::simd_ballot(t.accepted);
+            if (accepted.any()) {
+                const fsd_try_t a = shuffle_words(t, first_lane(accepted));
+                if (owns)
                     first = a;
                 break;
             }

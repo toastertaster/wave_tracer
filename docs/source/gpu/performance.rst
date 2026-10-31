@@ -2,7 +2,7 @@
 Performance
 =======================================
 
-All times on this page are render times on an NVIDIA GB10 (48 SMs, compute capability 12.1; CUDA 13.0, OptiX 9.0), of single runs, which vary by a few percent from run to run.
+Times on this page are render times on an NVIDIA GB10 (48 SMs, compute capability 12.1; CUDA 13.0, OptiX 9.0), except those of `Metal on Apple silicon`_, of single runs, which vary by a few percent from run to run.
 They exclude loading the scene, building its BVH and uploading it to the GPU.
 Scenes are those in ``scenes/`` and the test scenes of the Rust bindings (``tests/scenes``), rendered with the defines given (``-D name=value``); a film of resolution ``res`` is ``res`` pixels wide.
 
@@ -127,6 +127,118 @@ The same scenes in the CUDA and the CUDA + OptiX builds, with beams and in ray-t
 
 In ``plt_path`` renders the two builds differ by no more than run-to-run noise, as the path kernels use the CUDA traversals in both.
 In ``plt_bdpt`` renders, OptiX traces the connections' shadow rays in batches (see :doc:`design`): ``bidir_room`` renders 18% faster with it, while ``sphere_polarization``, whose cost lies elsewhere, does not change.
+
+
+Metal on Apple silicon
+----------------------
+
+The Metal backend on an Apple M4 (10-core GPU; 4 performance and 6 efficiency CPU cores, 32 GB; macOS 27.2, Metal toolchain 32023), against the same build rendering on the M4's CPU (all 10 cores), and the GB10 times above (CUDA + OptiX):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 16 10 10 10 10 10 10
+
+   * - Scene
+     - Defines
+     - Beams, Metal
+     - Beams, M4 CPU
+     - Beams, GB10
+     - Rays, Metal
+     - Rays, M4 CPU
+     - Rays, GB10
+   * - test ``box`` (plt_path)
+     - res=256 spp=64
+     - 929 ms
+     - 3.5 s
+     - 451 ms
+     - 328 ms
+     - 1.2 s
+     - 89 ms
+   * - test ``glass_box``
+     - res=256 spp=64
+     - 1.5 s
+     - 4.2 s
+     - 467 ms
+     - 235 ms
+     - 1.0 s
+     - 64 ms
+   * - test ``lights_box``
+     - res=256 spp=64
+     - 722 ms
+     - 3.2 s
+     - 291 ms
+     - 121 ms
+     - 784 ms
+     - 44 ms
+   * - test ``textured_box``
+     - res=256 spp=64
+     - 798 ms
+     - 3.1 s
+     - 291 ms
+     - 266 ms
+     - 938 ms
+     - 92 ms
+   * - test ``rough_box``
+     - res=256 spp=64
+     - 1.0 s
+     - 4.0 s
+     - 346 ms
+     - 220 ms
+     - 1.1 s
+     - 66 ms
+   * - test ``polarized_box`` (Stokes)
+     - res=256 spp=64
+     - 607 ms
+     - 2.0 s
+     - 276 ms
+     - 122 ms
+     - 547 ms
+     - 64 ms
+   * - test ``coverage`` (forward plt_path)
+     - res=256 spp=256
+     - 1.6 s
+     - 4.1 s
+     - 481 ms
+     - 164 ms
+     - 820 ms
+     - 64 ms
+   * - test ``lights_coverage``
+     - res=256 spp=256
+     - 2.8 s
+     - 9.3 s
+     - 661 ms
+     - 192 ms
+     - 993 ms
+     - 71 ms
+   * - ``diffraction_simple/double_slits``
+     - res=512 spp=32
+     - 1.2 s
+     - 2.5 s
+     - 464 ms
+     - 111 ms
+     - 554 ms
+     - 45 ms
+   * - ``cornell-box/sphere_polarization`` (plt_bdpt, Stokes)
+     - res=128 spp=8
+     - 16.8 s
+     - 7.3 s
+     - 12.6 s
+     - 71 ms
+     - 116 ms
+     - 33 ms
+
+* **plt_path renders 2 to 6 times faster on the M4's GPU than on its CPU**, with beams or rays, and 2 to 4 times slower than on the GB10, a GPU with several times the M4's 32-bit floating-point throughput.
+* **plt_bdpt with beams is slower on the GPU than on the CPU** in ``sphere_polarization``. Its first pass takes about 2 s; the rest is spent re-tracing the paths that overflow their scratch memory (see :doc:`design`), whose beams overlap thousands of triangles and edges: a few hundred such paths, each traced by a single GPU thread, far slower than a CPU core. The GB10 spends most of its 12.6 s on them too.
+* ``veach_mis``, ``sionna_etoile`` and ``bidir_room`` are missing: on macOS, their lengths in centimetres do not parse (libc++ reads the ``c`` of ``cm`` as part of the number), and ``sionna_etoile``'s meshes are Git LFS objects.
+
+What was measured, and decided, while tuning the Metal backend:
+
+* **Command buffers.** A wavefront step (path starts, beam traversals, interactions) is one command buffer, which the host waits for, as CUDA's host waits for each step's counters. The GPU is busy for 96% of a render's time (899 ms of GPU time in 66 command buffers, of a 938 ms ``box`` render); indirect dispatch, or Metal 4's command submission, could save at most the rest, so the backend uses neither.
+* **Per-thread memory.** Instruments reports about 1.5 KiB of stack and spills per thread in the wavefront's kernels, mostly the BVH traversal stacks (128 entries for cones). Neither reading the scene's parameters in place (in Metal's ``constant`` address space, rather than as a copy), nor loading path states as 16-byte words, changed render times: Metal's compiler handles both.
+* **Threadgroups and persistent threads.** Threadgroups of 32 to 256 threads, and 512 to 4096 persistent threads per GPU core, render within 2% of each other; the backend uses 128 and 2048.
+* **Free-space diffraction's rejection sampling** shares its tries among a SIMD-group's lanes, as among a CUDA warp's: plt_bdpt's first pass of ``sphere_polarization`` traces 6% more paths per second than with each lane sampling alone.
+* **plt_bdpt's memory for paths in flight** is a quarter of the GPU's recommended working set, up to 2 GiB, rather than CUDA's 512 MiB: re-traced paths need much more memory each, and 512 MiB held too few of them to fill the GPU (``sphere_polarization``: 24.6 s with 512 MiB, 16.6 s with 2 GiB; 4 GiB is no faster).
+* **The first render after building** includes compiling the kernels' pipelines for the GPU, about a second; macOS caches them for later runs.
 
 
 64-bit kernels

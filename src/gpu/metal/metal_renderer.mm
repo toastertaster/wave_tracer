@@ -200,8 +200,14 @@ private:
     static constexpr k::u32 initial_vertex_capacity = 16;
     /** @brief plt_bdpt: aperture edges of free-space diffractions a path holds at first (as vertices). */
     static constexpr k::u32 initial_aperture_capacity = 256;
-    /** @brief plt_bdpt: memory for paths in flight, which bounds their count. */
-    static constexpr std::size_t bdpt_pool_bytes = std::size_t(512)<<20;
+    /**
+     * @brief plt_bdpt: memory for paths in flight, which bounds their count:
+     *        a quarter of the GPU's recommended working set, up to 2 GiB.
+     *        Paths re-traced with more scratch memory take much more each,
+     *        so that a pool of CUDA's 512 MiB would hold too few of them to
+     *        fill the GPU; unified memory affords more.
+     */
+    static constexpr std::size_t max_bdpt_pool_bytes = std::size_t(2)<<30;
     /** @brief Whole paths a launch traces at most (its list of overflowed paths holds as many). */
     static constexpr k::u32 launch_paths = 1u<<20;
     /** @brief Paths in flight few enough to finish in one launch, rather than a launch per step. */
@@ -287,8 +293,8 @@ private:
     /**
      * @brief Starts an empty pool of paths with `capacity` scratch triangles
      *        and edges each: as many as the main pool has scratch memory for
-     *        (plt_bdpt: as many as `whole_path_threads`, or as
-     *        `bdpt_pool_bytes` holds).
+     *        (plt_bdpt: as many as `whole_path_threads`, or as its pool's
+     *        memory holds, see `max_bdpt_pool_bytes`).
      */
     void begin(wavefront_t& wf, k::u32 capacity) {
         if (params.params.bdpt!=0) {
@@ -301,7 +307,9 @@ private:
             const std::size_t slot_size =
                 vertices*(sensor_vertex_size + sizeof(k::bdpt_vertex<false>)) + (capacity+edges)*sizeof(k::u32) +
                 apertures*sizeof(k::fraunhofer::fsd_edge);
-            const auto slots = k::u32(std::clamp<std::size_t>(bdpt_pool_bytes/slot_size, 1, whole_path_threads));
+            const std::size_t pool_bytes = std::min<std::size_t>(max_bdpt_pool_bytes,
+                                                                 device.recommendedMaxWorkingSetSize/4);
+            const auto slots = k::u32(std::clamp<std::size_t>(pool_bytes/slot_size, 1, whole_path_threads));
             sensor_vertices.resize(std::size_t(slots)*vertices*sensor_vertex_size);
             emitter_vertices.resize(std::size_t(slots)*vertices);
             scratch_tris.resize(std::size_t(slots)*capacity);
