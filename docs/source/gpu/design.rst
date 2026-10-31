@@ -91,5 +91,5 @@ Precision and limits
 * Kernels compute in 32-bit floating point by default, as the CPU's default build does; ``GPU_DBL_PRECISION`` switches them to 64 bits. Films accumulate in 64 bits either way.
 * BVH traversals have fixed-size stacks: an overflow stops the render with an error.
 * Paths stop after :math:`2^{14}` steps, with a warning.
-* Scenes are compiled per sensor: each sensor of a scene uploads its own copy of the geometry.
+* Scenes are compiled per sensor (emitters, materials, film), but share one upload of the geometry: a render uploads the BVH once for all its sensors, or uses an upload it is given (``render_opts_t::gpu_geometry``; the Rust bindings give their scene's).
 * One GPU renders; CPU threads do not take part in rendering.

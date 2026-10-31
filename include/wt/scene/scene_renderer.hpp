@@ -10,6 +10,7 @@
 #pragma once
 
 #include <future>
+#include <memory>
 #include <vector>
 #include <queue>
 
@@ -30,6 +31,10 @@
 #include "interrupts.hpp"
 
 namespace wt {
+
+namespace gpu {
+class geometry_t;
+}
 
 namespace scene {
 
@@ -63,6 +68,11 @@ struct render_opts_t {
     /** @brief Preview interface to use, if any.
      */
     const preview_interface_t* previewer = nullptr;
+    /** @brief GPU rendering: the scene's ADS already uploaded to the context's GPU
+     *         (`gpu::device_t::upload`), which the render then shares. If null, the
+     *         render uploads the ADS itself, once for all its sensors.
+     */
+    std::shared_ptr<const gpu::geometry_t> gpu_geometry;
 };
 
 enum class rendering_state_t : std::uint8_t {

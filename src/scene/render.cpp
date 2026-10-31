@@ -632,6 +632,11 @@ scene::render_result_t scene_renderer_t::render_gpu(
         }
     };
 
+    // the ADS on the GPU, uploaded once and shared by the sensors' renderers
+    std::shared_ptr<const gpu::geometry_t> geometry = opts.gpu_geometry;
+    if (geometry && !geometry->is_upload_of(ads, *ctx.gpu_device))
+        throw gpu::gpu_error_t("the GPU geometry given to render a scene is not its ADS on the context's GPU");
+
     std::vector<gpu_sensor_render_t> renders;
     std::size_t total_passes = 0;
     for (const auto& scs : scene->sensors()) {
@@ -641,7 +646,12 @@ scene::render_result_t scene_renderer_t::render_gpu(
         if (samples_per_element==0) continue;
 
         auto film_storage = s->create_sensor_film(ctx, scene->integrator().sensor_write_flags());
-        auto renderer = std::make_unique<gpu::renderer_t>(*ctx.gpu_device, *scene, *s, ads);
+        // compiles the scene before uploading anything: unsupported scenes fail without an upload
+        auto renderer = geometry ?
+            std::make_unique<gpu::renderer_t>(geometry, *scene, *s, ads) :
+            std::make_unique<gpu::renderer_t>(*ctx.gpu_device, *scene, *s, ads);
+        if (!geometry)
+            geometry = renderer->uploaded_geometry();
         const auto samples_per_pass = std::clamp<std::size_t>(
                 gpu_paths_per_pass / renderer->paths_per_sample(), 1, samples_per_element);
 

@@ -169,12 +169,12 @@ std::string device_t::description() const {
     return backend->description();
 }
 
-std::unique_ptr<geometry_t> device_t::upload(const ads::ads_t& ads) const {
+std::shared_ptr<geometry_t> device_t::upload(const ads::ads_t& ads) const {
     const auto* bvh = dynamic_cast<const ads::bvh8w_t*>(&ads);
     if (!bvh)
         throw gpu_error_t("the GPU supports only the bvh8w acceleration structure");
     try {
-        return std::unique_ptr<geometry_t>(new geometry_t(backend->upload(flatten(*bvh))));
+        return std::shared_ptr<geometry_t>(new geometry_t(backend->upload(flatten(*bvh)), ads, *this));
     } catch (const gpu_error_t&) {
         throw;
     } catch (const std::exception& e) {
@@ -187,7 +187,9 @@ std::unique_ptr<geometry_t> device_t::upload(const ads::ads_t& ads) const {
  * geometry_t
  */
 
-geometry_t::geometry_t(std::unique_ptr<backend_geometry_t> backend) noexcept : backend(std::move(backend)) {}
+geometry_t::geometry_t(std::unique_ptr<backend_geometry_t> backend,
+                       const ads::ads_t& source, const device_t& owner) noexcept
+    : backend(std::move(backend)), source(&source), owner(&owner) {}
 geometry_t::~geometry_t() noexcept = default;
 
 std::vector<std::optional<geometry_t::ray_hit_t>> geometry_t::intersect(

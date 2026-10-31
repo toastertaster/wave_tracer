@@ -69,6 +69,15 @@ public:
                const scene_t& scene,
                const sensor::sensor_t& sensor,
                const ads::ads_t& ads);
+    /**
+     * @brief As above, but with `ads` already uploaded (`device_t::upload`),
+     *        which the renderer shares rather than uploading it again. Throws
+     *        gpu_error_t if `geometry` is not an upload of `ads`.
+     */
+    renderer_t(std::shared_ptr<const geometry_t> geometry,
+               const scene_t& scene,
+               const sensor::sensor_t& sensor,
+               const ads::ads_t& ads);
     ~renderer_t() noexcept;
 
     renderer_t(const renderer_t&) = delete;
@@ -80,6 +89,9 @@ public:
      *        each element; forward, as many paths from the emitters).
      */
     [[nodiscard]] std::uint64_t paths_per_sample() const noexcept { return paths_per_spe; }
+
+    /** @brief The scene's ADS on the GPU, which other renderers of the scene may share. */
+    [[nodiscard]] const std::shared_ptr<const geometry_t>& uploaded_geometry() const noexcept { return geometry; }
 
     /**
      * @brief Traces samples `first .. first+count-1` of every sensor element
@@ -101,7 +113,12 @@ public:
     void write_film(sensor::film_storage_handle_t& film) const;
 
 private:
-    std::unique_ptr<geometry_t> geometry;
+    /** @brief Compiles the scene, then creates the backend renderer on the geometry `upload` returns. */
+    template <typename Upload>
+    void create(const scene_t& scene, const sensor::sensor_t& sensor, const ads::ads_t& ads,
+                const Upload& upload);
+
+    std::shared_ptr<const geometry_t> geometry;
     std::unique_ptr<backend_renderer_t> backend;
     std::unique_ptr<spectral_tables_t> spectra;
 

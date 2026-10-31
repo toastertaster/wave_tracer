@@ -1026,6 +1026,21 @@ renderer_t::renderer_t(const device_t& device,
                        const scene_t& scene,
                        const sensor::sensor_t& sensor,
                        const ads::ads_t& ads) {
+    create(scene, sensor, ads, [&]() -> std::shared_ptr<const geometry_t> { return device.upload(ads); });
+}
+
+renderer_t::renderer_t(std::shared_ptr<const geometry_t> uploaded,
+                       const scene_t& scene,
+                       const sensor::sensor_t& sensor,
+                       const ads::ads_t& ads) {
+    if (!uploaded || uploaded->source!=&ads)
+        throw gpu_error_t("the GPU geometry given to render a scene is not an upload of its acceleration structure");
+    create(scene, sensor, ads, [&]() { return std::move(uploaded); });
+}
+
+template <typename Upload>
+void renderer_t::create(const scene_t& scene, const sensor::sensor_t& sensor, const ads::ads_t& ads,
+                        const Upload& upload) {
     const auto* bvh = dynamic_cast<const ads::bvh8w_t*>(&ads);
     if (!bvh)
         throw gpu_error_t("the GPU supports only the bvh8w acceleration structure");
@@ -1047,7 +1062,8 @@ renderer_t::renderer_t(const device_t& device,
     film_elements = std::size_t(paths_per_spe) * compiled.film.components;
     polarimetric = compiled.film.polarimetric!=0;
 
-    geometry = device.upload(ads);
+    // after compiling, which refuses scenes the GPU cannot render before anything is uploaded
+    geometry = upload();
     try {
         backend = geometry->backend->create_plt_renderer(compiled);
     } catch (const gpu_error_t&) {

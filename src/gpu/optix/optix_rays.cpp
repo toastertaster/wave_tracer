@@ -15,6 +15,7 @@
 #include <optix_stack_size.h>
 #include <optix_stubs.h>
 
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -186,8 +187,12 @@ struct ray_geometry_t::impl_t {
     OptixTraversableHandle handle = 0;
     const kernel::bvh_tri* tris = nullptr;     // owned by the CUDA geometry
     device_buffer_t<launch_params_t> params;
+    // Launches come from the geometry's queries and from renderers sharing it (plt_bdpt's
+    // shadow rays), on any thread: each must queue its launch right after its parameters.
+    std::mutex launch_mutex;
 
     void launch(const OptixShaderBindingTable& sbt, launch_params_t p, std::size_t count) {
+        const std::scoped_lock lock(launch_mutex);
         params.upload(&p, 1);
         check_optix(optixLaunch(context->pipeline, nullptr, device_ptr(params.get()), sizeof(launch_params_t),
                                 &sbt, unsigned(count), 1, 1),

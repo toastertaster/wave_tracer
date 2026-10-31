@@ -17,7 +17,8 @@
  * `wt_context_t::gpu_device`; the CPU implementation is used when it is null,
  * and a build without a GPU backend never creates one. A `gpu::geometry_t` is
  * a scene's acceleration structure on that device, answering batches of the
- * same queries as `ads::ads_t`.
+ * same queries as `ads::ads_t`. GPU renders of the scene can share it (see
+ * `scene::render_opts_t::gpu_geometry`), rather than uploading the scene again.
  */
 
 #include <memory>
@@ -75,9 +76,11 @@ public:
 
     /**
      * @brief Uploads a scene's acceleration structure. Throws gpu_error_t if the
-     *        ADS type is not supported on the GPU (only bvh8w is).
+     *        ADS type is not supported on the GPU (only bvh8w is). Shared, so
+     *        that the scene's queries and renders can use the same upload;
+     *        `ads` and this device must outlive it.
      */
-    [[nodiscard]] std::unique_ptr<geometry_t> upload(const ads::ads_t& ads) const;
+    [[nodiscard]] std::shared_ptr<geometry_t> upload(const ads::ads_t& ads) const;
 
 private:
     explicit device_t(std::unique_ptr<backend_t> backend) noexcept;
@@ -134,12 +137,20 @@ public:
     /** @brief `ads_t::intersect(ball)` for each ball. */
     [[nodiscard]] triangle_lists_t intersect(std::span<const ball_t> balls) const;
 
+    /** @brief Whether this is `ads` uploaded to `device`. */
+    [[nodiscard]] bool is_upload_of(const ads::ads_t& ads, const device_t& device) const noexcept {
+        return &ads==source && &device==owner;
+    }
+
 private:
     friend class device_t;
     friend class renderer_t;
-    explicit geometry_t(std::unique_ptr<backend_geometry_t> backend) noexcept;
+    geometry_t(std::unique_ptr<backend_geometry_t> backend,
+               const ads::ads_t& source, const device_t& owner) noexcept;
 
     std::unique_ptr<backend_geometry_t> backend;
+    const ads::ads_t* source;
+    const device_t* owner;
     mutable std::mutex mutex;
 };
 
