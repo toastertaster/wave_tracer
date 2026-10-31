@@ -228,12 +228,78 @@ constexpr k::u32 trace_found = 1u<<31;
 
 /**
  * @brief Counters of a step: paths that go on, slots freed, paths that
- *        overflowed; and of a launch of plt_bdpt paths, the paths taken.
+ *        overflowed; and of a launch of whole paths, the paths taken, and the
+ *        plt_bdpt connections deferred (see `cuda_deferral_t`).
  */
 struct step_counters_t {
     std::uint32_t queued, freed, overflowed;
     std::uint32_t taken;
+    std::uint32_t deferred;
 };
+
+/** @brief A deferred plt_bdpt connection's splat (`k::trace_bdpt_path`), made unless its shadow ray is blocked. */
+template <bool P>
+struct deferred_splat_t {
+    k::observed_t<P> L;
+    k::vec2 offset;
+    k::u32 ex, ey;
+    k::u32 spectral;
+    k::u32 light;               // into the light image, or else (unweighted) into the film
+};
+
+/**
+ * @brief plt_bdpt connections' shadow rays and splats, deferred (as
+ *        `k::trace_bdpt_path`'s `deferred`) to a batch that OptiX traces after
+ *        the paths (`splat_deferred_kernel`): a megakernel of paths cannot
+ *        trace rays on the RT cores. Up to `capacity` connections (none if 0);
+ *        `count` counts those offered, also past it.
+ */
+template <bool P>
+struct cuda_deferral_t {
+    ray_query_t* rays;
+    deferred_splat_t<P>* splats;
+    k::u32 capacity;
+    std::uint32_t* count;
+
+    static constexpr bool may_defer = true;
+    __device__ bool defer(const k::shadow_ray_t& sr, const k::observed_t<P>& L, k::u32 spectral,
+                          k::u32 ex, k::u32 ey, k::vec2 offset, bool light) {
+        // an entry each, of one atomic add for the lanes deferring at once
+        const unsigned lanes = __activemask();
+        const unsigned lane = threadIdx.x % 32;
+        const int leader = __ffs(lanes)-1;
+        std::uint32_t first = 0;
+        if (int(lane)==leader)
+            first = atomicAdd(count, std::uint32_t(__popc(lanes)));
+        first = __shfl_sync(lanes, first, leader);
+        const std::uint32_t i = first + __popc(lanes & ((1u<<lane)-1));
+        if (i>=capacity)
+            return false;
+        rays[i] = { sr.r, sr.rng };
+        splats[i] = { L, offset, ex, ey, spectral, light ? 1u : 0u };
+        return true;
+    }
+};
+
+/** @brief The deferral of plt_bdpt's connections: to OptiX, if it traces rays. */
+#if defined(WT_GPU_USE_OPTIX)
+template <bool P> using bdpt_deferral_t = cuda_deferral_t<P>;
+#else
+template <bool P> using bdpt_deferral_t = k::bdpt_no_deferral;
+#endif
+
+/** @brief Splats the `count` deferred connections (see `cuda_deferral_t`) whose shadow rays are not `occluded`. */
+template <bool P>
+__global__ void splat_deferred_kernel(k::plt_scene scene, const deferred_splat_t<P>* splats,
+                                      const std::uint8_t* occluded, k::u32 count,
+                                      cuda_film_t film, cuda_film_t light) {
+    const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i>=count || occluded[i]!=0) return;
+
+    const deferred_splat_t<P> d = splats[i];
+    cuda_film_t sink = d.light!=0 ? light : film;
+    k::splat(scene.film, scene.spectra[d.spectral].response, sink, d.ex, d.ey, d.offset, d.L);
+}
 
 __global__ void fill_free_slots_kernel(k::u32* free_slots, k::u32 count) {
     const k::u32 i = blockIdx.x*blockDim.x + threadIdx.x;
@@ -456,21 +522,22 @@ __global__ void __launch_bounds__(block_size, 3) run_paths_kernel(k::plt_scene s
 /**
  * @brief Traces `count` whole plt_bdpt paths (see `k::trace_bdpt_path`), by
  *        persistent warps (`take_paths`), with the vertices and scratch memory
- *        of `slots` slots, splatting into `film` and its light image `light`.
- *        Paths that outgrow them, which splat nothing, are listed in `overflow`.
+ *        of `slots` slots, splatting into `film` and its light image `light`,
+ *        but the connections they defer to `deferred`. Paths that outgrow
+ *        them, which splat nothing, are listed in `overflow`.
  */
 template <bool P>
 __global__ void __launch_bounds__(block_size, 2) run_bdpt_paths_kernel(k::plt_scene scene, path_pool_t pool,
                                         k::u32 slots, std::uint64_t base, k::u32 count, const path_entry_t* list,
                                         std::uint32_t seed, k::u32 table, cuda_film_t film, cuda_film_t light,
-                                        step_counters_t* counters, path_entry_t* overflow,
-                                        std::uint32_t* status) {
+                                        bdpt_deferral_t<P> deferred, step_counters_t* counters,
+                                        path_entry_t* overflow, std::uint32_t* status) {
     pool.paths_started(table, count);
     const cuda_bvh_geometry_t geometry = { scene.bvh };
     take_paths(slots, count, counters, [&](k::u32 slot, k::u32 i) {
         const path_entry_t e = path_entry(base, i, list, seed);
         k::u32 s = k::status_ok;
-        const k::u32 spectral = k::trace_bdpt_path(scene, geometry, film, light, pool.scratch(slot),
+        const k::u32 spectral = k::trace_bdpt_path(scene, geometry, film, light, deferred, pool.scratch(slot),
                                                    pool.sensor_verts<P>(slot), pool.emitter_verts(slot),
                                                    pool.vertex_capacity, pool.apertures(slot),
                                                    pool.aperture_capacity, path_rng(e), e.path, table,
@@ -496,13 +563,22 @@ __global__ void __launch_bounds__(block_size, 2) run_bdpt_paths_kernel(k::plt_sc
  *        Ray-traced paths, whose steps are cheap, and plt_bdpt paths run
  *        whole, in launches of persistent warps (see `take_paths`), with a
  *        slot of the pool for each thread the GPU runs at once (plt_bdpt: or
- *        as many as their vertices' memory allows).
+ *        as many as their vertices' memory allows). With OptiX, plt_bdpt
+ *        launches defer their connections' shadow rays, traced by OptiX
+ *        after each launch (see `cuda_deferral_t`).
  */
 class cuda_plt_renderer_t final : public backend_renderer_t {
 public:
-    cuda_plt_renderer_t(int ordinal, k::bvh_view bvh, const plt_scene_t& scene)
+    cuda_plt_renderer_t(int ordinal, k::bvh_view bvh, const plt_scene_t& scene
+#if defined(WT_GPU_USE_OPTIX)
+                        , const optix::ray_geometry_t* optix_rays
+#endif
+                        )
         : ordinal(ordinal),
           polarimetric(scene.film.polarimetric!=0),
+#if defined(WT_GPU_USE_OPTIX)
+          optix_rays(optix_rays),
+#endif
           table_size(scene.emitter_count*scene.samples_per_emitter)
     {
         set_device(ordinal);
@@ -521,6 +597,16 @@ public:
             });
             whole_path_threads = k::u32(std::max(1, multiprocessors*blocks)) * block_size;
         }
+#if defined(WT_GPU_USE_OPTIX)
+        if (scene.params.bdpt!=0 && optix_rays) {
+            deferral_capacity = deferred_connections;
+            const std::size_t splat_size =
+                polarimetric ? sizeof(deferred_splat_t<true>) : sizeof(deferred_splat_t<false>);
+            deferred_rays.resize(deferral_capacity);
+            deferred_splats.resize((std::size_t(deferral_capacity)*splat_size + sizeof(uint4)-1)/sizeof(uint4));
+            deferred_occluded.resize(deferral_capacity);
+        }
+#endif
         tris.upload(scene.tris.data(), scene.tris.size());
         edges.upload(scene.edges.data(), scene.edges.size());
         emitters.upload(scene.emitters.data(), scene.emitters.size());
@@ -673,6 +759,8 @@ private:
     static constexpr std::size_t bdpt_pool_bytes = std::size_t(512)<<20;
     /** @brief Whole paths a launch traces at most (its list of overflowed paths holds as many). */
     static constexpr k::u32 launch_paths = 1u<<20;
+    /** @brief plt_bdpt: connections a launch defers at most (see `cuda_deferral_t`), if OptiX traces rays. */
+    static constexpr k::u32 deferred_connections = 1u<<22;
     /** @brief Paths in flight few enough to finish in one launch, rather than a launch per step. */
     static constexpr k::u32 tail_size = 1024;
     /**
@@ -795,6 +883,47 @@ private:
         return { light_film.get(), nullptr };
     }
 
+    /** @brief plt_bdpt's deferral of connections (see `cuda_deferral_t`), of a sensor `P`. */
+    template <bool P>
+    [[nodiscard]] bdpt_deferral_t<P> deferral() const noexcept {
+#if defined(WT_GPU_USE_OPTIX)
+        return {
+            deferred_rays.get(), reinterpret_cast<deferred_splat_t<P>*>(deferred_splats.get()),
+            deferral_capacity, &counters.get()->deferred,
+        };
+#else
+        return {};
+#endif
+    }
+
+    /**
+     * @brief Traces the shadow rays of the connections that a launch of
+     *        `paths` plt_bdpt paths deferred (`offered`, of which the first
+     *        `deferral_capacity`), and splats those unblocked. Sizes the next
+     *        launches for their connections to fit, at this one's rate.
+     */
+    void splat_deferred(k::u32 paths, std::uint32_t offered) {
+#if defined(WT_GPU_USE_OPTIX)
+        const auto count = std::min<std::uint32_t>(offered, deferral_capacity);
+        if (count>0) {
+            optix_rays->occluded(deferred_rays.get(), count, deferred_occluded.get());
+            dispatch([&](auto P) {
+                splat_deferred_kernel<P.value><<<grid_size(count), block_size>>>(
+                        params, reinterpret_cast<const deferred_splat_t<P.value>*>(deferred_splats.get()),
+                        deferred_occluded.get(), count, film_view(), light_view());
+            });
+            check(cudaGetLastError(), "launching the deferred splat kernel");
+        }
+        // (with room to spare: paths vary)
+        const double per_path = double(offered)/paths;
+        deferral_paths = per_path>0 ?
+            k::u32(std::clamp(.9*deferral_capacity/per_path, double(whole_path_threads), double(launch_paths))) :
+            launch_paths;
+#else
+        (void)paths, (void)offered;
+#endif
+    }
+
     /** @brief Room for `count` spectral samples on the device. Moves them: only when no paths are in flight. */
     void reserve_spectra(std::size_t count) {
         spectra.resize(count);
@@ -836,14 +965,16 @@ private:
         if (whole_paths()) {
             // by persistent warps, a thread per slot (nothing remains in flight)
             while (source.started<source.count) {
-                const auto n = k::u32(std::min<std::uint64_t>(launch_paths, source.count-source.started));
+                const auto n = k::u32(std::min<std::uint64_t>(std::min(launch_paths, deferral_paths),
+                                                              source.count-source.started));
                 const auto base = source.list ? source.started : source.first+source.started;
                 check(cudaMemset(counters.get(), 0, sizeof(step_counters_t)), "clearing the step counters");
                 dispatch([&](auto P) {
                     if (params.params.bdpt!=0)
                         run_bdpt_paths_kernel<P.value><<<grid_size(wf.slots), block_size>>>(
                                 params, pool, wf.slots, base, n, source.list, seed, table, film_view(),
-                                light_view(), counters.get(), overflow.get(), status_word.get());
+                                light_view(), deferral<P.value>(), counters.get(), overflow.get(),
+                                status_word.get());
                     else
                         run_paths_kernel<P.value><<<grid_size(wf.slots), block_size>>>(
                                 params, pool, wf.slots, base, n, source.list, seed, table, film_view(),
@@ -851,7 +982,9 @@ private:
                 });
                 check(cudaGetLastError(), "launching the path kernel");
                 source.started += n;
-                collect_overflowed();
+                const step_counters_t c = collect_overflowed();
+                if (deferral_capacity>0)
+                    splat_deferred(n, c.deferred);
             }
             return;
         }
@@ -965,6 +1098,16 @@ private:
     k::plt_scene params;
     bool polarimetric;                  // the sensor's: paths are `k::path_state_t<polarimetric>`
     k::u32 whole_path_threads = 0;      // `whole_paths`: the threads of their kernel the GPU runs at once
+#if defined(WT_GPU_USE_OPTIX)
+    const optix::ray_geometry_t* optix_rays;    // or null
+#endif
+
+    // plt_bdpt's deferred connections (`deferral_capacity` 0: none), and the paths a launch with them traces
+    k::u32 deferral_capacity = 0;
+    k::u32 deferral_paths = launch_paths;
+    device_buffer_t<ray_query_t>       deferred_rays;
+    device_buffer_t<uint4>             deferred_splats;  // `deferred_splat_t<polarimetric>`
+    device_buffer_t<std::uint8_t>      deferred_occluded;
 
     device_buffer_t<k::tri_shading>   tris;
     device_buffer_t<k::edge>          edges;
@@ -1109,7 +1252,11 @@ public:
     [[nodiscard]] std::unique_ptr<backend_renderer_t> create_plt_renderer(const plt_scene_t& scene) override {
         if (scene.tris.size()!=tri_count)
             throw std::runtime_error("the compiled scene does not match the uploaded geometry");
+#if defined(WT_GPU_USE_OPTIX)
+        return std::make_unique<cuda_plt_renderer_t>(ordinal, view(), scene, optix_rays.get());
+#else
         return std::make_unique<cuda_plt_renderer_t>(ordinal, view(), scene);
+#endif
     }
 
 private:

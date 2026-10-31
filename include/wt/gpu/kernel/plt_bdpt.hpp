@@ -29,7 +29,9 @@
  * as plt_path's functions are. A path keeps its vertices, and the apertures of
  * its diffractions, in memory the backend provides, up to capacities; a path
  * that outgrows them, or its scratch memory, stops with `status_scratch_overflow`
- * before it splats anything, to be re-traced with more.
+ * before it splats anything, to be re-traced with more. A backend may also take
+ * over the shadow rays of connections, and their splats (`trace_bdpt_path`'s
+ * `deferred`), to trace them in batches.
  */
 
 namespace wt::gpu::kernel {
@@ -616,14 +618,38 @@ struct bdpt_mis_t {
     bool delta_sensor, delta_emitter;
 };
 
-/** @brief A connection of `t` sensor and `s` emitter vertices: what the sensor observes, and where (t<=1). */
+/**
+ * @brief A connection of `t` sensor and `s` emitter vertices: what the sensor
+ *        observes, and where (t<=1). Connections test whether their segments
+ *        are blocked (`shadowed`), observing nothing if so; or else leave it
+ *        to test later (see `trace_bdpt_path`): then `shadow`, of the
+ *        segment `from`-`to`.
+ */
 template <bool P>
 struct bdpt_connection_t {
     observed_t<P> L;            // radiant flux (Stokes parameters, if polarimetric); zero if none
     u32 ex, ey;                 // t<=1: the sensor element connected to, and offset
     vec2 offset;
     bdpt_mis_t mis;             // if L is not zero
+    bool shadow = false;
+    vertex_geo from, to;
 };
+
+/**
+ * @brief The segment `a`-`b` of connection `c`: tested now (false if it is
+ *        blocked), or, if `Late`, left to test later.
+ */
+template <bool Late, bool P, typename Geometry>
+WT_GPU_FN bool connection_segment(WT_GPU_THREAD bdpt_connection_t<P>& c, const WT_GPU_THREAD plt_scene& scene,
+                                  const WT_GPU_THREAD Geometry& geometry, vertex_geo a, vertex_geo b,
+                                  WT_GPU_THREAD u32& status) {
+    if (!Late)
+        return !shadowed(scene, geometry, a, b, status);
+    c.shadow = true;
+    c.from = a;
+    c.to = b;
+    return true;
+}
 
 /** @brief `area_density_or_one` of `bdpt_compute_mis_weight` */
 WT_GPU_FN real density_or_one(real p) {
@@ -700,7 +726,7 @@ WT_GPU_FN bdpt_connection_t<P> connect_to_emitter_surface(const WT_GPU_THREAD pl
  * @brief `connect_subpaths` with s==1: connects the sensor subpath's last
  *        vertex to a sampled emitter point (`scene_t::sample_emitter_direct`).
  */
-template <bool P, typename Geometry>
+template <bool Late, bool P, typename Geometry>
 WT_GPU_FN bdpt_connection_t<P> connect_to_emitter(const WT_GPU_THREAD plt_scene& scene,
                                                   const WT_GPU_THREAD Geometry& geometry, u32 spectral, i32 t,
                                                   const WT_GPU_GLOBAL bdpt_vertex<P>* sv,
@@ -723,7 +749,7 @@ WT_GPU_FN bdpt_connection_t<P> connect_to_emitter(const WT_GPU_THREAD plt_scene&
     beam_t<P> db;
     if (!scatter_towards(last, apertures, ed.geo.wp, true, db) || db.S.s0==real(0) || I==real(0))
         return c;
-    if (shadowed(scene, geometry, geo_of(last), ed.geo, status))
+    if (!connection_segment<Late>(c, scene, geometry, geo_of(last), ed.geo, status))
         return c;
     c.L = db.observe_unpolarized(I);
 
@@ -745,7 +771,7 @@ WT_GPU_FN bdpt_connection_t<P> connect_to_emitter(const WT_GPU_THREAD plt_scene&
  *        vertex to a sampled sensor point (`sensor_t::sample_direct`).
  *        Diffractions connect only to virtual plane sensors, as the CPU's.
  */
-template <bool P, typename Geometry>
+template <bool Late, bool P, typename Geometry>
 WT_GPU_FN bdpt_connection_t<P> connect_to_sensor(const WT_GPU_THREAD plt_scene& scene,
                                                  const WT_GPU_THREAD Geometry& geometry, i32 s,
                                                  const WT_GPU_GLOBAL bdpt_vertex<false>* ev,
@@ -768,7 +794,7 @@ WT_GPU_FN bdpt_connection_t<P> connect_to_sensor(const WT_GPU_THREAD plt_scene& 
     beam_t<false> eb;
     if (!scatter_towards(last, apertures, sd.p, false, eb) || eb.S.s0==real(0) || importance==real(0))
         return c;
-    if (shadowed(scene, geometry, vertex_geo{ sd.p, geo_point, 0 }, geo_of(last), status))
+    if (!connection_segment<Late>(c, scene, geometry, vertex_geo{ sd.p, geo_point, 0 }, geo_of(last), status))
         return c;
     c.L = observe_directly<P>(importance, build_orthogonal_frame(sd.wd), eb);
     c.ex = sd.ex;
@@ -833,7 +859,7 @@ WT_GPU_FN bdpt_connection_t<P> connect_through_sensor(const WT_GPU_THREAD plt_sc
  *        the CPU's connections ignore their scattering (`ignore_fsd`),
  *        weighting their beams by 0.
  */
-template <bool P, typename Geometry>
+template <bool Late, bool P, typename Geometry>
 WT_GPU_FN bdpt_connection_t<P> connect_vertices(const WT_GPU_THREAD plt_scene& scene,
                                                 const WT_GPU_THREAD Geometry& geometry, i32 s, i32 t,
                                                 const WT_GPU_GLOBAL bdpt_vertex<P>* sv,
@@ -861,7 +887,7 @@ WT_GPU_FN bdpt_connection_t<P> connect_vertices(const WT_GPU_THREAD plt_scene& s
     db.scale(v.rr_weight * recp_d2 * abs(dot(e.shading.n, d)));
     if (db.S.s0==real(0) || eb.S.s0==real(0))
         return c;
-    if (shadowed(scene, geometry, geo_of(v), geo_of(e), status))
+    if (!connection_segment<Late>(c, scene, geometry, geo_of(v), geo_of(e), status))
         return c;
     c.L = db.observe(eb.S, eb.Sframe);
 
@@ -876,6 +902,13 @@ WT_GPU_FN bdpt_connection_t<P> connect_vertices(const WT_GPU_THREAD plt_scene& s
     return c;
 }
 
+/** @brief A deferral of `trace_bdpt_path` that takes no connections. */
+struct bdpt_no_deferral {
+    static constexpr bool may_defer = false;
+    template <typename Observed>
+    WT_GPU_FN bool defer(const WT_GPU_THREAD shadow_ray_t&, Observed, u32, u32, u32, vec2, bool) { return false; }
+};
+
 /**
  * @brief Traces path `path` (`plt_bdpt_t::integrate`, a sample of a sensor
  *        element): samples an emitter and one of its spectral samples in the
@@ -888,10 +921,18 @@ WT_GPU_FN bdpt_connection_t<P> connect_vertices(const WT_GPU_THREAD plt_scene& s
  *        and the edges of their diffractions' apertures to `aperture_edges`, of
  *        `aperture_capacity` edges. Returns the path's spectral sample; adds
  *        status flags to `status`.
+ *
+ *        `deferred` may take over a connection's shadow ray and splat, if its
+ *        `may_defer` (`bdpt_no_deferral` takes none): its `defer(shadow ray,
+ *        observed, spectral sample, ex, ey, offset, into light)` returns
+ *        whether it will splat it (into `light`, or else unweighted into
+ *        `film`) unless the ray finds the segment blocked. The path splats
+ *        its film block's weights in any case.
  */
-template <bool P, typename Geometry, typename Film>
+template <bool P, typename Geometry, typename Film, typename Deferral>
 WT_GPU_FN u32 trace_bdpt_path(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_THREAD Geometry& geometry,
                               WT_GPU_THREAD Film& film, WT_GPU_THREAD Film& light,
+                              WT_GPU_THREAD Deferral& deferred,
                               const WT_GPU_THREAD path_scratch& scratch,
                               WT_GPU_GLOBAL bdpt_vertex<P>* sensor_verts,
                               WT_GPU_GLOBAL bdpt_vertex<false>* emitter_verts, u32 capacity,
@@ -922,7 +963,9 @@ WT_GPU_FN u32 trace_bdpt_path(const WT_GPU_THREAD plt_scene& scene, const WT_GPU
     if (status & status_scratch_overflow)
         return spectral;
 
-    // the connections of t sensor and s emitter vertices
+    // the connections of t sensor and s emitter vertices (blocked ones end before their weights, unless they
+    // may be deferred)
+    constexpr bool late = Deferral::may_defer;
     observed_t<P> L = {};
     for (i32 t=0; t<=i32(nt); ++t)
     for (i32 s=0; s<=i32(ns); ++s) {
@@ -935,19 +978,29 @@ WT_GPU_FN u32 trace_bdpt_path(const WT_GPU_THREAD plt_scene& scene, const WT_GPU
         const bdpt_connection_t<P> c =
             s==0 ? connect_to_emitter_surface<P>(scene, spectral, t, sensor_verts) :
             t==0 ? connect_through_sensor<P>(scene, s, emitter_verts) :
-            s==1 ? connect_to_emitter(scene, geometry, spectral, t, sensor_verts, apertures, rnd, status) :
-            t==1 ? connect_to_sensor<P>(scene, geometry, s, emitter_verts, apertures, rnd, status) :
-                   connect_vertices(scene, geometry, s, t, sensor_verts, emitter_verts, apertures, status);
+            s==1 ? connect_to_emitter<late>(scene, geometry, spectral, t, sensor_verts, apertures, rnd, status) :
+            t==1 ? connect_to_sensor<late, P>(scene, geometry, s, emitter_verts, apertures, rnd, status) :
+                   connect_vertices<late>(scene, geometry, s, t, sensor_verts, emitter_verts, apertures, status);
         if (intensity_of(c.L)<=real(0))
             continue;
 
         // MIS, or the strategies' mean, with the spectral weight (the emissions include its MIS form)
         const real w = opts.mis!=0 ? bdpt_mis_weight(s, t, sensor_verts, emitter_verts, c.mis) :
                                      spec.no_mis_scale / real(s+t+1);
+        const observed_t<P> Lw = c.L * w;
+        if (late && c.shadow) {
+            // (a deferral out of room leaves the ray to the path)
+            const shadow_ray_t sr = shadow_ray(scene, c.from, c.to);
+            if (t>1 ? deferred.defer(sr, Lw, spectral, ex, ey, offset, false) :
+                      deferred.defer(sr, Lw, spectral, c.ex, c.ey, c.offset, true))
+                continue;
+            if (geometry.occluded(sr.r, sr.rng, status))
+                continue;
+        }
         if (t>1)
-            L += c.L * w;
+            L += Lw;
         else
-            splat(scene.film, spec.response, light, c.ex, c.ey, c.offset, c.L * w);
+            splat(scene.film, spec.response, light, c.ex, c.ey, c.offset, Lw);
     }
 
     splat_weighted(scene.film, spec.response, film, ex, ey, offset, L);

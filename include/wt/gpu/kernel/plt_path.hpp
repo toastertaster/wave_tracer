@@ -601,16 +601,28 @@ WT_GPU_FN vec3 offseted_ray_origin(const WT_GPU_THREAD plt_scene& scene, vertex_
     return r.o;
 }
 
-/** @brief `shadow(ads, a, b)` of wt/integrator/traversal.hpp: is the segment between two vertices blocked? */
-template <typename Geometry>
-WT_GPU_FN bool shadowed(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_THREAD Geometry& geometry,
-                        vertex_geo a, vertex_geo b, WT_GPU_THREAD u32& status) {
+/** @brief A shadow ray: a segment between two vertices, which is blocked if the ray hits anything in its range. */
+struct shadow_ray_t {
+    ray r;
+    range rng;
+};
+
+/** @brief The ray of `shadow(ads, a, b)` of wt/integrator/traversal.hpp, between two vertices, offset off both. */
+WT_GPU_FN shadow_ray_t shadow_ray(const WT_GPU_THREAD plt_scene& scene, vertex_geo a, vertex_geo b) {
     const ray r = make_ray(a.wp, normalize(b.wp-a.wp));
     const vec3 o = offseted_ray_origin(scene, a, r);
     const vec3 t = offseted_ray_origin(scene, b, make_ray(b.wp, -r.d));
     const real dist = length(t-o);
     const vec3 d = (t-o)/dist;
-    return geometry.occluded(make_ray(o, d), range{ 0, dist }, status);
+    return { make_ray(o, d), range{ 0, dist } };
+}
+
+/** @brief `shadow(ads, a, b)` of wt/integrator/traversal.hpp: is the segment between two vertices blocked? */
+template <typename Geometry>
+WT_GPU_FN bool shadowed(const WT_GPU_THREAD plt_scene& scene, const WT_GPU_THREAD Geometry& geometry,
+                        vertex_geo a, vertex_geo b, WT_GPU_THREAD u32& status) {
+    const shadow_ray_t s = shadow_ray(scene, a, b);
+    return geometry.occluded(s.r, s.rng, status);
 }
 
 
