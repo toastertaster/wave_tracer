@@ -259,6 +259,6 @@ Tips
 * Preview with ``--ray-tracing``, which renders most scenes in well under a second, before rendering with beams.
 * Render enough paths per pass to fill the GPU: films of at least 256×256 elements, or enough samples per element; with ``plt_bdpt``, prefer larger films.
 * Keep meshes as coarse as the simulation allows when rendering with beams.
-* Build with OptiX for ``plt_bdpt``; it costs nothing otherwise.
+* Build with OptiX for ``plt_bdpt``; it costs nothing otherwise, and ``--no-optix`` turns it off at run time.
 * Use ``GPU_DBL_PRECISION`` to investigate precision, not for production renders.
 * Interrupts and previews wait for a pass to end; with ``plt_bdpt`` and beams, a pass can take a minute or more.

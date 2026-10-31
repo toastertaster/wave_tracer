@@ -77,9 +77,11 @@ Command line
 
    ./wave_tracer render --gpu scene.xml -o out -D spp=256
    ./wave_tracer render --gpu --ray-tracing scene.xml -o out
+   ./wave_tracer render --gpu --no-optix scene.xml -o out
    CUDA_VISIBLE_DEVICES=1 ./wave_tracer render --gpu scene.xml   # another GPU
 
 * ``--ray-tracing`` renders in ray-tracing mode, as on the CPU.
+* ``--no-optix`` traces rays with the CUDA traversal, as builds without ``GPU_OPTIX`` do, rather than with OptiX; the program then reports the GPU as ``CUDA on <GPU>``. Use it to compare the two, or to rule OptiX out when investigating a difference: OptiX may report either triangle when a ray grazes an edge or vertex they share. It has no effect in builds without OptiX.
 * Outputs, previews (``--tev``, and the GUI of ``renderui``), progress, pausing and termination work as on the CPU. They update between the GPU's *passes*: a pass renders whole samples of all sensor elements, about :math:`2^{22}` paths (see :doc:`design`).
 * ``--block_size`` and ``--block_samples`` do not apply; ``--threads`` sets the CPU threads that load the scene and build its acceleration structure.
 * The reported render time (``Elapsed``) excludes loading the scene and building its BVH (both on the CPU), opening the GPU, and compiling and uploading the scene to it.
@@ -106,8 +108,21 @@ The GPU is a ``wt::gpu::device_t``, given to the renderer through the context; a
    // load the scene with `context`, then render it with a scene_renderer_t, as on the CPU
 
 * ``wt::gpu::compiled_backends()`` names the backends a build includes (``"CUDA, OptiX"``, ``"CUDA"`` or ``""``).
-* Constructing a ``wt::gpu::renderer_t`` (done by ``scene_renderer_t`` for each sensor) compiles and uploads the scene; it throws ``gpu_error_t`` naming the first unsupported scene element.
+* ``use_optix = false`` traces rays with the CUDA traversal in an OptiX build (the command line's ``--no-optix``).
+* Constructing a ``wt::gpu::renderer_t`` (done by ``scene_renderer_t`` for each sensor) compiles the scene; it throws ``gpu_error_t`` naming the first unsupported scene element.
 * ``wt::gpu::geometry_t`` (from ``device_t::upload``) answers batches of the acceleration structure's queries on the GPU (closest-hit and shadow rays, elliptic cones and balls), with the CPU's results up to floating-point rounding.
+* A render uploads the scene's acceleration structure once, for all its sensors. An application that has already uploaded it, for its own queries, can give that upload to its renders, which then share it rather than upload the scene again:
+
+  .. code-block:: cpp
+
+     std::shared_ptr<const wt::gpu::geometry_t> geometry = gpu->upload(ads);
+     // ... geometry->intersect(rays, range), etc.
+
+     wt::scene::render_opts_t opts;
+     opts.gpu_geometry = geometry;   // must be `ads` uploaded to context.gpu_device
+     wt::scene_renderer_t renderer{ scene, context, ads, std::launch::async, std::move(opts) };
+
+  Queries and renders may then run concurrently; queries wait for the GPU work queued before them.
 * Destroy the ``device_t`` before ``main`` returns: the statically linked CUDA runtime shuts down before global objects are destroyed.
 
 
@@ -128,8 +143,9 @@ The `Rust bindings <https://github.com/toastertaster/wave_tracers>`_ build the G
    let scene = Scene::load(&context, "scene.xml", &[("spp", "64")])?;
    let result = scene.start_render()?.wait()?;
 
-``wave_tracers::gpu_backends()`` names the compiled backends.
-The bindings' examples take ``--gpu`` and ``--ray-tracing`` (``examples/render.rs``), and ``examples/gpu_compare.rs`` compares a scene's GPU and CPU renders statistically.
+``wave_tracers::gpu_backends()`` names the compiled backends, and ``ContextBuilder::optix(false)`` turns OptiX off (the command line's ``--no-optix``).
+A scene loaded with a GPU context uploads its geometry once, for its geometry queries, and its renders share that upload.
+The bindings' examples take ``--gpu``, ``--no-optix`` and ``--ray-tracing`` (``examples/render.rs``), and ``examples/gpu_compare.rs`` compares a scene's GPU and CPU renders statistically.
 
 
 Supported scenes

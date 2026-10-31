@@ -54,6 +54,8 @@ Renders a scene file. Usage:
 --ray-tracing                 forces ray tracing only
 --gpu                         render on the GPU (experimental; needs a build with ``GPU_CUDA``),
                               see :doc:`gpu/gpu`
+--no-optix                    with ``--gpu``, trace rays with the CUDA traversal rather than OptiX
+                              (in builds with ``GPU_OPTIX``)
 --mesh_scale TEXT
                               default scale to apply to imported positions of external meshes;
                               can be overridden per shape in the scene file.
@@ -132,6 +134,8 @@ Renders a scene file using a graphical user interface. Usage:
 --ray-tracing                 forces ray tracing only
 --gpu                         render on the GPU (experimental; needs a build with ``GPU_CUDA``),
                               see :doc:`gpu/gpu`
+--no-optix                    with ``--gpu``, trace rays with the CUDA traversal rather than OptiX
+                              (in builds with ``GPU_OPTIX``)
 --mesh_scale TEXT
                               default scale to apply to imported positions of external meshes;
                               can be overridden per shape in the scene file.
