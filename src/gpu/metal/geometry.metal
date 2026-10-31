@@ -9,13 +9,17 @@
 
 /*
  * Metal backend: acceleration-structure query kernels (the Metal counterparts
- * of cuda_backend.cu's).
+ * of cuda_backend.cu's), and ray queries with Metal's ray tracing (the
+ * counterparts of the OptiX programs).
  */
 
 #include <wt/gpu/kernel/queries.hpp>
 
+#include "rt_rays.hpp"
+
 using namespace metal;
 namespace k = wt::gpu::compute_kernel;
+using wt::gpu::metal_backend::acceleration_structure;
 
 namespace {
 
@@ -81,3 +85,24 @@ kernel void intersect_balls(const device k::bvh_node* nodes [[buffer(0)]],
     hits[i] = { sink.count, status };
 }
 
+
+kernel void rt_intersect_rays(acceleration_structure accel     [[buffer(0)]],
+                              const device k::bvh_tri* tris    [[buffer(1)]],
+                              const device k::ray_query* queries [[buffer(2)]],
+                              device k::ray_hit* hits          [[buffer(3)]],
+                              constant uint& count             [[buffer(4)]],
+                              uint i [[thread_position_in_grid]]) {
+    if (i>=count) return;
+    const k::ray_query q = queries[i];
+    hits[i] = wt::gpu::metal_backend::rt_intersect(accel, tris, q.ray, q.range);
+}
+
+kernel void rt_rays_occluded(acceleration_structure accel     [[buffer(0)]],
+                             const device k::ray_query* queries [[buffer(2)]],
+                             device uchar* occluded           [[buffer(3)]],
+                             constant uint& count             [[buffer(4)]],
+                             uint i [[thread_position_in_grid]]) {
+    if (i>=count) return;
+    const k::ray_query q = queries[i];
+    occluded[i] = wt::gpu::metal_backend::rt_occluded(accel, q.ray, q.range) ? 1 : 0;
+}

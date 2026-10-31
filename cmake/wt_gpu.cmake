@@ -189,19 +189,19 @@ function(wt_add_metal_backend target defines)
         list(APPEND air_files "${air}")
     endforeach()
 
+    # Linked and embedded by one command, so that the embedded kernels are
+    # always the metallib it linked (with separate steps, a Makefile build
+    # that relinked the metallib within the second it embedded it kept the
+    # older embedding: make compares whole seconds).
     set(metallib "${CMAKE_CURRENT_BINARY_DIR}/wt_metal/wt_metal_kernels.metallib")
-    add_custom_command(
-        OUTPUT "${metallib}"
-        COMMAND "${WT_METALLIB_LINKER}" ${air_files} -o "${metallib}"
-        DEPENDS ${air_files}
-        COMMENT "Linking the Metal kernels"
-        VERBATIM)
     set(embedded "${CMAKE_CURRENT_BINARY_DIR}/wt_metal/wt_metal_kernels.cpp")
     add_custom_command(
-        OUTPUT "${embedded}"
+        OUTPUT "${metallib}" "${embedded}"
+        COMMAND "${WT_METALLIB_LINKER}" ${air_files} -o "${metallib}"
         COMMAND "${CMAKE_COMMAND}" "-DINPUT=${metallib}" "-DOUTPUT=${embedded}" -DNAME=wt_metal_kernels
                 -P "${WT_GPU_ROOT}/cmake/wt_embed_file.cmake"
-        DEPENDS "${metallib}" "${WT_GPU_ROOT}/cmake/wt_embed_file.cmake"
+        DEPENDS ${air_files} "${WT_GPU_ROOT}/cmake/wt_embed_file.cmake"
+        COMMENT "Linking and embedding the Metal kernels"
         VERBATIM)
 
     # Its own library, as the CUDA backend: it sees only the shared kernel

@@ -23,6 +23,8 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -40,20 +42,36 @@ public:
             throw std::runtime_error("cannot create a Metal command queue");
     }
 
-    /** @brief The compute pipeline of kernel `name`, created on first use. Not thread safe. */
-    id<MTLComputePipelineState> pipeline(const std::string& name) {
-        const auto it = pipelines.find(name);
+    /**
+     * @brief The compute pipeline of kernel `name`, created on first use; of
+     *        a path kernel (plt.metal), specialized by its function constant
+     *        `hardware_rays`. Thread safe: a scene's geometry queries and
+     *        renders, which share the context, may run on different threads.
+     */
+    id<MTLComputePipelineState> pipeline(const std::string& name, std::optional<bool> hardware_rays = {}) {
+        const std::string key = !hardware_rays ? name : name + (*hardware_rays ? "+rt" : "+bvh");
+        const std::scoped_lock lock(pipelines_mutex);
+        const auto it = pipelines.find(key);
         if (it!=pipelines.end())
             return it->second;
-        id<MTLFunction> function = [library newFunctionWithName:@(name.c_str())];
-        if (!function)
-            throw std::runtime_error("Metal kernel " + name + " not found");
         NSError* error = nil;
+        id<MTLFunction> function = nil;
+        if (hardware_rays) {
+            MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
+            const bool value = *hardware_rays;
+            [constants setConstantValue:&value type:MTLDataTypeBool atIndex:0];
+            function = [library newFunctionWithName:@(name.c_str()) constantValues:constants error:&error];
+        } else {
+            function = [library newFunctionWithName:@(name.c_str())];
+        }
+        if (!function)
+            throw std::runtime_error("Metal kernel " + name + " not found" +
+                                     (error ? ": " + to_string(error.localizedDescription) : std::string{}));
         id<MTLComputePipelineState> state = [device newComputePipelineStateWithFunction:function error:&error];
         if (!state)
             throw std::runtime_error("cannot create the Metal pipeline of " + name + ": " +
                                      to_string(error.localizedDescription));
-        pipelines.emplace(name, state);
+        pipelines.emplace(key, state);
         return state;
     }
 
@@ -79,23 +97,22 @@ public:
         }
     }
 
-    /** @brief Encodes kernel `name` on `count` threads (one dimension), in threadgroups of up to 128. */
-    void dispatch(id<MTLComputeCommandEncoder> encoder, const std::string& name, std::size_t count) {
+    /** @brief Encodes the kernel of pipeline `state` on `count` threads (one dimension), in threadgroups of up to 128. */
+    static void dispatch(id<MTLComputeCommandEncoder> encoder, id<MTLComputePipelineState> state, std::size_t count) {
         if (count==0) return;
-        id<MTLComputePipelineState> state = pipeline(name);
         [encoder setComputePipelineState:state];
         [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(threadgroup_width(state), 1, 1)];
     }
 
     /**
-     * @brief Encodes kernel `name` on at least `count` threads, in whole
-     *        threadgroups (of whole SIMD-groups): for kernels of persistent
-     *        SIMD-groups. Returns the threads launched.
+     * @brief Encodes the kernel of pipeline `state` on at least `count`
+     *        threads, in whole threadgroups (of whole SIMD-groups): for
+     *        kernels of persistent SIMD-groups. Returns the threads launched.
      */
-    std::size_t dispatch_groups(id<MTLComputeCommandEncoder> encoder, const std::string& name, std::size_t count) {
+    static std::size_t dispatch_groups(id<MTLComputeCommandEncoder> encoder, id<MTLComputePipelineState> state,
+                                       std::size_t count) {
         if (count==0) return 0;
-        id<MTLComputePipelineState> state = pipeline(name);
         const NSUInteger width = threadgroup_width(state);
         const NSUInteger groups = (count+width-1)/width;
         [encoder setComputePipelineState:state];
@@ -107,9 +124,10 @@ public:
     void dispatch(const char* name, std::size_t count,
                   const std::function<void(id<MTLComputeCommandEncoder>)>& bind) {
         if (count==0) return;
+        id<MTLComputePipelineState> state = pipeline(name);
         run(name, [&](id<MTLComputeCommandEncoder> encoder) {
             bind(encoder);
-            dispatch(encoder, name, count);
+            dispatch(encoder, state, count);
         });
     }
 
@@ -148,6 +166,7 @@ private:
     }
 
     std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines;
+    std::mutex pipelines_mutex;
 };
 
 /**

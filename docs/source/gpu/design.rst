@@ -12,8 +12,9 @@ Code layout
 
 ``include/wt/gpu/kernel/``
    The kernels: math, ray/triangle and cone/triangle intersections, the ``bvh8w`` traversals (``bvh.hpp``), beams (``beam.hpp``), polarimetry, free-space diffraction (``fsd.hpp``, ``fraunhofer.hpp``), textures, and the integrators (``plt_path.hpp``, ``plt_bdpt.hpp``).
-   They are written in a subset of C++17, without wave_tracer's unit types or the standard library (see ``config.hpp``), so that the same headers compile with ``nvcc`` and as host C++, and can be ported to other GPU languages (such as Metal) later.
-   ``real`` is ``float``, or ``double`` with ``GPU_DBL_PRECISION``.
+   They are written in a subset of C++17, without wave_tracer's unit types or the standard library (see ``config.hpp``), so that the same headers compile with ``nvcc``, as Metal Shading Language 3.2, and as host C++.
+   Metal requires address spaces on pointers and references (``WT_GPU_GLOBAL``, ``WT_GPU_THREAD``, ``WT_GPU_CONSTANT``), and namespaces declared one level at a time.
+   ``real`` is ``float``, or ``double`` with ``GPU_DBL_PRECISION`` (CUDA only).
 
 ``include/wt/gpu/gpu.hpp``, ``include/wt/gpu/renderer.hpp``
    The API the rest of wave_tracer uses: ``gpu::device_t``, ``gpu::geometry_t`` (batched acceleration-structure queries) and ``gpu::renderer_t`` (renders a sensor).
@@ -21,6 +22,10 @@ Code layout
 
 ``include/wt/gpu/backend.hpp``, ``src/gpu/cuda/``, ``src/gpu/optix/``
    The interface a backend implements, and the CUDA backend with its OptiX ray tracing.
+
+``src/gpu/metal/``
+   The Metal backend (Apple silicon): the kernels' entry points (``geometry.metal``, ``plt.metal``), compiled into a metallib embedded in the library; the host side in Objective-C++ (``metal_backend.mm``, ``metal_renderer.mm``); the structs the two exchange (``plt_shared.hpp``), whose layouts the backend checks at start-up against the Metal compiler's (``layout.hpp``); and ray queries with Metal's ray tracing (``rt_rays.hpp``).
+   Its host code mirrors the CUDA backend's, with the differences described below.
 
 ``cmake/wt_gpu.cmake``
    The build options, shared by builds that embed wave_tracer.
@@ -71,8 +76,11 @@ The backend organizes them so that the GPU keeps busy despite that:
    A ray-traced step is too cheap to be worth storing a path's state between kernel launches, and a ``plt_bdpt`` path holds two subpaths of vertices.
    These paths run whole: a launch starts as many threads as the GPU can run at once (``plt_bdpt``: as many as 512 MiB of vertex memory allows), and each warp takes the next 32 paths from a global counter once all its lanes have finished their previous ones.
    Launches trace up to :math:`2^{20}` paths each.
+   On Metal, SIMD-groups (of 32 lanes) take paths as warps do, with ``simd_ballot`` and ``simd_broadcast``; Metal reports no occupancy, so a launch runs 2048 threads per GPU core (the core count is read from the IORegistry), more than a core runs at once.
+   ``plt_bdpt``'s vertex memory is a quarter of the GPU's recommended working set, up to 2 GiB, as unified memory affords it.
+   macOS stops command buffers that run too long, so Metal launches are sized, from the previous launch's rate, to take about a quarter of a second of GPU time.
 
-**Free-space diffraction's rejection sampling** shares its tries among a warp's lanes, so that a lane whose tries are rejected does not hold back the others.
+**Free-space diffraction's rejection sampling** shares its tries among a warp's (or SIMD-group's) lanes, so that a lane whose tries are rejected does not hold back the others.
 
 **Scratch memory.**
    A beam query returns all the triangles and edges within the beam's footprint, into a per-path buffer with room for 64.
@@ -86,11 +94,19 @@ The backend organizes them so that the GPU keeps busy despite that:
 Everything else (cone and ray traversals of the paths, edge queries of free-space diffraction) uses the CUDA port of ``bvh8w``: the same node layout and visiting order as the CPU's, with leaves encoded in their parents' child pointers.
 OptiX cannot replace these traversals, as beams are cones, not rays, and OptiX rays cannot be traced from within the long-running path kernels.
 
+**Hardware ray tracing on Metal.**
+   On GPUs with ray-tracing hardware (Apple M3 and later; earlier Apple GPUs emulate Metal's ray tracing, and the backend does not use it), the Metal backend builds a primitive acceleration structure of the BVH's triangles, in the BVH's order, so that a hit's primitive is its BVH triangle.
+   Unlike OptiX's, Metal's ray queries (``intersector``) run within any compute kernel, so the path kernels trace their rays with it directly, without deferring them: the closest hits of ballistic segments and of ray tracing, and shadow rays (``plt_bdpt``'s connections, next-event estimation), as well as the geometry API's ray queries.
+   Cone queries still traverse the BVH.
+   The path kernels' pipelines are specialized by a function constant, ``hardware_rays``, so that each is compiled with either kind of ray query.
+   Hits agree with the BVH traversal up to floating-point rounding, as OptiX's do, but for one case: ``plt_path``'s free-space diffraction of beams tests the visibility of the point a beam hit, on its surface, and whether such a shadow ray is blocked by the surface it ends on turns on the rounding of the ray-triangle test, which the BVH traversal shares with the CPU and the hardware does not. Those shadow rays, of ``plt_path`` with beams and free-space diffraction, use the BVH traversal.
+   ``--no-hw-rt`` (``use_hardware_ray_tracing = false``) turns hardware ray tracing off.
+
 
 Precision and limits
 --------------------
 
-* Kernels compute in 32-bit floating point by default, as the CPU's default build does; ``GPU_DBL_PRECISION`` switches them to 64 bits (CUDA only). Films accumulate in 64 bits either way.
+* Kernels compute in 32-bit floating point by default, as the CPU's default build does; ``GPU_DBL_PRECISION`` switches them to 64 bits (CUDA only: Apple GPUs have no 64-bit floating point). Films accumulate in 64 bits either way.
 * **Films on Metal (macOS).** Metal has no 64-bit floating point, neither arithmetic nor atomics, so the Metal backend's kernels splat into 32-bit float films with float atomic additions.
   Between launches, while the GPU is idle, the host adds these float films into its double-precision films and clears them: after every 64 samples per film element (paths started, on average; launches of whole paths trace no more than that), when the render finishes, and before a film is read (previews, captures).
   A float element therefore sums only a bounded number of splats, about 64 samples' worth (for films smaller than about 64×64 elements, a launch's worth), before its sum moves to double precision, rather than all of a render's samples; the relative rounding error of a flushed sum is at most of the order of :math:`64 \cdot 2^{-24} \approx 4 \cdot 10^{-6}`, and in practice nearer :math:`\sqrt{64} \cdot 2^{-24}`.

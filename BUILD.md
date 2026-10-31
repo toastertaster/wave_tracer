@@ -48,13 +48,15 @@ GPU support is optional at compile time and at run time: with these options `OFF
 
 ```GPU_OPTIX```: (default `OFF`) trace GPU ray queries, and `plt_bdpt`'s connection shadow rays, with OptiX's hardware ray tracing. Requires `GPU_CUDA`, CMake 3.27 and the OptiX SDK, found in `/opt/optix*` or given with `-DOptiX_INSTALL_DIR=...` (or the environment variable of the same name). An OptiX SDK needs a recent enough NVIDIA driver (OptiX 9.1 needs a newer one than 9.0); with an older driver, choose an older SDK.
 
+```GPU_METAL```: (default `OFF`) build the Metal backend, on macOS with Apple silicon (an M1 or later GPU, macOS 15 or later). Exclusive with `GPU_CUDA` and `GPU_DBL_PRECISION`. Needs the Metal toolchain, a separate download since Xcode 26: `xcodebuild -downloadComponent MetalToolchain`. The kernels are compiled as Metal Shading Language 3.2 and embedded in the library. Ray queries use Metal's hardware ray tracing on GPUs that have it (M3 and later; `render --gpu --no-hw-rt` turns it off). Metal has no 64-bit floating point: films accumulate in 32-bit floats on the GPU, which the host adds into double-precision films every 64 samples per film element (see `docs/source/gpu/design.rst`, "Precision and limits").
+
 ```GPU_DBL_PRECISION```: (default `OFF`) use 64-bit floating point in GPU kernels, independent of `DBL_PRECISION`. OptiX is then not used for ray queries (its traversal is 32-bit). Most GPUs compute 64-bit floating point far slower than 32-bit, and Apple GPUs not at all.
 
 At run time, `render --gpu` uses the GPU. The GPU answers acceleration-structure queries (`wt/gpu/gpu.hpp`), and renders a subset of scenes (`wt/gpu/renderer.hpp`): so far `plt_path` (forward and backward) and `plt_bdpt`, with beams or in ray-tracing mode, with coverage and perspective sensors, point, spot, directional and area emitters, and `surface_spm`, `dielectric` and `diffuse` BSDFs with bitmap textures. A scene outside that subset fails with an error naming the unsupported feature, rather than silently rendering on the CPU. The documentation's GPU section (`docs/source/gpu/`) describes the supported scenes, usage from the command line, C++ and Rust, the design, and runtime performance. The GPU code is laid out as follows:
 
 * `include/wt/gpu/kernel/`: the kernels, in a C++17 subset shared by CUDA, Metal and host C++ (see `config.hpp`): math, intersection tests and the `bvh8w` traversals, beams, polarimetry, free-space diffraction (`fsd.hpp`, `fraunhofer.hpp`), textures and the integrators (`plt_path.hpp`, `plt_bdpt.hpp`), ported from the CPU code.
 * `include/wt/gpu/gpu.hpp`: the API the rest of wave_tracer uses (`gpu::device_t`, `gpu::geometry_t`); `include/wt/gpu/renderer.hpp`: rendering (`gpu::renderer_t`, used by `scene_renderer_t`), which compiles a scene into the kernels' structs (`src/gpu/renderer.cpp`).
-* `include/wt/gpu/backend.hpp`: the interface backends implement; `src/gpu/cuda/`, `src/gpu/optix/`: the CUDA backend.
+* `include/wt/gpu/backend.hpp`: the interface backends implement; `src/gpu/cuda/`, `src/gpu/optix/`: the CUDA backend; `src/gpu/metal/`: the Metal backend.
 * `cmake/wt_gpu.cmake`: the options above, also used by builds that embed wave_tracer.
 
 

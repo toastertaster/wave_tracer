@@ -8,12 +8,19 @@ GPU support is optional twice over: at compile time, the GPU backends are built 
 Requirements
 ------------
 
+For the CUDA backend:
+
 * An NVIDIA GPU and its driver. The CUDA runtime is linked statically, so the driver is all that is needed to run.
 * To build: the CUDA toolkit (``nvcc``), with a host compiler it accepts.
 * For OptiX: CMake 3.27 or newer and the `OptiX SDK <https://developer.nvidia.com/designworks/optix/download>`_ (headers only; OptiX itself ships with the driver).
   Every OptiX SDK needs a driver at least as new as its release: OptiX 9.1, for example, needs a newer driver than 9.0. With an older driver, build against an older SDK.
 
-The GPU code was developed and measured on an NVIDIA GB10 (compute capability 12.1) with CUDA 13.0 and OptiX 9.0.
+For the Metal backend:
+
+* macOS 15 or later, on Apple silicon: an M1 or later GPU (Metal GPU family Apple7, for float atomics and SIMD-group functions). Ray queries use the GPU's ray-tracing hardware on M3 and later.
+* To build: Xcode or its Command Line Tools, and the Metal toolchain, which Xcode 26 and later download separately: ``xcodebuild -downloadComponent MetalToolchain`` (the Rust bindings' ``just install-metal-toolchain``). The kernels are compiled as Metal Shading Language 3.2 and embedded in the library, so nothing else is needed to run.
+
+The GPU code was developed and measured on an NVIDIA GB10 (compute capability 12.1) with CUDA 13.0 and OptiX 9.0, and on an Apple M4 (macOS 27.2).
 
 
 Build configurations
@@ -43,6 +50,10 @@ Build configurations
      - add ``-DGPU_DBL_PRECISION=ON``
      - add ``gpu-double-precision``
      - ``CUDA, 64-bit on <GPU> (...)``
+   * - Metal (macOS)
+     - ``-DGPU_METAL=ON``
+     - ``gpu-metal``
+     - ``Metal + hardware ray tracing on <GPU>`` (M3 and later), ``Metal on <GPU>``
 
 ``GPU_CUDA``
    Builds the CUDA backend. Kernels are compiled for the GPUs of the building machine (``CMAKE_CUDA_ARCHITECTURES=native``), unless ``CMAKE_CUDA_ARCHITECTURES`` is set, e.g. to ``86;89;120`` to build for other GPUs.
@@ -51,6 +62,12 @@ Build configurations
    Requires ``GPU_CUDA``. Traces ray queries with OptiX's hardware ray tracing: the batched ray queries of the GPU geometry API, and ``plt_bdpt``'s connection shadow rays.
    The rendering kernels themselves traverse the BVH with CUDA code in both configurations (see :doc:`design`), so OptiX speeds up only ``plt_bdpt`` renders (see :doc:`performance`).
    The SDK is searched for in ``/opt/optix*`` and ``/opt/NVIDIA-OptiX-SDK*`` (newest first), or given with ``-DOptiX_INSTALL_DIR=<dir>`` or the environment variable of the same name.
+
+``GPU_METAL``
+   Builds the Metal backend, on macOS only; exclusive with ``GPU_CUDA`` (a build has one GPU backend) and with ``GPU_DBL_PRECISION``.
+   The kernels (``src/gpu/metal/*.metal``, including the shared ``include/wt/gpu/kernel/`` headers) are compiled with the Metal toolchain (``xcrun metal``) into a metallib embedded in the library.
+   Ray queries, of the geometry API and of the rendering kernels, use Metal's hardware ray tracing on GPUs that have it (M3 and later); there is no build option for it.
+   Metal has no 64-bit floating point: films accumulate in 32-bit floats on the GPU, added into double-precision films on the host every 64 samples per element (see :doc:`design`).
 
 ``GPU_DBL_PRECISION``
    Computes in 64-bit floating point in the GPU kernels, independently of the CPU's ``DBL_PRECISION``.
@@ -65,7 +82,7 @@ Builds that embed wave_tracer (such as the Rust bindings) add the GPU backends t
    include(<wave_tracer>/cmake/wt_gpu.cmake)
    wt_add_gpu_backends(<target>)
 
-which honours the same options and defines ``WT_GPU_CUDA``, ``WT_GPU_OPTIX`` and ``WT_GPU_DBL_PRECISION`` on the target.
+which honours the same options and defines ``WT_GPU_CUDA``, ``WT_GPU_OPTIX``, ``WT_GPU_METAL`` and ``WT_GPU_DBL_PRECISION`` on the target.
 
 
 Command line
@@ -77,11 +94,13 @@ Command line
 
    ./wave_tracer render --gpu scene.xml -o out -D spp=256
    ./wave_tracer render --gpu --ray-tracing scene.xml -o out
-   ./wave_tracer render --gpu --no-optix scene.xml -o out
+   ./wave_tracer render --gpu --no-optix scene.xml -o out    # CUDA builds
+   ./wave_tracer render --gpu --no-hw-rt scene.xml -o out    # Metal builds
    CUDA_VISIBLE_DEVICES=1 ./wave_tracer render --gpu scene.xml   # another GPU
 
 * ``--ray-tracing`` renders in ray-tracing mode, as on the CPU.
 * ``--no-optix`` traces rays with the CUDA traversal, as builds without ``GPU_OPTIX`` do, rather than with OptiX; the program then reports the GPU as ``CUDA on <GPU>``. Use it to compare the two, or to rule OptiX out when investigating a difference: OptiX may report either triangle when a ray grazes an edge or vertex they share. It has no effect in builds without OptiX.
+* ``--no-hw-rt``, in Metal builds, traces rays with the ported BVH traversal rather than with Metal's hardware ray tracing; the program then reports the GPU as ``Metal on <GPU>``. As with OptiX, rays grazing an edge or vertex may hit either triangle. It has no effect on GPUs without ray-tracing hardware (before M3).
 * Outputs, previews (``--tev``, and the GUI of ``renderui``), progress, pausing and termination work as on the CPU. They update between the GPU's *passes*: a pass renders whole samples of all sensor elements, about :math:`2^{22}` paths (see :doc:`design`).
 * ``--block_size`` and ``--block_samples`` do not apply; ``--threads`` sets the CPU threads that load the scene and build its acceleration structure.
 * The reported render time (``Elapsed``) excludes loading the scene and building its BVH (both on the CPU), opening the GPU, and compiling and uploading the scene to it.
@@ -97,7 +116,7 @@ The GPU is a ``wt::gpu::device_t``, given to the renderer through the context; a
    #include <wt/gpu/gpu.hpp>
 
    // throws wt::gpu::gpu_error_t, explaining why, if the build or the machine has no usable GPU
-   auto gpu = wt::gpu::device_t::create({ .ordinal = 0, .use_optix = true });
+   auto gpu = wt::gpu::device_t::create({ .ordinal = 0, .use_hardware_ray_tracing = true });
    std::cout << gpu->description() << '\n';
 
    wt::wt_context_t context;
@@ -107,8 +126,8 @@ The GPU is a ``wt::gpu::device_t``, given to the renderer through the context; a
 
    // load the scene with `context`, then render it with a scene_renderer_t, as on the CPU
 
-* ``wt::gpu::compiled_backends()`` names the backends a build includes (``"CUDA, OptiX"``, ``"CUDA"`` or ``""``).
-* ``use_optix = false`` traces rays with the CUDA traversal in an OptiX build (the command line's ``--no-optix``).
+* ``wt::gpu::compiled_backends()`` names the backends a build includes (``"CUDA, OptiX"``, ``"CUDA"``, ``"Metal"`` or ``""``).
+* ``use_hardware_ray_tracing = false`` traces rays with the ported BVH traversal rather than with OptiX (the command line's ``--no-optix``) or Metal's ray tracing (``--no-hw-rt``). ``ordinal`` is a CUDA device ordinal, or an index into Metal's devices.
 * Constructing a ``wt::gpu::renderer_t`` (done by ``scene_renderer_t`` for each sensor) compiles the scene; it throws ``gpu_error_t`` naming the first unsupported scene element.
 * ``wt::gpu::geometry_t`` (from ``device_t::upload``) answers batches of the acceleration structure's queries on the GPU (closest-hit and shadow rays, elliptic cones and balls), with the CPU's results up to floating-point rounding.
 * A render uploads the scene's acceleration structure once, for all its sensors. An application that has already uploaded it, for its own queries, can give that upload to its renders, which then share it rather than upload the scene again:
@@ -129,7 +148,7 @@ The GPU is a ``wt::gpu::device_t``, given to the renderer through the context; a
 Rust bindings
 -------------
 
-The `Rust bindings <https://github.com/toastertaster/wave_tracers>`_ build the GPU backends with the features ``gpu-cuda``, ``gpu-optix`` and ``gpu-double-precision``. A context uses the GPU only when asked:
+The `Rust bindings <https://github.com/toastertaster/wave_tracers>`_ build the GPU backends with the features ``gpu-cuda``, ``gpu-optix``, ``gpu-double-precision`` and ``gpu-metal``. A context uses the GPU only when asked:
 
 .. code-block:: rust
 
@@ -143,9 +162,9 @@ The `Rust bindings <https://github.com/toastertaster/wave_tracers>`_ build the G
    let scene = Scene::load(&context, "scene.xml", &[("spp", "64")])?;
    let result = scene.start_render()?.wait()?;
 
-``wave_tracers::gpu_backends()`` names the compiled backends, and ``ContextBuilder::optix(false)`` turns OptiX off (the command line's ``--no-optix``).
+``wave_tracers::gpu_backends()`` names the compiled backends, and ``ContextBuilder::hardware_ray_tracing(false)`` turns OptiX or Metal's ray tracing off (the command line's ``--no-optix`` and ``--no-hw-rt``).
 A scene loaded with a GPU context uploads its geometry once, for its geometry queries, and its renders share that upload.
-The bindings' examples take ``--gpu``, ``--no-optix`` and ``--ray-tracing`` (``examples/render.rs``), and ``examples/gpu_compare.rs`` compares a scene's GPU and CPU renders statistically.
+The bindings' examples take ``--gpu``, ``--no-hw-rt`` (or ``--no-optix``) and ``--ray-tracing`` (``examples/render.rs``), and ``examples/gpu_compare.rs`` compares a scene's GPU and CPU renders statistically.
 
 
 Supported scenes

@@ -13,6 +13,7 @@ At a glance
 * **Beams cost far more than rays.** ``plt_path`` with beams takes 3 to 18 times longer than in ray-tracing mode; ``plt_bdpt`` with beams, hundreds of times longer (380× and 540× below). Ray tracing renders millions of paths per second on any of these scenes.
 * **A beam's cost grows with the geometry its footprint overlaps.** Finely tessellated meshes, and wide beams (of coarse films), make beam queries return many triangles and edges, all of which the path then processes.
 * **OptiX matters only for plt_bdpt.** It traces ``plt_bdpt``'s connection shadow rays (0 to 20% faster); ``plt_path``, with beams or rays, renders at the same speed with or without it.
+* **On Apple silicon (Metal)**, an M4's GPU renders ``plt_path`` 2 to 7 times faster than its CPU, and hardware ray tracing (M3 and later), which Metal's path kernels use for all their rays, renders ray-traced scenes of thousands of triangles up to twice as fast (see `Metal on Apple silicon`_).
 * **64-bit kernels are 3 to 8 times slower** on the GB10, a GPU with a low 64-bit floating-point rate.
 * **Small renders do not fill the GPU.** A pass has a fixed cost of tens of milliseconds for ``plt_path``, and of seconds for ``plt_bdpt`` with beams, whose longest paths dominate a small pass.
 
@@ -132,102 +133,168 @@ In ``plt_bdpt`` renders, OptiX traces the connections' shadow rays in batches (s
 Metal on Apple silicon
 ----------------------
 
-The Metal backend on an Apple M4 (10-core GPU; 4 performance and 6 efficiency CPU cores, 32 GB; macOS 27.2, Metal toolchain 32023), against the same build rendering on the M4's CPU (all 10 cores), and the GB10 times above (CUDA + OptiX):
+The Metal backend on an Apple M4 (10-core GPU, which has ray-tracing hardware; 4 performance and 6 efficiency CPU cores, 32 GB; macOS 27.2, Metal toolchain 32023): with hardware ray tracing (the default), without it (``--no-hw-rt``), against the same build rendering on the M4's CPU (all 10 cores), and the GB10 times above (CUDA + OptiX).
+Times are of the second of two runs, so that the GPU's compiled pipelines are cached (see below).
+
+With beams:
 
 .. list-table::
    :header-rows: 1
-   :widths: 26 16 10 10 10 10 10 10
+   :widths: 30 16 11 13 10 10
 
    * - Scene
      - Defines
-     - Beams, Metal
-     - Beams, M4 CPU
-     - Beams, GB10
-     - Rays, Metal
-     - Rays, M4 CPU
-     - Rays, GB10
+     - Metal
+     - Metal, ``--no-hw-rt``
+     - M4 CPU
+     - GB10
    * - test ``box`` (plt_path)
      - res=256 spp=64
-     - 929 ms
+     - 1.0 s
+     - 964 ms
      - 3.5 s
      - 451 ms
-     - 328 ms
+   * - test ``glass_box``
+     - res=256 spp=64
+     - 1.3 s
+     - 1.6 s
+     - 4.2 s
+     - 467 ms
+   * - test ``lights_box``
+     - res=256 spp=64
+     - 794 ms
+     - 773 ms
+     - 3.2 s
+     - 291 ms
+   * - test ``textured_box``
+     - res=256 spp=64
+     - 832 ms
+     - 824 ms
+     - 3.1 s
+     - 291 ms
+   * - test ``rough_box``
+     - res=256 spp=64
+     - 1.0 s
+     - 1.1 s
+     - 4.0 s
+     - 346 ms
+   * - test ``polarized_box`` (Stokes)
+     - res=256 spp=64
+     - 703 ms
+     - 611 ms
+     - 2.0 s
+     - 276 ms
+   * - test ``coverage`` (forward plt_path)
+     - res=256 spp=256
+     - 1.7 s
+     - 1.7 s
+     - 4.1 s
+     - 481 ms
+   * - test ``lights_coverage``
+     - res=256 spp=256
+     - 3.0 s
+     - 3.0 s
+     - 9.3 s
+     - 661 ms
+   * - ``diffraction_simple/double_slits``
+     - res=512 spp=32
+     - 1.3 s
+     - 1.2 s
+     - 2.5 s
+     - 464 ms
+   * - ``cornell-box/sphere_polarization`` (plt_bdpt, Stokes)
+     - res=128 spp=8
+     - 14.4 s
+     - 15.2 s
+     - 7.3 s
+     - 12.6 s
+
+In ray-tracing mode (``--ray-tracing``), with the scenes' triangle counts:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 10 10 13 10 10
+
+   * - Scene
+     - Defines
+     - Triangles
+     - Metal
+     - Metal, ``--no-hw-rt``
+     - M4 CPU
+     - GB10
+   * - test ``box`` (plt_path)
+     - res=256 spp=64
+     - 1290
+     - 159 ms
+     - 323 ms
      - 1.2 s
      - 89 ms
    * - test ``glass_box``
      - res=256 spp=64
-     - 1.5 s
-     - 4.2 s
-     - 467 ms
-     - 235 ms
+     - 1304
+     - 167 ms
+     - 226 ms
      - 1.0 s
      - 64 ms
    * - test ``lights_box``
      - res=256 spp=64
-     - 722 ms
-     - 3.2 s
-     - 291 ms
-     - 121 ms
+     - 14
+     - 131 ms
+     - 116 ms
      - 784 ms
      - 44 ms
    * - test ``textured_box``
      - res=256 spp=64
-     - 798 ms
-     - 3.1 s
-     - 291 ms
-     - 266 ms
+     - 38
+     - 234 ms
+     - 256 ms
      - 938 ms
      - 92 ms
    * - test ``rough_box``
      - res=256 spp=64
-     - 1.0 s
-     - 4.0 s
-     - 346 ms
-     - 220 ms
+     - 38
+     - 191 ms
+     - 217 ms
      - 1.1 s
      - 66 ms
    * - test ``polarized_box`` (Stokes)
      - res=256 spp=64
-     - 607 ms
-     - 2.0 s
-     - 276 ms
-     - 122 ms
+     - 10
+     - 125 ms
+     - 114 ms
      - 547 ms
      - 64 ms
    * - test ``coverage`` (forward plt_path)
      - res=256 spp=256
-     - 1.6 s
-     - 4.1 s
-     - 481 ms
-     - 164 ms
+     - 38
+     - 171 ms
+     - 166 ms
      - 820 ms
      - 64 ms
    * - test ``lights_coverage``
      - res=256 spp=256
-     - 2.8 s
-     - 9.3 s
-     - 661 ms
+     - 40
+     - 194 ms
      - 192 ms
      - 993 ms
      - 71 ms
    * - ``diffraction_simple/double_slits``
      - res=512 spp=32
-     - 1.2 s
-     - 2.5 s
-     - 464 ms
-     - 111 ms
+     - 10
+     - 122 ms
+     - 103 ms
      - 554 ms
      - 45 ms
    * - ``cornell-box/sphere_polarization`` (plt_bdpt, Stokes)
      - res=128 spp=8
-     - 16.8 s
-     - 7.3 s
-     - 12.6 s
-     - 71 ms
+     - 20502
+     - 41 ms
+     - 63 ms
      - 116 ms
      - 33 ms
 
-* **plt_path renders 2 to 6 times faster on the M4's GPU than on its CPU**, with beams or rays, and 2 to 4 times slower than on the GB10, a GPU with several times the M4's 32-bit floating-point throughput.
+* **plt_path renders 2 to 4 times faster with beams, and 3 to 7 times faster with rays, on the M4's GPU than on its CPU**, and 2 to 4.5 times slower than on the GB10, a GPU with several times the M4's 32-bit floating-point throughput.
+* **Hardware ray tracing pays off with geometry**: ray-traced renders of the scenes of a thousand triangles or more take 25% to 50% less time with it (``box``: 323 ms to 159 ms; ``sphere_polarization``: 63 ms to 41 ms), and ``glass_box`` with beams 20% less. On the test scenes of a few dozen triangles, whose BVH is a leaf or two, the ported traversal takes up to 16% less time; and beams, whose cone queries always traverse the BVH, gain less.
 * **plt_bdpt with beams is slower on the GPU than on the CPU** in ``sphere_polarization``. Its first pass takes about 2 s; the rest is spent re-tracing the paths that overflow their scratch memory (see :doc:`design`), whose beams overlap thousands of triangles and edges: a few hundred such paths, each traced by a single GPU thread, far slower than a CPU core. The GB10 spends most of its 12.6 s on them too.
 * ``veach_mis``, ``sionna_etoile`` and ``bidir_room`` are missing: on macOS, their lengths in centimetres do not parse (libc++ reads the ``c`` of ``cm`` as part of the number), and ``sionna_etoile``'s meshes are Git LFS objects.
 
@@ -238,8 +305,7 @@ What was measured, and decided, while tuning the Metal backend:
 * **Threadgroups and persistent threads.** Threadgroups of 32 to 256 threads, and 512 to 4096 persistent threads per GPU core, render within 2% of each other; the backend uses 128 and 2048.
 * **Free-space diffraction's rejection sampling** shares its tries among a SIMD-group's lanes, as among a CUDA warp's: plt_bdpt's first pass of ``sphere_polarization`` traces 6% more paths per second than with each lane sampling alone.
 * **plt_bdpt's memory for paths in flight** is a quarter of the GPU's recommended working set, up to 2 GiB, rather than CUDA's 512 MiB: re-traced paths need much more memory each, and 512 MiB held too few of them to fill the GPU (``sphere_polarization``: 24.6 s with 512 MiB, 16.6 s with 2 GiB; 4 GiB is no faster).
-* **The first render after building** includes compiling the kernels' pipelines for the GPU, about a second; macOS caches them for later runs.
-
+* **The first render after building** includes compiling the kernels' pipelines for the GPU, a second or two (and again the first time with ``--no-hw-rt``, whose pipelines differ); macOS caches them for later runs.
 
 64-bit kernels
 --------------
@@ -372,5 +438,6 @@ Tips
 * Render enough paths per pass to fill the GPU: films of at least 256×256 elements, or enough samples per element; with ``plt_bdpt``, prefer larger films.
 * Keep meshes as coarse as the simulation allows when rendering with beams.
 * Build with OptiX for ``plt_bdpt``; it costs nothing otherwise, and ``--no-optix`` turns it off at run time.
+* On Apple silicon, hardware ray tracing (M3 and later) is on by default; ``--no-hw-rt`` may be faster for scenes of a few dozen triangles.
 * Use ``GPU_DBL_PRECISION`` to investigate precision, not for production renders.
 * Interrupts and previews wait for a pass to end; with ``plt_bdpt`` and beams, a pass can take a minute or more.

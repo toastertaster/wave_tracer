@@ -22,10 +22,15 @@
 
 namespace wt::gpu::metal_backend {
 
-/** @brief A scene's BVH on the GPU (`metal_geometry_t`'s), which renders trace their rays through. */
+/**
+ * @brief A scene's geometry on the GPU (`metal_geometry_t`'s), which renders
+ *        trace their beams and rays through: its BVH, and, if rays are traced
+ *        by hardware, the acceleration structure of its triangles (else nil).
+ */
 struct bvh_buffers_t {
     id<MTLBuffer> nodes;
     id<MTLBuffer> tris;
+    id<MTLAccelerationStructure> accel;
 };
 
 /** @brief Uploads `scene`, compiled for the geometry of `bvh`, for rendering. */

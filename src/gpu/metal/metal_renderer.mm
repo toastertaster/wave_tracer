@@ -344,10 +344,11 @@ private:
         scratch_aperture.resize(std::size_t(slots)*capacity);
         overflow.resize(slots);
 
+        id<MTLComputePipelineState> fill = context->pipeline("fill_free_slots");
         context->run("path pool kernel", [&](id<MTLComputeCommandEncoder> e) {
             free_slots.bind(e, 0);
             bind_value(e, slots, 1);
-            context->dispatch(e, "fill_free_slots", slots);
+            context_t::dispatch(e, fill, slots);
         });
         wf = { slots, capacity, 0, slots, 0 };
     }
@@ -389,15 +390,23 @@ private:
         });
     }
 
-    /** @brief Encodes path kernel `name` (`kernel`) of launch `l`, on `threads` threads. */
+    /**
+     * @brief Encodes path kernel `name` (`kernel`) of launch `l`, on `threads`
+     *        threads; its rays traced by hardware if the geometry has an
+     *        acceleration structure.
+     */
     void dispatch(id<MTLComputeCommandEncoder> e, const char* name, const plt_launch& l, std::size_t threads,
                   bool whole_groups = false) {
+        const bool hardware_rays = bvh.accel!=nil;
+        id<MTLComputePipelineState> state = context->pipeline(kernel(name), hardware_rays);
         bind_value(e, params, 0);
         bind_value(e, l, 1);
+        if (hardware_rays)
+            [e setAccelerationStructure:bvh.accel atBufferIndex:2];
         if (whole_groups)
-            context->dispatch_groups(e, kernel(name), threads);
+            context_t::dispatch_groups(e, state, threads);
         else
-            context->dispatch(e, kernel(name), threads);
+            context_t::dispatch(e, state, threads);
     }
 
     /** @brief The buffers the kernels read and write. */

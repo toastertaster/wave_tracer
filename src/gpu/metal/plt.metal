@@ -12,24 +12,39 @@
  * cuda_backend.cu's (see there, and metal_renderer.mm, for how they are run).
  * Kernels are templates of `P`, whether the sensor is polarimetric
  * (`path_state_t`), instantiated as `<name>_scalar` and `<name>_polarimetric`.
+ *
+ * Their pipelines are specialized by the function constant `hardware_rays`:
+ * whether the paths' ray queries (ballistic segments, shadow rays) use
+ * Metal's ray tracing, in the acceleration structure at buffer 2 (see
+ * rt_rays.hpp), or the BVH traversal. Cone queries always traverse the BVH.
+ * Unlike OptiX's, Metal's ray queries run within the path kernels.
  */
 
 #include "plt_shared.hpp"
+#include "rt_rays.hpp"
 
 using namespace metal;
 namespace k = wt::gpu::compute_kernel;
 using namespace wt::gpu::metal_backend;
 
+constant bool hardware_rays [[function_constant(0)]];
+
 namespace {
 
-/** @brief Geometry queries for the path tracers: the BVH traversals. */
+/** @brief Geometry queries for the path tracers: the BVH traversals, and rays traced by hardware if enabled. */
 struct bvh_geometry {
     k::bvh_view bvh;
+    acceleration_structure accel;       // with `hardware_rays`
+    bool hardware_shadows;              // shadow rays too (see `geometry_of`)
 
     k::ray_hit intersect(k::ray r, k::range rng) const {
+        if (hardware_rays)
+            return rt_intersect(accel, bvh.tris, r, rng);
         return k::intersect_ray(bvh, r, rng);
     }
     bool occluded(k::ray r, k::range rng, thread k::u32& status) const {
+        if (hardware_rays && hardware_shadows)
+            return rt_occluded(accel, r, rng);
         return k::ray_occluded(bvh, r, rng, status);
     }
     k::cone_hit intersect_cone(const thread k::cone& c, k::range rng, k::real z_scale,
@@ -37,6 +52,31 @@ struct bvh_geometry {
         return k::intersect_cone(bvh, c, rng, z_scale, sink);
     }
 };
+
+/**
+ * @brief The path kernels' geometry: `accel` is a kernel argument only with
+ *        `hardware_rays`.
+ *
+ *        Shadow rays are traced by hardware but in plt_path's free-space
+ *        diffraction of beams (`do_fsd`), which tests the visibility of the
+ *        point a beam hit, on its surface: whether a shadow ray ending on a
+ *        surface is blocked by it turns on the rounding of the ray-triangle
+ *        test, which the BVH traversal shares with the CPU (a closed range),
+ *        and the hardware does not (backward plt_path renders were 12%
+ *        brighter). Other shadow rays end off surfaces, offset as the CPU's,
+ *        and the two agree.
+ */
+bvh_geometry geometry_of(const thread k::plt_scene& scene, acceleration_structure accel) {
+    bvh_geometry g;
+    g.bvh = scene.bvh;
+    g.hardware_shadows = false;
+    if (hardware_rays) {
+        g.accel = accel;
+        const k::plt_params o = scene.params;
+        g.hardware_shadows = o.bdpt!=0 || o.ray_tracing_only!=0 || o.fsd==0;
+    }
+    return g;
+}
 
 /** @brief Path `base+i` with `seed` (and a spectral sample of its table), or `list[base+i]` if there is a list. */
 path_entry entry_of(const thread plt_launch& l, u32 i) {
@@ -160,6 +200,7 @@ kernel void start_paths(constant k::plt_scene& scene_ [[buffer(0)]], constant pl
  */
 template <bool P>
 kernel void trace_paths(constant k::plt_scene& scene_ [[buffer(0)]], constant plt_launch& launch [[buffer(1)]],
+                        acceleration_structure accel [[buffer(2), function_constant(hardware_rays)]],
                         uint i [[thread_position_in_grid]]) {
     if (i>=launch.count) return;
     const k::plt_scene scene = scene_;
@@ -167,7 +208,7 @@ kernel void trace_paths(constant k::plt_scene& scene_ [[buffer(0)]], constant pl
 
     const u32 slot = l.queue[i];
     const k::path_state_t<P> p = l.pool.states<P>()[slot];
-    const bvh_geometry geometry = { scene.bvh };
+    const bvh_geometry geometry = geometry_of(scene, accel);
 
     k::traversal_t tr;
     u32 s = k::status_ok;
@@ -180,6 +221,7 @@ kernel void trace_paths(constant k::plt_scene& scene_ [[buffer(0)]], constant pl
 /** @brief Second part of a step of the `count` queued paths (`interact`), after `trace_paths`. */
 template <bool P>
 kernel void interact_paths(constant k::plt_scene& scene_ [[buffer(0)]], constant plt_launch& launch [[buffer(1)]],
+                           acceleration_structure accel [[buffer(2), function_constant(hardware_rays)]],
                            uint i [[thread_position_in_grid]]) {
     if (i>=launch.count) return;
     const k::plt_scene scene = scene_;
@@ -192,7 +234,7 @@ kernel void interact_paths(constant k::plt_scene& scene_ [[buffer(0)]], constant
     bool goes_on = false;
     if (traced & trace_found) {
         const k::traversal_t tr = l.pool.traversals[slot];
-        const bvh_geometry geometry = { scene.bvh };
+        const bvh_geometry geometry = geometry_of(scene, accel);
         film_view film = l.film;
         goes_on = k::interact(scene, geometry, film, l.pool.scratch(slot), tr, p, s);
     }
@@ -206,6 +248,7 @@ kernel void interact_paths(constant k::plt_scene& scene_ [[buffer(0)]], constant
  */
 template <bool P>
 kernel void step_paths(constant k::plt_scene& scene_ [[buffer(0)]], constant plt_launch& launch [[buffer(1)]],
+                       acceleration_structure accel [[buffer(2), function_constant(hardware_rays)]],
                        uint i [[thread_position_in_grid]]) {
     if (i>=launch.count) return;
     const k::plt_scene scene = scene_;
@@ -213,7 +256,7 @@ kernel void step_paths(constant k::plt_scene& scene_ [[buffer(0)]], constant plt
 
     const u32 slot = l.queue[i];
     k::path_state_t<P> p = l.pool.states<P>()[slot];
-    const bvh_geometry geometry = { scene.bvh };
+    const bvh_geometry geometry = geometry_of(scene, accel);
     film_view film = l.film;
 
     u32 s = k::status_ok;
@@ -231,12 +274,13 @@ kernel void step_paths(constant k::plt_scene& scene_ [[buffer(0)]], constant plt
  */
 template <bool P>
 kernel void run_paths(constant k::plt_scene& scene_ [[buffer(0)]], constant plt_launch& launch [[buffer(1)]],
+                      acceleration_structure accel [[buffer(2), function_constant(hardware_rays)]],
                       uint thread_index [[thread_position_in_grid]],
                       uint lane [[thread_index_in_simdgroup]]) {
     const k::plt_scene scene = scene_;
     const plt_launch l = launch;
     paths_started(l, thread_index);
-    const bvh_geometry geometry = { scene.bvh };
+    const bvh_geometry geometry = geometry_of(scene, accel);
     auto trace = [&](u32 slot, u32 i) {
         k::path_state_t<P> p = start_path<P>(scene, l, i);
         film_view film = l.film;
@@ -259,12 +303,13 @@ kernel void run_paths(constant k::plt_scene& scene_ [[buffer(0)]], constant plt_
  */
 template <bool P>
 kernel void run_bdpt_paths(constant k::plt_scene& scene_ [[buffer(0)]], constant plt_launch& launch [[buffer(1)]],
+                           acceleration_structure accel [[buffer(2), function_constant(hardware_rays)]],
                            uint thread_index [[thread_position_in_grid]],
                            uint lane [[thread_index_in_simdgroup]]) {
     const k::plt_scene scene = scene_;
     const plt_launch l = launch;
     paths_started(l, thread_index);
-    const bvh_geometry geometry = { scene.bvh };
+    const bvh_geometry geometry = geometry_of(scene, accel);
     auto trace = [&](u32 slot, u32 i) {
         const path_entry e = entry_of(l, i);
         film_view film = l.film, light = l.light;
@@ -291,10 +336,10 @@ kernel void run_bdpt_paths(constant k::plt_scene& scene_ [[buffer(0)]], constant
                                                                   __VA_ARGS__);
 #define WT_PATH_KERNELS(P, suffix) \
     WT_PATH_KERNEL(start_paths, P, suffix, uint) \
-    WT_PATH_KERNEL(trace_paths, P, suffix, uint) \
-    WT_PATH_KERNEL(interact_paths, P, suffix, uint) \
-    WT_PATH_KERNEL(step_paths, P, suffix, uint) \
-    WT_PATH_KERNEL(run_paths, P, suffix, uint, uint) \
-    WT_PATH_KERNEL(run_bdpt_paths, P, suffix, uint, uint)
+    WT_PATH_KERNEL(trace_paths, P, suffix, acceleration_structure, uint) \
+    WT_PATH_KERNEL(interact_paths, P, suffix, acceleration_structure, uint) \
+    WT_PATH_KERNEL(step_paths, P, suffix, acceleration_structure, uint) \
+    WT_PATH_KERNEL(run_paths, P, suffix, acceleration_structure, uint, uint) \
+    WT_PATH_KERNEL(run_bdpt_paths, P, suffix, acceleration_structure, uint, uint)
 WT_PATH_KERNELS(false, scalar)
 WT_PATH_KERNELS(true, polarimetric)

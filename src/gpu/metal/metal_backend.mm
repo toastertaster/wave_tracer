@@ -10,7 +10,10 @@
 /*
  * The Metal backend (Apple silicon): the shared kernels compiled as Metal
  * Shading Language into an embedded metallib, run through Metal compute
- * pipelines. Buffers live in unified memory shared with the CPU.
+ * pipelines. Buffers live in unified memory shared with the CPU. On GPUs with
+ * ray-tracing hardware (Apple M3 and later), ray queries, of the geometry and
+ * of the path kernels, use Metal's ray tracing (rt_rays.hpp), as the CUDA
+ * backend's use OptiX.
  */
 
 #include <wt/gpu/backend.hpp>
@@ -60,9 +63,62 @@ void check_layouts(context_t& context) {
 }
 
 
+/**
+ * @brief Builds the acceleration structure of Metal's ray tracing of `bvh`'s
+ *        triangles, in the BVH's order: a hit's primitive is its BVH triangle.
+ */
+id<MTLAccelerationStructure> build_acceleration_structure(context_t& context, const bvh_arrays_t& bvh) {
+    // one vertex triple per triangle
+    std::vector<float> vertices;
+    vertices.reserve(bvh.tris.size()*9);
+    for (const auto& t : bvh.tris)
+        for (const auto& v : { t.a, t.b, t.c })
+            vertices.insert(vertices.end(), { v.x, v.y, v.z });
+    buffer_t<float> vertex_buffer(context.device);
+    vertex_buffer.upload(vertices.data(), vertices.size());
+
+    MTLAccelerationStructureTriangleGeometryDescriptor* geometry =
+        [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+    geometry.vertexBuffer = vertex_buffer.get();
+    geometry.vertexFormat = MTLAttributeFormatFloat3;
+    geometry.vertexStride = 3*sizeof(float);
+    geometry.triangleCount = bvh.tris.size();
+    geometry.opaque = YES;
+    MTLPrimitiveAccelerationStructureDescriptor* descriptor = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+    descriptor.geometryDescriptors = @[ geometry ];
+
+    const MTLAccelerationStructureSizes sizes = [context.device accelerationStructureSizesWithDescriptor:descriptor];
+    id<MTLAccelerationStructure> accel = [context.device newAccelerationStructureWithSize:sizes.accelerationStructureSize];
+    id<MTLBuffer> scratch = [context.device newBufferWithLength:std::max<NSUInteger>(sizes.buildScratchBufferSize, 1)
+                                                        options:MTLResourceStorageModePrivate];
+    if (!accel || !scratch)
+        throw std::runtime_error("cannot allocate the ray-tracing acceleration structure");
+    @autoreleasepool {
+        id<MTLCommandBuffer> commands = [context.queue commandBuffer];
+        id<MTLAccelerationStructureCommandEncoder> encoder = [commands accelerationStructureCommandEncoder];
+        [encoder buildAccelerationStructure:accel descriptor:descriptor scratchBuffer:scratch scratchBufferOffset:0];
+        [encoder endEncoding];
+        [commands commit];
+        [commands waitUntilCompleted];
+        if (commands.status==MTLCommandBufferStatusError)
+            throw std::runtime_error("cannot build the ray-tracing acceleration structure: " +
+                                     to_string(commands.error.localizedDescription));
+    }
+    return accel;
+}
+
+/** @brief Metal's ray tracing traces forward only: ranges starting below 0 need the BVH traversal. */
+bool hardware_can_trace(const ray_query_t* queries, std::size_t count) {
+    for (std::size_t i=0; i<count; ++i)
+        if (!(queries[i].range.min>=0))
+            return false;
+    return true;
+}
+
+
 class metal_geometry_t final : public backend_geometry_t {
 public:
-    metal_geometry_t(std::shared_ptr<context_t> context, const bvh_arrays_t& bvh)
+    metal_geometry_t(std::shared_ptr<context_t> context, const bvh_arrays_t& bvh, bool hardware_rays)
         : context(std::move(context)),
           nodes(this->context->device), tris(this->context->device),
           ray_queries(this->context->device), ray_hits(this->context->device),
@@ -74,6 +130,8 @@ public:
         nodes.upload(bvh.nodes.data(), bvh.nodes.size());
         tris.upload(bvh.tris.data(), bvh.tris.size());
         tri_count = bvh.tris.size();
+        if (hardware_rays && !bvh.tris.empty())
+            accel = build_acceleration_structure(*this->context, bvh);
     }
 
     void intersect_rays(const ray_query_t* queries, std::size_t count, k::ray_hit* hits) override {
@@ -81,8 +139,10 @@ public:
         ray_queries.upload(queries, count);
         ray_hits.resize(count);
         const auto n = k::u32(count);
-        context->dispatch("intersect_rays", count, [&](id<MTLComputeCommandEncoder> e) {
-            bind_bvh(e);
+        const bool hardware = accel && hardware_can_trace(queries, count);
+        context->dispatch(hardware ? "rt_intersect_rays" : "intersect_rays", count,
+                          [&](id<MTLComputeCommandEncoder> e) {
+            bind_bvh(e, hardware);
             ray_queries.bind(e, 2);
             ray_hits.bind(e, 3);
             bind_value(e, n, 4);
@@ -97,8 +157,10 @@ public:
         flags.resize(count);
         status_word.upload(status, 1);
         const auto n = k::u32(count);
-        context->dispatch("rays_occluded", count, [&](id<MTLComputeCommandEncoder> e) {
-            bind_bvh(e);
+        const bool hardware = accel && hardware_can_trace(queries, count);
+        context->dispatch(hardware ? "rt_rays_occluded" : "rays_occluded", count,
+                          [&](id<MTLComputeCommandEncoder> e) {
+            bind_bvh(e, hardware);
             ray_queries.bind(e, 2);
             flags.bind(e, 3);
             bind_value(e, n, 4);
@@ -149,12 +211,16 @@ public:
     [[nodiscard]] std::unique_ptr<backend_renderer_t> create_plt_renderer(const plt_scene_t& scene) override {
         if (scene.tris.size()!=tri_count)
             throw std::runtime_error("the compiled scene does not match the uploaded geometry");
-        return metal_backend::create_plt_renderer(context, { nodes.get(), tris.get() }, scene);
+        return metal_backend::create_plt_renderer(context, { nodes.get(), tris.get(), accel }, scene);
     }
 
 private:
-    void bind_bvh(id<MTLComputeCommandEncoder> e) const {
-        nodes.bind(e, 0);
+    /** @brief Binds the BVH, or, for the hardware's ray queries, the acceleration structure and the triangles. */
+    void bind_bvh(id<MTLComputeCommandEncoder> e, bool hardware = false) const {
+        if (hardware)
+            [e setAccelerationStructure:accel atBufferIndex:0];
+        else
+            nodes.bind(e, 0);
         tris.bind(e, 1);
     }
 
@@ -163,6 +229,7 @@ private:
     buffer_t<k::bvh_node> nodes;
     buffer_t<k::bvh_tri>  tris;
     std::size_t tri_count = 0;
+    id<MTLAccelerationStructure> accel = nil;   // of the hardware's ray tracing, if used
 
     // per-call buffers, reused across calls
     buffer_t<ray_query_t>   ray_queries;
@@ -180,7 +247,6 @@ private:
 class metal_backend_t final : public backend_t {
 public:
     metal_backend_t(int ordinal, bool use_hardware_ray_tracing) {
-        (void)use_hardware_ray_tracing;
         id<MTLDevice> device = nil;
         @autoreleasepool {
             NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
@@ -205,18 +271,23 @@ public:
 
         context = std::make_shared<context_t>(device, library);
         check_layouts(*context);
+
+        // ray-tracing hardware: Apple9 (M3) and later; earlier GPUs emulate Metal's ray tracing in software
+        hardware_rays = use_hardware_ray_tracing && [device supportsFamily:MTLGPUFamilyApple9];
     }
 
     [[nodiscard]] std::string description() const override {
-        return "Metal on " + to_string(context->device.name);
+        return std::string("Metal") + (hardware_rays ? " + hardware ray tracing" : "") + " on " +
+               to_string(context->device.name);
     }
 
     [[nodiscard]] std::unique_ptr<backend_geometry_t> upload(const bvh_arrays_t& bvh) override {
-        return std::make_unique<metal_geometry_t>(context, bvh);
+        return std::make_unique<metal_geometry_t>(context, bvh, hardware_rays);
     }
 
 private:
     std::shared_ptr<context_t> context;
+    bool hardware_rays = false;
 };
 
 }
