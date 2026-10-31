@@ -12,7 +12,7 @@ Its results agree with the CPU's statistically, not bit for bit, as the two draw
    :align: center
    :alt: veach_mis rendered on the GPU
 
-.. centered:: ``scenes/veach_mis``, 1440×1080 pixels at 128 samples per pixel, rendered with beams on an NVIDIA GB10 in 10.1 seconds.
+.. centered:: ``scenes/veach_mis``, 1440×1080 pixels at 512 samples per pixel, rendered with beams on an NVIDIA GB10 in 39.5 seconds.
 
 
 Quick start

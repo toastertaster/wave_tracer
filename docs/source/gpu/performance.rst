@@ -537,7 +537,7 @@ Convergence
 -----------
 
 Speed per path is not speed to a clean image.
-Forward ``plt_path`` renders of large coverage maps with narrow beams, such as ``scenes/sionna_munich`` (beam aperture 0.01°), need many samples: at 960×633 pixels and 128 samples per pixel (18.8 s), only about 5% of its pixels receive any contribution, and the far streets fill in only with thousands of samples per pixel.
+Forward ``plt_path`` renders of large coverage maps with narrow beams, such as ``scenes/sionna_munich`` (beam aperture 0.01°), need many samples: at 960×633 pixels and 128 samples per pixel (15.6 s), only about 5% of its pixels receive any contribution, and the far streets fill in only with thousands of samples per pixel.
 ``plt_bdpt`` with beams converges slowly too: ``scenes/cornell-box/box.xml`` takes 11.2 s at 256×256 pixels and 64 samples per pixel, and is still noisy (see :doc:`gallery`).
 
 

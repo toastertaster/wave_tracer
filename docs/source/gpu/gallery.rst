@@ -3,8 +3,8 @@ Gallery
 =======================================
 
 Scenes rendered on the GPU (an NVIDIA GB10, CUDA + OptiX build), with their render times, as the command line reports them (``Elapsed``).
-The images are the renders' tonemapped outputs, downscaled for this page, unless noted.
-The times of the renders with beams of ``cornell-box/box.xml``, ``sphere_polarization``, ``colourchecker`` and ``bidir_room`` are since the CPU traces the heaviest re-traced paths (``c3ffba8``; see :doc:`performance`), which changes their images only by rounding.
+The images are the renders' tonemapped outputs, downscaled for this page, unless noted, rendered with many samples so that little noise remains.
+All the renders and times are from ``c3ffba8``, where the CPU traces the heaviest re-traced paths (see :doc:`performance`).
 To render one, run, from the repository's root:
 
 .. code-block:: sh
@@ -27,33 +27,33 @@ Scenes of ``scenes/``
    * - ``veach_mis/mis.xml``
      - backward ``plt_path``, beams
      - 1440×1080, RGB
-     - 128
-     - 10.1 s
+     - 512
+     - 39.5 s
    * - ``sionna_etoile/etoile.xml``
      - forward ``plt_path``, beams
      - 1024×768 coverage, 1 GHz
-     - 512
-     - 32.7 s
+     - 2048
+     - 132 s
    * - ``sionna_etoile/etoile.xml`` ``-D optical_preview=true``
      - backward ``plt_path``, beams
      - 512×288, RGB
-     - 64
-     - 1.13 s
+     - 1024
+     - 17.4 s
    * - ``sionna_munich/munich.xml``
      - forward ``plt_path``, beams
      - 960×633 coverage, 1 GHz
      - 128
-     - 18.8 s
+     - 15.6 s
    * - ``diffraction_simple/double_slits.xml``
      - forward ``plt_path``, beams
      - 1024×256, 50 µm
-     - 32
-     - 1.75 s
+     - 256
+     - 13.9 s
    * - ``cornell-box/box.xml``
      - ``plt_bdpt``, rays
      - 512×512, RGB
-     - 256
-     - 5.77 s
+     - 4096
+     - 93.1 s
    * - ``cornell-box/box.xml``
      - ``plt_bdpt``, beams
      - 256×256, RGB
@@ -62,13 +62,13 @@ Scenes of ``scenes/``
    * - ``cornell-box/sphere_polarization.xml``
      - ``plt_bdpt``, rays
      - 384×384, Stokes
-     - 256
-     - 4.44 s
+     - 4096
+     - 70.1 s
    * - ``cornell-box/sphere_polarization.xml``
      - ``plt_bdpt``, beams
      - 192×192, Stokes
-     - 16
-     - 20.7 s
+     - 128
+     - 166 s
    * - ``colourchecker/colourchecker.xml``
      - backward ``plt_path``, beams
      - 192×144, Stokes
@@ -84,25 +84,25 @@ Scenes of ``scenes/``
    :width: 90%
    :align: center
 
-   ``veach_mis``: 1440×1080, 128 samples per pixel, beams, 10.1 s.
+   ``veach_mis``: 1440×1080, 512 samples per pixel, beams, 39.5 s.
 
 .. figure:: ../_static/gpu/etoile_coverage.jpg
    :width: 80%
    :align: center
 
-   ``sionna_etoile``: a 1 GHz coverage map (dB) of an 840 m wide area, 1024×768, 512 samples per element, beams, 32.7 s.
+   ``sionna_etoile``: a 1 GHz coverage map (dB) of an 840 m wide area, 1024×768, 2048 samples per element, beams, 132 s.
 
 .. figure:: ../_static/gpu/etoile_preview.jpg
    :width: 80%
    :align: center
 
-   ``sionna_etoile``, its optical preview: 512×288, 64 samples per pixel, beams, 1.13 s.
+   ``sionna_etoile``, its optical preview: 512×288, 1024 samples per pixel, beams, 17.4 s.
 
 .. figure:: ../_static/gpu/double_slits.png
    :width: 90%
    :align: center
 
-   ``diffraction_simple/double_slits``: the interference pattern (dB) of a double slit, 1024×256, 32 samples per element, beams, 1.75 s.
+   ``diffraction_simple/double_slits``: the interference pattern (dB) of a double slit, 1024×256, 256 samples per element, beams, 13.9 s.
 
 .. grid:: 1 2 3 3
    :gutter: 2
@@ -110,24 +110,24 @@ Scenes of ``scenes/``
    .. grid-item-card:: ``cornell-box/box.xml``, ray tracing
       :img-top: ../_static/gpu/cornell_box_rt.jpg
 
-      ``plt_bdpt``, 512×512, 256 samples per pixel: 5.77 s.
+      ``plt_bdpt``, 512×512, 4096 samples per pixel: 93.1 s.
 
    .. grid-item-card:: ``sphere_polarization``, ray tracing
       :img-top: ../_static/gpu/sphere_polarization_rt.jpg
 
-      ``plt_bdpt``, polarimetric (intensity shown), 384×384, 256 samples per pixel: 4.44 s.
+      ``plt_bdpt``, polarimetric (intensity shown), 384×384, 4096 samples per pixel: 70.1 s.
 
    .. grid-item-card:: ``sphere_polarization``, beams
       :img-top: ../_static/gpu/sphere_polarization_beams.jpg
 
-      ``plt_bdpt`` with beams, 192×192, 16 samples per pixel: 20.7 s. Beams make ``plt_bdpt`` paths tens to hundreds of times costlier (see :doc:`performance`).
+      ``plt_bdpt`` with beams, 192×192, 128 samples per pixel: 166 s. Beams make ``plt_bdpt`` paths tens to hundreds of times costlier (see :doc:`performance`).
 
 
 Test scenes
 -----------
 
 The test scenes of the `Rust bindings <https://github.com/toastertaster/wave_tracers>`_ (``tests/scenes``), whose tests compare GPU and CPU renders, each exercising features the GPU renders.
-All at 256×256 and 256 samples per pixel, with beams.
+All at 256×256 and 4096 samples per pixel, with beams.
 The box scenes are shown with an exposure of their own (scaled to a log-average luminance of 0.18, then sRGB-encoded), as their default tonemapping saturates; the coverage maps with their own tonemapping (dB).
 
 .. grid:: 2 3 5 5
@@ -136,49 +136,49 @@ The box scenes are shown with an exposure of their own (scaled to a log-average 
    .. grid-item-card:: ``box``
       :img-top: ../_static/gpu/test_box.jpg
 
-      Diffuse Cornell box, area light. 1.52 s
+      Diffuse Cornell box, area light. 22.9 s
 
    .. grid-item-card:: ``lights_box``
       :img-top: ../_static/gpu/test_lights_box.jpg
 
-      Point, spot, directional and area emitters. 1.08 s
+      Point, spot, directional and area emitters. 16.7 s
 
    .. grid-item-card:: ``glass_box``
       :img-top: ../_static/gpu/test_glass_box.jpg
 
-      Dielectrics: BK7 glass, tinted water. 1.67 s
+      Dielectrics: BK7 glass, tinted water. 26.2 s
 
    .. grid-item-card:: ``textured_box``
       :img-top: ../_static/gpu/test_textured_box.jpg
 
-      Bitmap textures, normal map. 1.07 s
+      Bitmap textures, normal map. 16.9 s
 
    .. grid-item-card:: ``rough_box``
       :img-top: ../_static/gpu/test_rough_box.jpg
 
-      Rough fractal and gaussian surfaces. 1.29 s
+      Rough fractal and gaussian surfaces. 20.2 s
 
    .. grid-item-card:: ``rgb_box``
       :img-top: ../_static/gpu/test_rgb_box.jpg
 
-      Coloured walls, aluminium mirror, blackbody light. 1.06 s
+      Coloured walls, aluminium mirror, blackbody light. 16.5 s
 
    .. grid-item-card:: ``polarized_box``
       :img-top: ../_static/gpu/test_polarized_box.jpg
 
-      Polarimetric camera (intensity shown, at a log-average of 0.09). 1.01 s
+      Polarimetric camera (intensity shown, at a log-average of 0.09). 15.8 s
 
    .. grid-item-card:: ``coverage``
       :img-top: ../_static/gpu/test_coverage.jpg
 
-      Forward coverage at 1 GHz. 0.49 s
+      Forward coverage at 1 GHz. 7.21 s
 
    .. grid-item-card:: ``lights_coverage``
       :img-top: ../_static/gpu/test_lights_coverage.jpg
 
-      Coverage of every emitter type. 0.68 s
+      Coverage of every emitter type. 10.2 s
 
    .. grid-item-card:: ``two_band_coverage``
       :img-top: ../_static/gpu/test_two_band_coverage.jpg
 
-      Coverage at 1 GHz and 2.4 GHz. 0.51 s
+      Coverage at 1 GHz and 2.4 GHz. 7.79 s
