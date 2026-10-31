@@ -1,4 +1,4 @@
-# GPU backends (experimental).
+# GPU backends.
 #
 # Included by the top-level CMakeLists.txt, and by builds that embed wave_tracer
 # (e.g. the Rust bindings), after creating their wave_tracer target:
@@ -21,9 +21,9 @@
 # The resulting compile definitions (WT_GPU_CUDA, WT_GPU_OPTIX, WT_GPU_METAL,
 # WT_GPU_DBL_PRECISION) are PUBLIC on <target>.
 
-option(GPU_CUDA "Build the CUDA GPU backend (experimental)" OFF)
+option(GPU_CUDA "Build the CUDA GPU backend" OFF)
 option(GPU_OPTIX "Use OptiX for GPU ray queries (requires GPU_CUDA)" OFF)
-option(GPU_METAL "Build the Metal GPU backend (macOS, experimental)" OFF)
+option(GPU_METAL "Build the Metal GPU backend (macOS)" OFF)
 option(GPU_DBL_PRECISION "Use 64-bit floating point in GPU kernels" OFF)
 set(OptiX_INSTALL_DIR "$ENV{OptiX_INSTALL_DIR}" CACHE PATH
     "OptiX SDK directory, containing include/optix.h (searched in /opt/optix* if empty)")

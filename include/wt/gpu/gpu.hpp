@@ -10,7 +10,7 @@
 #pragma once
 
 /*
- * GPU acceleration (experimental).
+ * GPU acceleration.
  *
  * A `gpu::device_t` is one GPU, through the backend this build includes
  * (CMake GPU_CUDA, GPU_OPTIX). Applications create one and set it as

@@ -584,7 +584,7 @@ void initialize_renderer(
         std::make_unique<wt::thread_pool::tpool_t>(cpu_threadpool_size.value());
     context.threadpool = threadpool.get();
 
-    // GPU (experimental); throws, explaining why, if it cannot be used
+    // GPU; throws, explaining why, if it cannot be used
     if (use_gpu) {
         gpu_device = wt::gpu::device_t::create({ .use_hardware_ray_tracing = use_hardware_ray_tracing });
         context.gpu_device = gpu_device.get();
@@ -841,7 +841,7 @@ int main(int argc, char* argv[]) {
     render_opt->add_flag("--ray-tracing", context.renderer_force_ray_tracing,
                          "forces ray tracing only");
     render_opt->add_flag("--gpu", use_gpu,
-                         "render on the GPU (experimental; needs a build with GPU_CUDA or GPU_METAL)");
+                         "render on the GPU (needs a build with GPU_CUDA or GPU_METAL)");
 #if defined(WT_GPU_METAL)
     render_opt->add_flag("--no-hw-rt", no_hardware_ray_tracing,
                          "with --gpu, trace rays with the ported BVH traversal rather than Metal's hardware ray tracing");

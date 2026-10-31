@@ -52,10 +52,12 @@ Renders a scene file. Usage:
                               concurrency)
 -D, --define <NAME=VALUE>       define variables (used as "$variable" in the scene file)
 --ray-tracing                 forces ray tracing only
---gpu                         render on the GPU (experimental; needs a build with ``GPU_CUDA``),
+--gpu                         render on the GPU (needs a build with ``GPU_CUDA`` or ``GPU_METAL``),
                               see :doc:`gpu/gpu`
 --no-optix                    with ``--gpu``, trace rays with the CUDA traversal rather than OptiX
                               (in builds with ``GPU_OPTIX``)
+--no-hw-rt                    with ``--gpu``, trace rays with the ported BVH traversal rather than
+                              Metal's hardware ray tracing (in builds with ``GPU_METAL``)
 --mesh_scale TEXT
                               default scale to apply to imported positions of external meshes;
                               can be overridden per shape in the scene file.
@@ -132,10 +134,12 @@ Renders a scene file using a graphical user interface. Usage:
                               concurrency)
 -D, --define <NAME=VALUE>       define variables (used as "$variable" in the scene file)
 --ray-tracing                 forces ray tracing only
---gpu                         render on the GPU (experimental; needs a build with ``GPU_CUDA``),
+--gpu                         render on the GPU (needs a build with ``GPU_CUDA`` or ``GPU_METAL``),
                               see :doc:`gpu/gpu`
 --no-optix                    with ``--gpu``, trace rays with the CUDA traversal rather than OptiX
                               (in builds with ``GPU_OPTIX``)
+--no-hw-rt                    with ``--gpu``, trace rays with the ported BVH traversal rather than
+                              Metal's hardware ray tracing (in builds with ``GPU_METAL``)
 --mesh_scale TEXT
                               default scale to apply to imported positions of external meshes;
                               can be overridden per shape in the scene file.

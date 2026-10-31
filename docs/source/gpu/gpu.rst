@@ -3,7 +3,7 @@ GPU rendering
 =======================================
 
 **wave_tracer** can render on an NVIDIA GPU, with CUDA and, optionally, OptiX; or, on macOS, on an Apple silicon GPU (M1 or later), with Metal.
-GPU rendering is **experimental**: it supports a subset of the scene elements (listed in :doc:`usage`), and it is compiled in only when asked for.
+GPU rendering supports a subset of the scene elements (listed in :doc:`usage`), and is compiled in only when asked for.
 The GPU renders the same light transport as the CPU: the same integrators, beams, free-space diffraction and interaction models, ported to GPU kernels.
 Its results agree with the CPU's statistically, not bit for bit, as the two draw different random numbers.
 

@@ -205,7 +205,7 @@ else()
     add_executable(wave_tracer ${SRC})
 endif()
 
-# GPU backends (experimental; options GPU_CUDA, GPU_OPTIX, GPU_DBL_PRECISION, all OFF by default)
+# GPU backends (options GPU_CUDA, GPU_OPTIX, GPU_METAL, GPU_DBL_PRECISION, all OFF by default)
 include(cmake/wt_gpu.cmake)
 wt_add_gpu_backends(wave_tracer)
 

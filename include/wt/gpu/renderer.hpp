@@ -10,7 +10,7 @@
 #pragma once
 
 /*
- * Rendering on a GPU (experimental).
+ * Rendering on a GPU.
  *
  * `scene_renderer_t` renders on `wt_context_t::gpu_device` when it is set.
  * GPU rendering implements a subset of wave_tracer; scenes outside it fail

@@ -40,7 +40,7 @@ sudo apt install git-lfs build-essential pkg-config libxmu-dev libxi-dev libgl-d
 * **AVX512f** and **AVX512dq** --- when compiling with double-precision support (```DBL_PRECISION``` set to `ON`)
 
 
-### GPU (experimental)
+### GPU
 
 GPU support is optional at compile time and at run time: with these options `OFF` (the default) nothing GPU-related is built and no GPU toolchain is needed, and a GPU build renders on the CPU unless asked otherwise.
 

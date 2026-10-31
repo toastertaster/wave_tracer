@@ -60,7 +60,7 @@ struct wt_context_t {
     wt::thread_pool::tpool_t* threadpool;
 
     /**
-     * @brief GPU to render on (experimental, see wt/gpu/gpu.hpp), owned by the application.
+     * @brief GPU to render on (see wt/gpu/gpu.hpp), owned by the application.
      *        Null renders on the CPU.
      */
     const wt::gpu::device_t* gpu_device = nullptr;
