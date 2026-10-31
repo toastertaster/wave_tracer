@@ -9,12 +9,10 @@
 
 /*
  * Metal backend: acceleration-structure query kernels (the Metal counterparts
- * of cuda_backend.cu's), and the struct layout check (see layout.hpp).
+ * of cuda_backend.cu's).
  */
 
 #include <wt/gpu/kernel/queries.hpp>
-
-#include "layout.hpp"
 
 using namespace metal;
 namespace k = wt::gpu::compute_kernel;
@@ -83,7 +81,3 @@ kernel void intersect_balls(const device k::bvh_node* nodes [[buffer(0)]],
     hits[i] = { sink.count, status };
 }
 
-kernel void struct_layouts(device k::u32* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {
-    if (i==0)
-        wt::gpu::metal_backend::write_layouts(out);
-}

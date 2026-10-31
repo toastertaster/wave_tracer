@@ -36,7 +36,9 @@ Passes run one after another; between them, the renderer handles interrupts (pau
 Interrupts wait for the current pass to end: with an expensive scene, a pass can take seconds or more (see :doc:`performance`).
 
 Every path is one sample of one element: path :math:`s \cdot \text{elements} + e` is sample :math:`s` of element :math:`e` (forward paths, which start at emitters, ignore their element, as on the CPU).
-The GPU accumulates the paths' splats into films in double precision (with atomic additions), as the CPU's integrators splat them: backward ``plt_path`` into image blocks with reconstruction weights, forward ``plt_path`` directly, and ``plt_bdpt`` both, the latter into a separate light image.
+The GPU accumulates the paths' splats into films (with atomic additions), as the CPU's integrators splat them: backward ``plt_path`` into image blocks with reconstruction weights, forward ``plt_path`` directly, and ``plt_bdpt`` both, the latter into a separate light image.
+With CUDA, the films are in double precision on the GPU.
+Metal has no 64-bit floating point, so the Metal backend accumulates in 32-bit floats on the GPU, and adds them into double-precision films on the host (see `Precision and limits`_).
 When a render completes, or a preview or capture is asked for, the films are downloaded into the sensor's film storage, and developed, tonemapped and written by the CPU's code.
 
 
@@ -88,7 +90,12 @@ OptiX cannot replace these traversals, as beams are cones, not rays, and OptiX r
 Precision and limits
 --------------------
 
-* Kernels compute in 32-bit floating point by default, as the CPU's default build does; ``GPU_DBL_PRECISION`` switches them to 64 bits. Films accumulate in 64 bits either way.
+* Kernels compute in 32-bit floating point by default, as the CPU's default build does; ``GPU_DBL_PRECISION`` switches them to 64 bits (CUDA only). Films accumulate in 64 bits either way.
+* **Films on Metal (macOS).** Metal has no 64-bit floating point, neither arithmetic nor atomics, so the Metal backend's kernels splat into 32-bit float films with float atomic additions.
+  Between launches, while the GPU is idle, the host adds these float films into its double-precision films and clears them: after every 64 samples per film element (paths started, on average; launches of whole paths trace no more than that), when the render finishes, and before a film is read (previews, captures).
+  A float element therefore sums only a bounded number of splats, about 64 samples' worth (for films smaller than about 64×64 elements, a launch's worth), before its sum moves to double precision, rather than all of a render's samples; the relative rounding error of a flushed sum is at most of the order of :math:`64 \cdot 2^{-24} \approx 4 \cdot 10^{-6}`, and in practice nearer :math:`\sqrt{64} \cdot 2^{-24}`.
+  Over the render, the double-precision films accumulate as the CUDA backend's do.
+  A flush reads and clears every float element: it takes a few milliseconds for a 2048×2048 RGB film, once per 64 samples per element.
 * BVH traversals have fixed-size stacks: an overflow stops the render with an error.
 * Paths stop after :math:`2^{14}` steps, with a warning.
 * Scenes are compiled per sensor (emitters, materials, film), but share one upload of the geometry: a render uploads the BVH once for all its sensors, or uses an upload it is given (``render_opts_t::gpu_geometry``; the Rust bindings give their scene's).

@@ -169,7 +169,7 @@ endfunction()
 # the backend library, and the Objective-C++ host code.
 function(wt_add_metal_backend target defines)
     set(metal_dir "${WT_GPU_ROOT}/src/gpu/metal")
-    set(kernel_sources geometry)
+    set(kernel_sources geometry plt layout)
     # Kernels need IEEE-conforming arithmetic (wt/gpu/kernel/math.hpp): no fast math.
     set(metal_flags -std=metal3.2 -fno-fast-math -Wno-c++17-extensions
                     -mmacosx-version-min=15.0
@@ -206,7 +206,8 @@ function(wt_add_metal_backend target defines)
 
     # Its own library, as the CUDA backend: it sees only the shared kernel
     # headers and wt/gpu/backend.hpp, not the wave_tracer target's settings.
-    add_library(wt_gpu_metal STATIC "${metal_dir}/metal_backend.mm" "${embedded}")
+    add_library(wt_gpu_metal STATIC "${metal_dir}/metal_backend.mm" "${metal_dir}/metal_renderer.mm"
+                                    "${embedded}")
     set_target_properties(wt_gpu_metal PROPERTIES
         OBJCXX_STANDARD 17 OBJCXX_STANDARD_REQUIRED ON
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
@@ -214,7 +215,8 @@ function(wt_add_metal_backend target defines)
     target_compile_options(wt_gpu_metal PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
     target_include_directories(wt_gpu_metal PRIVATE "${WT_GPU_ROOT}/include")
     target_compile_definitions(wt_gpu_metal PRIVATE ${defines})
-    target_link_libraries(wt_gpu_metal PRIVATE "-framework Metal" "-framework Foundation")
+    target_link_libraries(wt_gpu_metal PRIVATE "-framework Metal" "-framework Foundation"
+                                               "-framework IOKit" "-framework CoreFoundation")
 
     target_link_libraries(${target} PRIVATE wt_gpu_metal)
 endfunction()

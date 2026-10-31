@@ -88,6 +88,18 @@ WT_GPU_FN vertex_geo geo_of(const WT_GPU_GLOBAL bdpt_vertex<P>& v) {
     return v.tri!=no_triangle ? vertex_geo{ v.wp, geo_surface, v.tri } : vertex_geo{ v.wp, geo_point, 0 };
 }
 
+#if defined(__METAL_VERSION__)
+// Metal: of a vertex being built, in thread memory (elsewhere, the overloads above take it)
+template <bool P>
+WT_GPU_FN bdpt_point point_of(const thread bdpt_vertex<P>& v) {
+    return { v.wp, v.ng, v.on_surface!=0 };
+}
+template <bool P>
+WT_GPU_FN vertex_geo geo_of(const thread bdpt_vertex<P>& v) {
+    return v.tri!=no_triangle ? vertex_geo{ v.wp, geo_surface, v.tri } : vertex_geo{ v.wp, geo_point, 0 };
+}
+#endif
+
 /** @brief `vertex_t::is_connectible` */
 template <bool P>
 WT_GPU_FN bool is_connectible(const WT_GPU_GLOBAL bdpt_vertex<P>& v) {

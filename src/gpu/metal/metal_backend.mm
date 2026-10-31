@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "layout.hpp"
+#include "metal_renderer.hpp"
 #include "metal_util.hpp"
 
 // The metallib of src/gpu/metal/*.metal, embedded by cmake/wt_gpu.cmake.
@@ -148,7 +149,7 @@ public:
     [[nodiscard]] std::unique_ptr<backend_renderer_t> create_plt_renderer(const plt_scene_t& scene) override {
         if (scene.tris.size()!=tri_count)
             throw std::runtime_error("the compiled scene does not match the uploaded geometry");
-        throw std::runtime_error("rendering is not implemented in the Metal backend yet");
+        return metal_backend::create_plt_renderer(context, { nodes.get(), tris.get() }, scene);
     }
 
 private:
