@@ -22,6 +22,7 @@ Without it, the build is the same as ``main-gpu``'s.
    scene_elements
    tools
    data
+   gallery
 
 
 What is gated

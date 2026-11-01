@@ -24,6 +24,7 @@ To image the scene onto a detector, render it on a grid finer than the detector'
        tools/remote_sensing/instrument.json out_k4/dn.exr                                            # 1024² pixels
    uv run tools/remote_sensing/event_camera.py sites/railroad_valley/scene_k4.json out_k4/toa.exr \
        tools/remote_sensing/event_camera.json out_k4/events.npz --duration 0.01 --preview out_k4/events.png
+   uv run tools/remote_sensing/preview.py out_k4/dn.exr out_k4/dn.jpg --per-band                    # a viewable image
 
 ``fetch_site.py OUT_DIR [--lat --lon --size --date --aeronet-radius]``
    Fetches, for a square area in the conterminous US (default: 2048 m around the RadCalNet site at Railroad Valley Playa), the USGS 3DEP 1 m elevation (``dem.tif``), the NAIP orthophoto nearest ``--date`` (``naip.tif``, default 2022-07-19), the TSIS-1 solar spectrum (``tsis1_hsrs_1nm.csv``), and AERONET's Level 2.0 daily averages of ``--date`` from the nearest site within ``--aeronet-radius`` (``aeronet.csv``, default 50 km; Railroad Valley's is 0.8 km away), with ``site.json`` describing them.
@@ -107,6 +108,13 @@ To image the scene onto a detector, render it on a grid finer than the detector'
    ``OUT.npz`` has the events in time order (``x``, ``y``, ``t`` in µs, ``p`` ±1) and the camera's ``width`` and ``height``; ``--preview`` draws their sums per pixel (ON red, OFF blue).
    ``tools/remote_sensing/event_camera.json`` is an example: the telescope with 10 µm pixels (2 m GSD), scanning at the orbit's ground speed (as Falcon Neuro did from the ISS), thresholds of 0.25.
    At Railroad Valley the largest log contrast at 2 m is 0.24: with these thresholds, the camera sees only its noise events; with thresholds of 0.03, the facility's edges stream events along the scan (10 ms of 512² pixels, 354 steps, in 25 s).
+
+``preview.py IN.exr OUT [--bands --crop --bin --zoom --range | --percentiles --per-band --linear --quality]``
+   Writes a viewable image (JPEG or PNG, by ``OUT``'s extension) of an EXR's channels: a render, ``toa.py``'s, ``detector.py``'s output, or ``materials.exr``.
+   Three channels (``--bands R,G,B``; default ``red,green,blue`` when the EXR has them) make a colour image, one a grey one.
+   ``--crop X,Y,W,H`` takes a window of the EXR (pixels), ``--bin N`` averages N × N pixels of it, ``--zoom N`` repeats each pixel N × N times.
+   Values map linearly to black and white from ``--range LO,HI`` (one range, or one per channel: ``LO1,HI1,LO2,HI2,LO3,HI3``), or by default from the ``--percentiles P0,P1`` (0.5,99.5) of all the chosen channels together, which keeps their balance (``--per-band``: each channel's own), then are sRGB-encoded (unless ``--linear``). It prints the range used.
+   The :doc:`gallery`'s images (but the events') are its previews.
 
 With the default scene (1920² pixels at 1 m GSD), 1024 samples per pixel render in 25 s on an NVIDIA GB10 (ray tracing); loading the 2 M-triangle terrain takes ~18 s.
 Under the 2022-07-19 sun without an atmosphere, the mean band radiances of the playa (reflectance 0.35) match a hand calculation, ρ E cos θ / π, to 0.3%.
