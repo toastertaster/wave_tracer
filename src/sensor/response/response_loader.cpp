@@ -16,6 +16,9 @@
 #include <wt/sensor/response/multichannel.hpp>
 #include <wt/sensor/response/RGB.hpp>
 #include <wt/sensor/response/XYZ.hpp>
+#if defined(REALISTIC_REMOTE_SENSING)
+#include <wt/remote_sensing/band_radiance.hpp>
+#endif
 
 #include <wt/math/common.hpp>
 #include <wt/scene/loader/node_readers.hpp>
@@ -38,6 +41,10 @@ std::unique_ptr<response_t> response_t::load(std::string id,
         return RGB_t::load(std::move(id), loader, node, context);
     else if (type=="XYZ")
         return XYZ_t::load(std::move(id), loader, node, context);
+#if defined(REALISTIC_REMOTE_SENSING)
+    else if (type=="band_radiance")
+        return remote_sensing::band_radiance_t::load(std::move(id), loader, node, context);
+#endif
 
     throw scene_loading_exception_t("(response function loader) unrecognized response function type", node);
 }
