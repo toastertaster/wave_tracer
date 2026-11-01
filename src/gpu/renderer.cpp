@@ -829,6 +829,7 @@ sensor_spectral_t compile_sensor(const sensor::sensor_t& sensor, const compute_k
         compile_direction_transform(perspective.to_world_transform().inverse(), s.dir_to_local);
         s.ddir_dx = to_kernel(perspective.direction_pdvx());
         s.ddir_dy = to_kernel(perspective.direction_pdvy());
+        s.near_clip = real(u::to_m(perspective.near_clip()));
         s.recp_sa_scale = real(u::to_num(perspective.recp_solid_angle_density_for_sample(dir3_t{ 0,0,1 }) /
                                          u::ang::sr));
         compile_film(perspective.film(), out);

@@ -1082,7 +1082,9 @@ WT_GPU_FN sensor_sample_t sample_sensor(const WT_GPU_THREAD sensor_desc& s, cons
         const vec3 centre = point_on_sensor(s, vec2{ real(ex)+real(.5), real(ey)+real(.5) });
         ret.offset = rnd.r2() - vec2{ real(.5), real(.5) };
         const vec3 dir_local = normalize(centre + ret.offset.x*s.ddir_dx + ret.offset.y*s.ddir_dy);
-        r = make_ray(s.position, transform_direction(s.dir_to_world, dir_local));
+        const vec3 dir = transform_direction(s.dir_to_world, dir_local);
+        // perspective_t::ray_origin (in the kernels' precision)
+        r = make_ray(s.position + s.near_clip*dir, dir);
         scale = 1;
         ret.ppd = 0;
         ret.dpd = 1 / perspective_recp_dpd(s, dir_local);
@@ -1099,7 +1101,9 @@ WT_GPU_FN sensor_sample_t sample_sensor(const WT_GPU_THREAD sensor_desc& s, cons
         ret.dpd = dpd;
     }
 
-    b.envelope = make_isotropic_cone(r, spec.sensor_tan_alpha, spec.sensor_x0);
+    // a perspective sensor's beams start `near_clip` along: as propagated there (beam_t::transform_restart)
+    const real near_clip = s.type==sensor_perspective ? s.near_clip : real(0);
+    b.envelope = make_isotropic_cone(r, spec.sensor_tan_alpha, spec.sensor_x0 + near_clip*spec.sensor_tan_alpha);
     // the identity operator, scaled (its first row; and the others, for a polarimetric sensor)
     b.S = { scale,0,0,0 };
     b.rows.identity(scale);

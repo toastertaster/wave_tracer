@@ -280,6 +280,7 @@ struct sensor_desc {
      *        area over the image plane's distance squared.
      */
     real recp_sa_scale;
+    real near_clip;             // `near_clip()`: rays start this far along
 };
 
 /** @brief Largest supported film reconstruction filter radius, in elements. */
