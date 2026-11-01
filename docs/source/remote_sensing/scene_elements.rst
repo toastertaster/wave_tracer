@@ -86,3 +86,18 @@ Response functions may be given at any wavelengths: they are resampled finely (a
 That ramp is part of the response (and of ∫ *S* dλ): a 20 nm box band is 0.4% wider for it.
 
 All bands share each sample's wavelength, so with *n* disjoint bands a pixel's samples are shared among them: render about *n* times as many samples as for one band.
+(A pixel's wavelengths are stratified over its samples, so each band gets its share.)
+
+An optional ``transmittance`` spectrum multiplies what every band records, wavelength by wavelength, but not ∫ *S* dλ: e.g. the atmosphere's transmittance from the ground to the camera, so that a band records the band average of the transmitted radiance.
+
+.. code-block:: xml
+
+   <response type="band_radiance">
+       ...
+       <spectrum name="transmittance" type="piecewise_linear">
+           <bin wavelength="440nm" value=".83"/>
+           ...
+       </spectrum>
+   </response>
+
+Channels are named after their bands' ``id`` attributes (e.g. in EXR files), if every band has a distinct one.

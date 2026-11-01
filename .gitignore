@@ -27,3 +27,6 @@ log.txt
 
 # imgui runtime layout file
 imgui.ini
+
+# Python bytecode (tools/)
+__pycache__/

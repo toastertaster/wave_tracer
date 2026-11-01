@@ -8,16 +8,35 @@ Writes into the site directory:
   terrain.ply      the DEM as a triangle mesh, with vertex normals and texture
                    coordinates
   reflectance.png  a 16-bit linear reflectance map
-  <name>.xml       the scene: the terrain, the sun, and a satellite_frame camera
-                   recording band radiance (needs a wave_tracer built with
-                   REALISTIC_REMOTE_SENSING)
+  sky.ply          with an atmosphere: the sky, a hemisphere around the scene
+  <name>.xml       the scene: the terrain, the sun, the sky, and a
+                   satellite_frame camera recording band radiance (needs a
+                   wave_tracer built with REALISTIC_REMOTE_SENSING)
+  <name>.json      what toa.py needs to add the atmosphere's own radiance
 
 The scene's frame is local to the site: x east, y up, z south (north is -z),
 in metres, with the origin on the ground at the site's centre. The camera is
 placed by altitude and view angles over that origin (see the satellite_frame
 sensor). The sun shines from its position at the given time, with the TSIS-1
 top-of-atmosphere spectrum scaled to the Earth-Sun distance of that day.
-There is no atmosphere yet.
+
+With the atmosphere that atmosphere.py computed (SITE_DIR/atmosphere.json, for
+the same time and view; --no-atmosphere ignores it), per wavelength:
+  - the sun's irradiance is attenuated by the direct transmittance and the
+    gases' downward transmittance;
+  - the sky is a hemisphere of radius --sky-radius around the scene, an area
+    emitter of uniform radiance that gives a horizontal surface the diffuse
+    irradiance 6S computes, including the light that the ground (of the
+    scene's mean reflectance, beyond the scene too) and the atmosphere reflect
+    back and forth. It is black, and has a hole around the sun through which
+    the sun lights the whole scene; the camera's rays start inside it;
+  - the camera sees the ground through the direct upward transmittance and
+    the rest of the gases' two-way transmittance (the band_radiance response's
+    transmittance).
+The render is then the radiance at the top of the atmosphere that comes
+straight from the ground. toa.py adds the rest: the atmosphere's path
+radiance, and the ground's light that the atmosphere scatters into the view
+(the adjacency effect).
 
 Reflectance is a placeholder until spectral material maps: spectrally flat,
 scaled from NAIP's brightness so that its median is --reflectance. (NAIP is not
@@ -27,6 +46,8 @@ radiometrically calibrated; its RGB would also leave the near infrared dark.)
 
 Render it with
     wave_tracer render [--gpu] SITE_DIR/scene.xml -o OUT_DIR
+and, with an atmosphere, add its radiance with
+    uv run tools/remote_sensing/toa.py SITE_DIR/scene.json OUT_DIR/camera.exr TOA.exr
 """
 
 import argparse
@@ -40,42 +61,10 @@ import numpy as np
 import rasterio
 from PIL import Image
 
+from sun import earth_sun_distance, solar_position
+
 # placeholder multispectral bands (nm), as boxes: those of typical very-high-resolution imagers
 BANDS = {"blue": (450, 520), "green": (520, 600), "red": (630, 690), "nir": (760, 900)}
-
-
-def solar_position(when: datetime.datetime, lat: float, lon: float):
-    """Solar zenith and azimuth (clockwise from north), degrees: NOAA's solar position algorithm."""
-    jd = when.timestamp() / 86400 + 2440587.5
-    t = (jd - 2451545) / 36525
-    l0 = (280.46646 + t * (36000.76983 + t * 0.0003032)) % 360
-    m = 357.52911 + t * (35999.05029 - 0.0001537 * t)
-    e = 0.016708634 - t * (0.000042037 + 0.0000001267 * t)
-    mr = math.radians(m)
-    c = (math.sin(mr) * (1.914602 - t * (0.004817 + 0.000014 * t)) + math.sin(2 * mr) * (0.019993 - 0.000101 * t)
-         + math.sin(3 * mr) * 0.000289)
-    omega = 125.04 - 1934.136 * t
-    app_lon = l0 + c - 0.00569 - 0.00478 * math.sin(math.radians(omega))
-    obliq = 23 + (26 + (21.448 - t * (46.815 + t * (0.00059 - t * 0.001813))) / 60) / 60
-    obliq += 0.00256 * math.cos(math.radians(omega))
-    decl = math.asin(math.sin(math.radians(obliq)) * math.sin(math.radians(app_lon)))
-    y = math.tan(math.radians(obliq) / 2) ** 2
-    l0r = math.radians(l0)
-    eqtime = 4 * math.degrees(y * math.sin(2 * l0r) - 2 * e * math.sin(mr) + 4 * e * y * math.sin(mr) * math.cos(2 * l0r)
-                              - 0.5 * y * y * math.sin(4 * l0r) - 1.25 * e * e * math.sin(2 * mr))
-    minutes = when.hour * 60 + when.minute + when.second / 60
-    hour_angle = math.radians((minutes + eqtime + 4 * lon) / 4 - 180)
-    latr = math.radians(lat)
-    cos_zen = math.sin(latr) * math.sin(decl) + math.cos(latr) * math.cos(decl) * math.cos(hour_angle)
-    zen = math.acos(max(-1.0, min(1.0, cos_zen)))
-    az = math.atan2(math.sin(hour_angle), math.cos(hour_angle) * math.sin(latr) - math.tan(decl) * math.cos(latr))
-    return math.degrees(zen), (math.degrees(az) + 180) % 360
-
-
-def earth_sun_distance(day: datetime.date) -> float:
-    """Earth-Sun distance, AU (to ~1e-4)."""
-    g = math.radians(357.529 + 0.98560028 * (day.toordinal() - datetime.date(2000, 1, 1).toordinal() - 0.5 + 1))
-    return 1.00014 - 0.01671 * math.cos(g) - 0.00014 * math.cos(2 * g)
 
 
 def write_ply(path, vertices, normals, uvs, faces):
@@ -130,15 +119,70 @@ def reflectance_map(naip_path, out_path, mean_reflectance):
     lum = rgb.mean(axis=0)
     rho = np.clip(lum / np.median(lum[lum > 0]) * mean_reflectance, 0, 1)
     Image.fromarray(np.round(rho * 65535).astype(np.uint16)).save(out_path)
-    return bounds
+    return bounds, rho.mean()
 
 
-def solar_spectrum_xml(csv_path, scale, lo_nm, hi_nm, indent):
-    """TSIS-1 HSRS (W/m²/nm), averaged to 1 nm bins, as a piecewise-linear spectrum in W/m²/µm times `scale`."""
+def solar_spectrum(csv_path, nm):
+    """TSIS-1 HSRS at 1 AU, W/m²/µm, at wavelengths `nm` (1 nm bins: linear interpolation)."""
     data = np.loadtxt(csv_path, delimiter=",", skiprows=1, usecols=(0, 1))
-    nm = np.arange(lo_nm, hi_nm + 1)
-    e = np.interp(nm, data[:, 0], data[:, 1]) * 1e3 * scale
-    return "\n".join(f'{indent}<bin wavelength="{w}nm" value="{v:.6g}"/>' for w, v in zip(nm, e))
+    return np.interp(nm, data[:, 0], data[:, 1]) * 1e3
+
+
+def spectrum_xml(nm, values, tabs):
+    """Bins of a piecewise-linear spectrum, indented by `tabs`."""
+    return "\n".join("\t" * tabs + f'<bin wavelength="{w:g}nm" value="{v:.6g}"/>' for w, v in zip(nm, values))
+
+
+def load_atmosphere(path, nm, zenith, view_zenith, view_azimuth):
+    """atmosphere.json's quantities at wavelengths `nm`; checks that it was computed for this geometry."""
+    atm = json.loads(path.read_text())
+    if (abs(atm["sun"]["zenith_deg"] - zenith) > 0.01 or atm["view"]["zenith_deg"] != view_zenith
+            or (view_zenith != 0 and atm["view"]["azimuth_deg"] != view_azimuth)):
+        raise SystemExit(f"{path} is for the sun at zenith {atm['sun']['zenith_deg']:.3f}° and view zenith "
+                         f"{atm['view']['zenith_deg']}°, azimuth {atm['view']['azimuth_deg']}°: run atmosphere.py "
+                         "for this time and view, or give --no-atmosphere")
+    wl = np.asarray(atm["wavelength_nm"])
+    if nm[0] < wl[0] or nm[-1] > wl[-1]:
+        raise SystemExit(f"{path} covers {wl[0]:g}-{wl[-1]:g} nm, not {nm[0]:g}-{nm[-1]:g} nm")
+    keys = [k for k, v in atm.items() if isinstance(v, list) and len(v) == len(wl) and k != "wavelength_nm"]
+    return atm, {k: np.interp(nm, wl, atm[k]) for k in keys}
+
+
+def sky_dome(path, radius, to_sun, hole_deg, step_deg=1.0):
+    """A hemisphere of `radius` m about the origin, above the horizon, facing inwards, without the triangles within
+    `hole_deg` of the direction `to_sun`. Returns its projected solid angle seen from a horizontal surface at the
+    origin, sr (π, less the hole's)."""
+    rings = int(round(90 / step_deg))
+    sectors = int(round(360 / step_deg))
+    el = np.radians(np.arange(rings) * step_deg)
+    az = np.radians(np.arange(sectors) * step_deg)
+    E, A = np.meshgrid(el, az, indexing="ij")
+    dirs = np.stack([np.cos(E) * np.sin(A), np.sin(E), -np.cos(E) * np.cos(A)], -1).reshape(-1, 3)
+    dirs = np.concatenate([dirs, [[0, 1, 0]]])               # the zenith
+    top = len(dirs) - 1
+    idx = np.arange(rings * sectors).reshape(rings, sectors)
+    a, b = idx[:-1], np.roll(idx[:-1], -1, axis=1)          # ring r, sectors s and s+1
+    c, d = idx[1:], np.roll(idx[1:], -1, axis=1)            # ring r+1
+    # wound so that their normals, (v1-v0)×(v2-v0), face the origin
+    faces = np.concatenate([np.stack([a, b, c], -1).reshape(-1, 3), np.stack([b, d, c], -1).reshape(-1, 3),
+                            np.stack([idx[-1], np.roll(idx[-1], -1), np.full(sectors, top)], -1)])
+    v = dirs[faces]
+    n = np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0])
+    assert (np.einsum("ij,ij->i", n, v.mean(axis=1)) < 0).all()
+    s = np.asarray(to_sun) / np.linalg.norm(to_sun)
+    keep = ~(v @ s > math.cos(math.radians(hole_deg + step_deg))).any(axis=1)   # clear within hole_deg
+    faces = faces[keep]
+    # Lambert's formula: a spherical polygon's projected solid angle is ½ Σ θ_i n·(v_i×v_i+1)/|v_i×v_i+1|
+    v = dirs[faces]
+    proj = np.zeros(len(faces))
+    for i in range(3):
+        p, q = v[:, i], v[:, (i + 1) % 3]
+        cr = np.cross(p, q)
+        proj += 0.5 * np.arccos(np.clip(np.einsum("ij,ij->i", p, q), -1, 1)) * cr[:, 1] / np.linalg.norm(cr, axis=1)
+    normals = -dirs
+    uvs = np.zeros((len(dirs), 2))
+    write_ply(path, dirs * radius, normals, uvs, faces)
+    return np.abs(proj).sum(), len(faces)
 
 
 def main():
@@ -157,6 +201,8 @@ def main():
     p.add_argument("--ray-tracing", action="store_true", help="trace rays rather than beams")
     p.add_argument("--mesh-spacing", type=int, default=2, help="DEM pixels between mesh vertices (default 2)")
     p.add_argument("--reflectance", type=float, default=0.35, help="median reflectance of the placeholder map (default .35)")
+    p.add_argument("--no-atmosphere", action="store_true", help="ignore SITE_DIR/atmosphere.json")
+    p.add_argument("--sky-radius", type=float, default=100e3, help="m (default 100 km)")
     args = p.parse_args()
 
     site = json.loads((args.site_dir / "site.json").read_text())
@@ -165,7 +211,8 @@ def main():
     centre_h = site["centre"]["elevation_m"]
 
     vertices, normals, E, N, faces = terrain(args.site_dir / site["dem"]["file"], args.mesh_spacing, centre_en, centre_h)
-    tex_bounds = reflectance_map(args.site_dir / site["naip"]["file"], args.site_dir / "reflectance.png", args.reflectance)
+    tex_bounds, mean_reflectance = reflectance_map(args.site_dir / site["naip"]["file"], args.site_dir / "reflectance.png",
+                                                   args.reflectance)
     uvs = np.stack([(E - tex_bounds.left) / (tex_bounds.right - tex_bounds.left),
                     (N - tex_bounds.bottom) / (tex_bounds.top - tex_bounds.bottom)], axis=-1)
     write_ply(args.site_dir / "terrain.ply", vertices, normals, uvs, faces)
@@ -185,13 +232,79 @@ def main():
 				</spectrum>''' for name, (lo, hi) in BANDS.items())
     lo_nm = min(lo for lo, _ in BANDS.values()) - 10
     hi_nm = max(hi for _, hi in BANDS.values()) + 10
+    nm = np.arange(lo_nm, hi_nm + 1.0)
+    E0 = solar_spectrum(args.site_dir / site["solar_spectrum"]["file"], nm) / d**2
+    mus = math.cos(z)
+    in_band = {name: (nm >= lo) & (nm <= hi) for name, (lo, hi) in BANDS.items()}
+
+    atm_path = args.site_dir / "atmosphere.json"
+    atm = None
+    if not args.no_atmosphere and atm_path.exists():
+        atm_info, atm = load_atmosphere(atm_path, nm, zen, args.view_zenith, args.view_azimuth)
+    sidecar = {"bands_nm": BANDS, "gsd_m": args.gsd, "pixels": args.pixels, "view_zenith_deg": args.view_zenith,
+               "altitude_m": args.altitude, "atmosphere": None}
+    if atm is None:
+        print("no atmosphere" + ("" if args.no_atmosphere else f" ({atm_path} not found)"))
+        sun_irradiance = E0
+        sky_xml = ""
+        transmittance_xml = ""
+        radiance_where = "at the top of a (missing) atmosphere"
+    else:
+        # the sun, through the atmosphere
+        sun_irradiance = E0 * atm["T_down_direct"] * atm["Tg_down"]
+        # the sky: diffuse light, and light reflected between the ground and the atmosphere
+        rho_e, S = mean_reflectance, atm["spherical_albedo"]
+        sky_irradiance = E0 * mus * atm["Tg_down"] * (atm["T_down_total"] / (1 - rho_e * S) - atm["T_down_direct"])
+        # a hole wide enough for the sun to reach every point of the scene
+        half_diagonal = np.hypot(np.abs(vertices[:, 0]).max(), np.abs(vertices[:, 2]).max())
+        hole_deg = math.degrees(math.atan2(half_diagonal, args.sky_radius)) + 0.5
+        sky_projected_solid_angle, sky_triangles = sky_dome(args.site_dir / "sky.ply", args.sky_radius, to_sun, hole_deg)
+        sky_radiance = sky_irradiance / sky_projected_solid_angle
+        print(f"atmosphere: {atm_info['source']}; sky: {sky_triangles} triangles, hole {hole_deg:.2f}°, "
+              f"projected solid angle π - {math.pi - sky_projected_solid_angle:.2e} sr; mean reflectance {rho_e:.3f}")
+        sky_xml = f'''
+	<!-- the sky, of uniform radiance (W/m²/sr/µm) -->
+	<shape type="ply">
+		<path value="sky.ply"/>
+		<quantity name="scale" value="1m"/>
+		<bsdf type="diffuse">
+			<spectrum name="reflectance" constant="0"/>
+		</bsdf>
+		<emitter type="area">
+			<spectrum name="radiance" type="piecewise_linear">
+{spectrum_xml(nm, sky_radiance, 4)}
+			</spectrum>
+		</emitter>
+	</shape>
+'''
+        # the camera sees the ground through the direct transmittance, and the rest of the gases' two-way transmittance
+        transmittance = atm["T_up_direct"] * atm["Tg_total"] / atm["Tg_down"]
+        transmittance_xml = f'''
+				<spectrum name="transmittance" type="piecewise_linear">
+{spectrum_xml(nm, transmittance, 5)}
+				</spectrum>'''
+        radiance_where = "at the top of the atmosphere, straight from the ground (toa.py adds the rest)"
+
+        # for toa.py, band-averaged: the path radiance; the ratio of diffuse to direct upward transmittance, weighted by
+        # the spectrum of the ground's radiance (as for a grey ground), and how much of it is from molecules
+        weight = E0 * atm["Tg_total"] * atm["T_down_total"] * atm["T_up_direct"] / (1 - rho_e * S)
+        diffuse = atm["T_up_total"] - atm["T_up_direct"]
+        r_mol, r_aer = atm["T_up_diffuse_rayleigh"], atm["T_up_diffuse_aerosol"]
+        sidecar["atmosphere"] = {
+            "source": atm_info["source"], "inputs": atm_info["inputs"], "mean_reflectance": rho_e,
+            "path_radiance": {b: float(np.mean((atm["rho_atm"] * E0 * mus / math.pi)[m])) for b, m in in_band.items()},
+            "diffuse_to_direct_up": {b: float(np.sum((weight * diffuse / atm["T_up_direct"])[m]) / np.sum(weight[m]))
+                                     for b, m in in_band.items()},
+            "rayleigh_fraction": {b: float(np.sum((weight * r_mol)[m]) / np.sum((weight * (r_mol + r_aer))[m]))
+                                  for b, m in in_band.items()},
+        }
 
     xml = f'''<?xml version="1.0" encoding="utf-8"?>
 <!-- Generated by tools/remote_sensing/build_scene.py from {args.site_dir.name}: {site["size_m"]:g} m around
      {site["centre"]["lat"]}, {site["centre"]["lon"]} ({site["dem"]["source"]}, {site["dem"]["project"]}; NAIP {", ".join(site["naip"]["dates"])}).
      Frame: x east, y up, z south, metres, origin on the ground at the centre ({centre_h:.2f} m NAVD88).
      Camera: {args.altitude / 1e3:g} km, view zenith {args.view_zenith:g}°, azimuth {args.view_azimuth:g}°, {args.gsd:g} m GSD at nadir.
-     Pixels record band-averaged radiance, W/m²/sr/µm, at the top of a (missing) atmosphere.
+     Pixels record band-averaged radiance, W/m²/sr/µm, {radiance_where}.
      Needs wave_tracer built with REALISTIC_REMOTE_SENSING. -->
 <scene version="0.1.0">
 	<default name="spp" value="{args.spp}"/>
@@ -216,21 +329,21 @@ def main():
 			<response type="band_radiance">
 				<string name="spectral_unit" value="um"/>
 				<boolean name="normalize" value="true"/>
-{band_xml}
+{band_xml}{transmittance_xml}
 			</response>
 		</film>
 	</sensor>
 
-	<!-- the sun: TSIS-1 HSRS (W/m²/µm), at {d:.5f} AU -->
+	<!-- the sun: TSIS-1 HSRS (W/m²/µm), at {d:.5f} AU{'' if atm is None else ', through the atmosphere'} -->
 	<emitter type="directional">
 		<transform name="to_world">
 			<lookat origin="0m, 0m, 0m" target="{-to_sun[0]:.9f}m, {-to_sun[1]:.9f}m, {-to_sun[2]:.9f}m" up="0, 1, 0"/>
 		</transform>
 		<spectrum name="irradiance" type="piecewise_linear">
-{solar_spectrum_xml(args.site_dir / site["solar_spectrum"]["file"], 1 / d**2, lo_nm, hi_nm, "			")}
+{spectrum_xml(nm, sun_irradiance, 3)}
 		</spectrum>
 	</emitter>
-
+{sky_xml}
 	<shape type="ply">
 		<path value="terrain.ply"/>
 		<quantity name="scale" value="1m"/>
@@ -246,7 +359,9 @@ def main():
 </scene>
 '''
     (args.site_dir / f"{args.name}.xml").write_text(xml)
-    print(f"wrote {args.site_dir}/terrain.ply, reflectance.png, {args.name}.xml; camera focal length {focal_length:g} m")
+    (args.site_dir / f"{args.name}.json").write_text(json.dumps(sidecar, indent=1) + "\n")
+    print(f"wrote {args.site_dir}/terrain.ply, reflectance.png, {'sky.ply, ' if atm is not None else ''}{args.name}.xml, "
+          f"{args.name}.json; camera focal length {focal_length:g} m")
 
 
 if __name__ == "__main__":

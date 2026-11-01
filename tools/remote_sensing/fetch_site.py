@@ -12,6 +12,10 @@ Downloads, for a square area around a point in the conterminous US:
              the TSIS-1 Hybrid Solar Reference Spectrum (Coddington et al.
              2021): top-of-atmosphere solar spectral irradiance at 1 AU,
              W/m²/nm, 202-2730 nm at 1 nm resolution
+  aeronet.csv
+             AERONET's Level 2.0 daily averages of aerosol optical depth and
+             precipitable water, for --date, from the nearest site within
+             --aeronet-radius (if any): inputs for atmosphere.py
   site.json  the area, its coordinate system, and where the data came from
 into OUT_DIR. Both rasters share the area's bounds in its UTM zone (NAD83),
 north up. Only the area is read from the sources (they are cloud-optimized
@@ -27,6 +31,7 @@ the result into a wave_tracer scene.
 import argparse
 import datetime
 import json
+import math
 import pathlib
 import sys
 
@@ -43,6 +48,8 @@ TNM_API = "https://tnmaccess.nationalmap.gov/api/v1/products"
 DEM_DATASET = "Digital Elevation Model (DEM) 1 meter"
 STAC_API = "https://planetarycomputer.microsoft.com/api/stac/v1"
 TSIS_HSRS = "https://lasp.colorado.edu/lisird/latis/dap/tsis1_hsrs_1nm.csv"
+AERONET_SITES = "https://aeronet.gsfc.nasa.gov/aeronet_locations_v3.txt"
+AERONET_DATA = "https://aeronet.gsfc.nasa.gov/cgi-bin/print_web_data_v3"
 
 
 def utm_crs(lon: float) -> CRS:
@@ -91,6 +98,29 @@ def naip_items(bounds, crs: CRS, date: datetime.date):
     return [i for i in items if i.datetime.year == year]
 
 
+def aeronet_daily(lat: float, lon: float, date: datetime.date, radius_km: float):
+    """The nearest AERONET site with Level 2.0 data on `date` within `radius_km`, and its daily averages (CSV)."""
+    lines = requests.get(AERONET_SITES, timeout=60).text.splitlines()
+    sites = []
+    for line in lines[2:]:
+        name, slon, slat, *_ = line.split(",")
+        d = 6371 * math.acos(min(1, math.sin(math.radians(lat)) * math.sin(math.radians(float(slat))) +
+                                 math.cos(math.radians(lat)) * math.cos(math.radians(float(slat))) *
+                                 math.cos(math.radians(lon - float(slon)))))
+        if d <= radius_km:
+            sites.append((d, name))
+    for d, name in sorted(sites):
+        params = {"site": name, "year": date.year, "month": date.month, "day": date.day, "year2": date.year,
+                  "month2": date.month, "day2": date.day, "AOD20": 1, "AVG": 20, "if_no_html": 1}
+        text = requests.get(AERONET_DATA, params=params, timeout=60).text
+        # (the service also returns neighbouring days)
+        rows = [l for l in text.splitlines() if l.startswith(f"{name},{date:%d:%m:%Y},")]
+        if rows:
+            header = next(l for l in text.splitlines() if l.startswith("AERONET_Site,"))
+            return name, d, header + "\n" + "\n".join(rows) + "\n"
+    return None
+
+
 def merge(urls, bounds, res, resampling, nodata=None):
     sources = [rasterio.open(u) for u in urls]
     try:
@@ -118,7 +148,8 @@ def main():
     parser.add_argument("--lon", type=float, default=-115.692, help="centre longitude")
     parser.add_argument("--size", type=float, default=2048, help="side of the square area, metres (default 2048)")
     parser.add_argument("--date", type=datetime.date.fromisoformat, default=datetime.date(2022, 7, 19),
-                        help="choose the NAIP year nearest this date (default 2022-07-19)")
+                        help="choose the NAIP year nearest this date, and AERONET's data of it (default 2022-07-19)")
+    parser.add_argument("--aeronet-radius", type=float, default=50, help="km (default 50)")
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -147,6 +178,13 @@ def main():
     (args.out_dir / "tsis1_hsrs_1nm.csv").write_text(solar.text)
     print("solar spectrum: TSIS-1 HSRS (1 nm)")
 
+    aeronet = aeronet_daily(args.lat, args.lon, args.date, args.aeronet_radius)
+    if aeronet:
+        (args.out_dir / "aeronet.csv").write_text(aeronet[2])
+        print(f"AERONET: {aeronet[0]} ({aeronet[1]:.1f} km), Level 2.0 daily average of {args.date}")
+    else:
+        print(f"AERONET: no Level 2.0 data of {args.date} within {args.aeronet_radius:g} km", file=sys.stderr)
+
     centre_elevation = float(dem[0, dem.shape[1] // 2, dem.shape[2] // 2])
     site = {
         "centre": {"lat": args.lat, "lon": args.lon, "elevation_m": centre_elevation},
@@ -157,6 +195,8 @@ def main():
                 "tiles": urls, "vertical_datum": "NAVD88"},
         "naip": {"file": "naip.tif", "resolution_m": naip_res, "bands": ["red", "green", "blue", "nir"],
                  "items": [i.id for i in items], "dates": sorted({str(i.datetime.date()) for i in items})},
+        "date": str(args.date),
+        "aeronet": {"file": "aeronet.csv", "site": aeronet[0], "distance_km": round(aeronet[1], 2)} if aeronet else None,
         "solar_spectrum": {"file": "tsis1_hsrs_1nm.csv", "source": "TSIS-1 HSRS, 1 nm resolution", "url": TSIS_HSRS,
                            "units": "W/m^2/nm at 1 AU"},
     }

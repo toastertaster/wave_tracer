@@ -72,7 +72,7 @@ Sun, materials and atmosphere
      - GPL: run as a separate program, never linked
      - `libradtran.org <https://www.libradtran.org>`_
    * - 6S / Py6S
-     - A lighter radiative transfer code for the solar spectrum, with AERONET import, as a cross-check of the tables.
+     - A radiative transfer code for the solar spectrum: computes the atmosphere (``atmosphere.py``). The 6S executable is on conda-forge (``sixs``).
      - Py6S: LGPL
      - ``pip install Py6S`` (needs the 6S executable)
 

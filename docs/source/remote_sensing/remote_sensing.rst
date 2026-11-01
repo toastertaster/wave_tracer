@@ -44,7 +44,8 @@ The first goal is stage one of the simulation: the radiance that reaches the tel
 0. *Done.* Scaffolding: the option, its propagation to the GPU backends and the Rust bindings, and the data survey (:doc:`data`).
 1. *Done.* Reference site: a fetch script and a scene builder for a terrain tile (elevation model and orthophoto) at Railroad Valley Playa, Nevada (:doc:`tools`).
 2. *Done.* Satellite frame camera: placed by altitude and look angles, with focal length, pixel pitch and pixel count; radiance per band in physical units; precision at orbital distances (:doc:`scene_elements`).
-3. Sun and atmosphere: *done:* the top-of-atmosphere solar spectrum and the sun's position (in the scene builder); *to do:* atmospheric transmittance, path radiance and sky light from tables precomputed with a radiative transfer code.
+3. *Done.* Sun and atmosphere: the top-of-atmosphere solar spectrum and the sun's position; the atmosphere of the day (from AERONET's aerosol optical depth and water vapour) computed with 6S: the sun's and the camera's transmittances and a sky dome in the scene, the path radiance and the adjacency effect added to the render (:doc:`tools`).
+   Matches 6S's top-of-atmosphere radiance of a uniform ground to 0.16%.
 4. Spectral materials: material maps that refer to measured reflectance spectra.
 5. Detector: point-spread functions, conversion to electrons and digital numbers, noise and quantization.
 6. Time: camera trajectories, platform motion and jitter, TDI and pushbroom cameras; then event cameras.
@@ -55,6 +56,5 @@ Known issues
 ------------
 
 * A ``directional`` emitter whose direction is exactly parallel to a coordinate axis (e.g. ``target="0m, -1m, 0m"``) lights a plane perpendicular to it with a pattern of rings, and too dimly; tilted by 0.001°, it lights it exactly. Suns computed from ephemerides are unaffected. Not yet investigated.
-* EXR files of films with four or more channels name them with a stray control character (``\x01R``, ...); band names would be better.
-* Bands share wavelength samples (see ``band_radiance``): images of several disjoint bands are noisy per band.
+* Bands share wavelength samples (see ``band_radiance``): images of several disjoint bands are noisier per band than images of one.
 * From a camera hundreds of kilometres away, ~10⁻⁴ of oblique views' samples still shadow themselves with ``near_clip``'s default margin (2 km); nearer margins leave fewer.
