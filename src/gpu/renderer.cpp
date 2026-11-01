@@ -10,6 +10,7 @@
 #include <wt/gpu/renderer.hpp>
 #include <wt/gpu/backend.hpp>
 
+#include <array>
 #include <bit>
 #include <format>
 #include <functional>
@@ -45,6 +46,9 @@
 #include <wt/texture/bitmap.hpp>
 #include <wt/texture/scale.hpp>
 #include <wt/texture/transform.hpp>
+#if defined(REALISTIC_REMOTE_SENSING)
+#include <wt/remote_sensing/spectral_mix.hpp>
+#endif
 #include <wt/spectrum/colourspace/RGB/RGB_to_spectral.hpp>
 #include <wt/sensor/sensor/perspective.hpp>
 #include <wt/sensor/sensor/virtual_plane_sensor.hpp>
@@ -294,10 +298,15 @@ bool ior_has_transmission(const c_t ior) noexcept {
  */
 class textures_t {
 public:
-    /** @brief A texture at a wavenumber: a constant factor, times the value of `texture` (unless no_texture). */
+    /**
+     * @brief A texture at a wavenumber: a constant factor, times the value of `texture` (unless no_texture); of a
+     *        `spectral_mix_t` (`mixed`), times its RGBA weighting the mixed spectra's values `mix`.
+     */
     struct compiled_t {
         f_t factor;
         std::uint32_t texture;
+        bool mixed = false;
+        std::array<f_t, 4> mix{};
     };
 
     /** @brief Registers the textures of `bsdf` and the BSDFs it nests, refusing those the GPU cannot look up. */
@@ -352,7 +361,7 @@ public:
     [[nodiscard]] compiled_t compile(const texture::texture_t& texture, const wavenumber_t k,
                                      const bsdf::bsdf_t& of) const {
         const auto c = canonical(texture, k, of);
-        return { c.factor, c.bitmap ? registered.at(&texture) : compute_kernel::no_texture };
+        return { c.factor, c.bitmap ? registered.at(&texture) : compute_kernel::no_texture, c.mixed, c.mix };
     }
 
     /** @brief The roughness texture of a roughness-parametrized fractal or gaussian surface profile, or nullptr. */
@@ -371,12 +380,17 @@ public:
     std::vector<real> texel_luts;
 
 private:
-    /** @brief A texture in the form of `compute_kernel::texture`: factor * bitmap(M*uv + t), or a constant (no bitmap). */
+    /**
+     * @brief A texture in the form of `compute_kernel::texture`: factor * bitmap(M*uv + t), or a constant (no bitmap).
+     *        Of a `spectral_mix_t` (`mixed`): factor * dot(bitmap's RGBA(M*uv + t), mix).
+     */
     struct canonical_t {
         f_t factor = 1;
         const texture::bitmap_t* bitmap = nullptr;
         mat2_t M = mat2_t{ 1 };
         vec2_t t = vec2_t{ 0 };
+        bool mixed = false;
+        std::array<f_t, 4> mix{};
     };
 
     /** @brief `texture` in canonical form; its factor at wavenumber `k`, or 1 without. */
@@ -399,13 +413,23 @@ private:
             if (a.bitmap && b.bitmap)
                 throw gpu_error_t(std::format(
                     "GPU rendering does not support scale textures of two bitmaps yet (BSDF <{}>)", of.get_id()));
-            if (b.bitmap) {
+            if (b.bitmap || b.mixed) {
                 b.factor *= a.factor;
                 return b;
             }
             a.factor *= b.factor;
             return a;
         }
+#if defined(REALISTIC_REMOTE_SENSING)
+        if (const auto* mix = dynamic_cast<const remote_sensing::spectral_mix_t*>(&texture); mix) {
+            // the weights' lookup, weighting the spectra (the weights are a transformed bitmap)
+            auto c = canonical(*mix->weights(), k, of);
+            c.mixed = true;
+            if (k)
+                c.mix = mix->values(*k);
+            return c;
+        }
+#endif
         throw gpu_error_t(std::format(
             "GPU rendering supports only bitmap, constant, scale and transform textures so far; "
             "BSDF <{}> has a '{}' texture", of.get_id(), type_of(texture)));
@@ -421,7 +445,8 @@ private:
         // glm matrices are column-major
         compute_kernel::texture t{};
         t.bitmap = bitmap_index(*c.bitmap, of);
-        t.rgb = c.bitmap->is_RGB() ? 1 : 0;
+        // a spectral mix's RGBA are weights, not a colour
+        t.rgb = c.bitmap->is_RGB() && !c.mixed ? 1 : 0;
         t.M[0] = real(c.M[0][0]); t.M[1] = real(c.M[1][0]);
         t.M[2] = real(c.M[0][1]); t.M[3] = real(c.M[1][1]);
         t.t[0] = real(c.t.x); t.t[1] = real(c.t.y);
@@ -571,6 +596,9 @@ void compile_surface_profile(const bsdf::surface_spm_t& spm, const wavenumber_t 
     // a textured roughness: the kernel derives the parameters where paths hit (`set_profile_roughness`)
     if (const auto* roughness = textures_t::roughness_texture(spm); roughness) {
         const auto r = textures.compile(*roughness, k, spm);
+        if (r.mixed)
+            throw gpu_error_t(std::format(
+                "GPU rendering supports spectral_mix textures only as diffuse reflectances (BSDF <{}>)", spm.get_id()));
         if (r.texture!=compute_kernel::no_texture) {
             m.roughness = real(r.factor);
             m.roughness_texture = r.texture;
@@ -618,6 +646,10 @@ compute_kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber
                 return m;
         } else if (const auto* scale = dynamic_cast<const bsdf::scale_t*>(b); scale) {
             const auto s = textures.compile(*scale->scale_texture(), k, *scale);
+            if (s.mixed)
+                throw gpu_error_t(std::format(
+                    "GPU rendering supports spectral_mix textures only as diffuse reflectances (BSDF <{}>)",
+                    scale->get_id()));
             m.scale *= real(s.factor);
             if (s.texture!=compute_kernel::no_texture) {
                 if (m.scale_texture!=compute_kernel::no_texture)
@@ -642,6 +674,11 @@ compute_kernel::material compile_bsdf(const bsdf::bsdf_t& bsdf, const wavenumber
         // diffuse_t clamps the reflectance; the kernel clamps a textured one where paths hit
         m.reflectance_texture = r.texture;
         m.reflectance = real(r.texture==compute_kernel::no_texture ? m::clamp01<f_t>(r.factor) : r.factor);
+#if defined(REALISTIC_REMOTE_SENSING)
+        m.reflectance_mixed = r.mixed ? 1 : 0;
+        for (std::size_t i=0; i<r.mix.size(); ++i)
+            m.reflectance_mix[i] = real(r.mix[i]);
+#endif
         return m;
     }
 

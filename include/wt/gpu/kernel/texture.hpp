@@ -245,9 +245,18 @@ WT_GPU_FN void set_profile_roughness(WT_GPU_THREAD material& m, real r, real k) 
 WT_GPU_FN void resolve_material(const WT_GPU_THREAD plt_scene& scene, u32 spectral, WT_GPU_THREAD material& m, vec2 uv) {
     if (m.scale_texture!=no_texture)
         m.scale *= texture_value(scene, spectral, m.scale_texture, uv);
-    if (m.reflectance_texture!=no_texture)
+    if (m.reflectance_texture!=no_texture) {
+#if defined(REALISTIC_REMOTE_SENSING)
+        if (m.reflectance_mixed!=0) {
+            const vec4 w = texture_rgba(scene, m.reflectance_texture, uv);
+            const real mixed = w.x*m.reflectance_mix[0] + w.y*m.reflectance_mix[1] +
+                               w.z*m.reflectance_mix[2] + w.w*m.reflectance_mix[3];
+            m.reflectance = clamp(m.reflectance * mixed, real(0), real(1));
+        } else
+#endif
         m.reflectance = clamp(m.reflectance * texture_value(scene, spectral, m.reflectance_texture, uv),
                               real(0), real(1));
+    }
     if (m.roughness_texture!=no_texture)
         set_profile_roughness(m, m.roughness * texture_value(scene, spectral, m.roughness_texture, uv),
                               scene.spectra[spectral].k);

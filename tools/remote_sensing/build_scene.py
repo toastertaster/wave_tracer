@@ -7,7 +7,7 @@
 Writes into the site directory:
   terrain.ply      the DEM as a triangle mesh, with vertex normals and texture
                    coordinates
-  reflectance.png  a 16-bit linear reflectance map
+  reflectance.png  without materials.json: a 16-bit linear reflectance map
   sky.ply          with an atmosphere: the sky, a hemisphere around the scene
   <name>.xml       the scene: the terrain, the sun, the sky, and a
                    satellite_frame camera recording band radiance (needs a
@@ -38,9 +38,12 @@ straight from the ground. toa.py adds the rest: the atmosphere's path
 radiance, and the ground's light that the atmosphere scatters into the view
 (the adjacency effect).
 
-Reflectance is a placeholder until spectral material maps: spectrally flat,
-scaled from NAIP's brightness so that its median is --reflectance. (NAIP is not
-radiometrically calibrated; its RGB would also leave the near infrared dark.)
+The terrain's reflectance is that of the materials that materials.py mapped
+(SITE_DIR/materials.json): a spectral_mix of their spectra, weighted by their
+abundances (materials.exr). Without them, or with --reflectance, a
+placeholder: spectrally flat, scaled from NAIP's brightness so that its median
+is --reflectance (default .35). (NAIP is not radiometrically calibrated; its
+RGB would also leave the near infrared dark.)
 
     uv run tools/remote_sensing/build_scene.py SITE_DIR [--gsd 1 --pixels 1920 --altitude 500e3 ...]
 
@@ -112,14 +115,54 @@ def terrain(dem_path, spacing: int, centre_en, centre_h):
 
 
 def reflectance_map(naip_path, out_path, mean_reflectance):
-    """NAIP's brightness (mean of red, green, blue), scaled so that its median is `mean_reflectance`."""
+    """The placeholder reflectance: NAIP's brightness (mean of red, green, blue), scaled so that its median is
+    `mean_reflectance`. Returns its mean."""
     with rasterio.open(naip_path) as ds:
         rgb = ds.read([1, 2, 3]).astype(np.float64)
-        bounds = ds.bounds
     lum = rgb.mean(axis=0)
     rho = np.clip(lum / np.median(lum[lum > 0]) * mean_reflectance, 0, 1)
     Image.fromarray(np.round(rho * 65535).astype(np.uint16)).save(out_path)
-    return bounds, rho.mean()
+    return rho.mean()
+
+
+def terrain_bsdf(site_dir, nm, placeholder_reflectance, naip_path):
+    """The terrain's diffuse BSDF (XML), and its mean reflectance at wavelengths `nm`: of the materials of
+    materials.json, if any (and not `placeholder_reflectance`, a median reflectance), else the placeholder's."""
+    materials_path = site_dir / "materials.json"
+    if placeholder_reflectance is None and materials_path.exists():
+        materials = json.loads(materials_path.read_text())
+        wl = np.asarray(materials["wavelength_nm"])
+        if nm[0] < wl[0] or nm[-1] > wl[-1]:
+            raise SystemExit(f"{materials_path} covers {wl[0]:g}-{wl[-1]:g} nm, not {nm[0]:g}-{nm[-1]:g} nm")
+        spectra = {name: np.interp(nm, wl, r) for name, r in materials["reflectance"].items()}
+        mean = sum(materials["mean_abundances"][name] * r for name, r in spectra.items())
+        spectra_xml = "\n".join(f'''				<spectrum type="piecewise_linear" id="{name}">
+{spectrum_xml(nm, r, 5)}
+				</spectrum>''' for name, r in spectra.items())
+        print(f"materials: {', '.join(spectra)} ({materials_path.name}); mean reflectance at 550 nm "
+              f"{np.interp(550, nm, mean):.3f}")
+        return f'''<!-- materials: {", ".join(f"{m['name']} ({m['source']})" for m in materials["materials"])} -->
+		<bsdf type="diffuse">
+			<texture name="reflectance" type="spectral_mix">
+				<texture name="weights" type="bitmap">
+					<path value="{materials["weights"]}"/>
+					<string name="filter_type" value="bilinear"/>
+					<string name="wrap_mode" value="clamp"/>
+				</texture>
+{spectra_xml}
+			</texture>
+		</bsdf>''', mean
+    median = placeholder_reflectance if placeholder_reflectance is not None else 0.35
+    mean = reflectance_map(naip_path, site_dir / "reflectance.png", median)
+    print(f"placeholder reflectance: median {median:g}, mean {mean:.3f}")
+    return '''<bsdf type="diffuse">
+			<texture name="reflectance" type="bitmap">
+				<path value="reflectance.png"/>
+				<string name="colour_encoding" value="linear"/>
+				<string name="filter_type" value="bilinear"/>
+				<string name="wrap_mode" value="clamp"/>
+			</texture>
+		</bsdf>''', np.full(len(nm), mean)
 
 
 def solar_spectrum(csv_path, nm):
@@ -200,7 +243,9 @@ def main():
     p.add_argument("--spp", type=int, default=16, help="samples per pixel (default 16)")
     p.add_argument("--ray-tracing", action="store_true", help="trace rays rather than beams")
     p.add_argument("--mesh-spacing", type=int, default=2, help="DEM pixels between mesh vertices (default 2)")
-    p.add_argument("--reflectance", type=float, default=0.35, help="median reflectance of the placeholder map (default .35)")
+    p.add_argument("--reflectance", type=float,
+                   help="use a placeholder reflectance map of this median rather than SITE_DIR/materials.json "
+                        "(default, without it: .35)")
     p.add_argument("--no-atmosphere", action="store_true", help="ignore SITE_DIR/atmosphere.json")
     p.add_argument("--sky-radius", type=float, default=100e3, help="m (default 100 km)")
     args = p.parse_args()
@@ -211,8 +256,9 @@ def main():
     centre_h = site["centre"]["elevation_m"]
 
     vertices, normals, E, N, faces = terrain(args.site_dir / site["dem"]["file"], args.mesh_spacing, centre_en, centre_h)
-    tex_bounds, mean_reflectance = reflectance_map(args.site_dir / site["naip"]["file"], args.site_dir / "reflectance.png",
-                                                   args.reflectance)
+    naip_path = args.site_dir / site["naip"]["file"]
+    with rasterio.open(naip_path) as ds:
+        tex_bounds = ds.bounds      # materials.exr and reflectance.png are on NAIP's grid
     uvs = np.stack([(E - tex_bounds.left) / (tex_bounds.right - tex_bounds.left),
                     (N - tex_bounds.bottom) / (tex_bounds.top - tex_bounds.bottom)], axis=-1)
     write_ply(args.site_dir / "terrain.ply", vertices, normals, uvs, faces)
@@ -236,6 +282,7 @@ def main():
     E0 = solar_spectrum(args.site_dir / site["solar_spectrum"]["file"], nm) / d**2
     mus = math.cos(z)
     in_band = {name: (nm >= lo) & (nm <= hi) for name, (lo, hi) in BANDS.items()}
+    terrain_xml, mean_reflectance = terrain_bsdf(args.site_dir, nm, args.reflectance, naip_path)
 
     atm_path = args.site_dir / "atmosphere.json"
     atm = None
@@ -261,7 +308,7 @@ def main():
         sky_projected_solid_angle, sky_triangles = sky_dome(args.site_dir / "sky.ply", args.sky_radius, to_sun, hole_deg)
         sky_radiance = sky_irradiance / sky_projected_solid_angle
         print(f"atmosphere: {atm_info['source']}; sky: {sky_triangles} triangles, hole {hole_deg:.2f}°, "
-              f"projected solid angle π - {math.pi - sky_projected_solid_angle:.2e} sr; mean reflectance {rho_e:.3f}")
+              f"projected solid angle π - {math.pi - sky_projected_solid_angle:.2e} sr")
         sky_xml = f'''
 	<!-- the sky, of uniform radiance (W/m²/sr/µm) -->
 	<shape type="ply">
@@ -291,7 +338,8 @@ def main():
         diffuse = atm["T_up_total"] - atm["T_up_direct"]
         r_mol, r_aer = atm["T_up_diffuse_rayleigh"], atm["T_up_diffuse_aerosol"]
         sidecar["atmosphere"] = {
-            "source": atm_info["source"], "inputs": atm_info["inputs"], "mean_reflectance": rho_e,
+            "source": atm_info["source"], "inputs": atm_info["inputs"],
+            "mean_reflectance": {b: float(np.mean(rho_e[m])) for b, m in in_band.items()},
             "path_radiance": {b: float(np.mean((atm["rho_atm"] * E0 * mus / math.pi)[m])) for b, m in in_band.items()},
             "diffuse_to_direct_up": {b: float(np.sum((weight * diffuse / atm["T_up_direct"])[m]) / np.sum(weight[m]))
                                      for b, m in in_band.items()},
@@ -347,20 +395,13 @@ def main():
 	<shape type="ply">
 		<path value="terrain.ply"/>
 		<quantity name="scale" value="1m"/>
-		<bsdf type="diffuse">
-			<texture name="reflectance" type="bitmap">
-				<path value="reflectance.png"/>
-				<string name="colour_encoding" value="linear"/>
-				<string name="filter_type" value="bilinear"/>
-				<string name="wrap_mode" value="clamp"/>
-			</texture>
-		</bsdf>
+		{terrain_xml}
 	</shape>
 </scene>
 '''
     (args.site_dir / f"{args.name}.xml").write_text(xml)
     (args.site_dir / f"{args.name}.json").write_text(json.dumps(sidecar, indent=1) + "\n")
-    print(f"wrote {args.site_dir}/terrain.ply, reflectance.png, {'sky.ply, ' if atm is not None else ''}{args.name}.xml, "
+    print(f"wrote {args.site_dir}/terrain.ply, {'sky.ply, ' if atm is not None else ''}{args.name}.xml, "
           f"{args.name}.json; camera focal length {focal_length:g} m")
 
 

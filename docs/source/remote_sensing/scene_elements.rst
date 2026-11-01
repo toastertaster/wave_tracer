@@ -101,3 +101,38 @@ An optional ``transmittance`` spectrum multiplies what every band records, wavel
    </response>
 
 Channels are named after their bands' ``id`` attributes (e.g. in EXR files), if every band has a distinct one.
+
+
+``spectral_mix`` texture
+------------------------
+
+A linear mixture of up to four spectra whose weights vary over the surface, for reflectances of mixed materials (remote sensing's linear mixture model): at texture coordinates *uv* and wavelength λ,
+
+.. math::
+
+   \sum_i w_i(uv)\, S_i(\lambda),
+
+with the weights *w*\ :sub:`1`–*w*\ :sub:`4` the R, G, B and A channels of a ``weights`` bitmap texture (a grey bitmap gives its value to R, G and B; without alpha, A is 1).
+The weights are the materials' abundances (fractions of the surface): they need not sum to one, and so also carry variations in brightness.
+
+.. code-block:: xml
+
+   <bsdf type="diffuse">
+       <texture name="reflectance" type="spectral_mix">
+           <texture name="weights" type="bitmap">
+               <path value="materials.exr"/>              <!-- half or float RGBA -->
+               <string name="filter_type" value="bilinear"/>
+               <string name="wrap_mode" value="clamp"/>
+           </texture>
+           <spectrum type="piecewise_linear" id="playa"> ... </spectrum>       <!-- weighted by R -->
+           <spectrum type="piecewise_linear" id="concrete"> ... </spectrum>    <!-- by G -->
+           <spectrum type="piecewise_linear" id="asphalt"> ... </spectrum>     <!-- by B -->
+       </texture>
+   </bsdf>
+
+The ``weights`` texture may be a bitmap or a transform of one.
+Weights are linear: give PNG weights ``colour_encoding`` ``linear`` (EXR files are linear already).
+Spectra beyond the first four are refused; channels without a spectrum are ignored.
+
+On the GPUs, ``spectral_mix`` textures can only be diffuse reflectances (not, e.g., roughnesses or scale factors): the kernels look up the bitmap's RGBA and take its dot product with the spectra's values at the sample's wavelength.
+``materials.py`` (:doc:`tools`) writes the weights and spectra of a site.

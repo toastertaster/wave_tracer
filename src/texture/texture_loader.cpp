@@ -28,6 +28,10 @@
 
 #include <wt/scene/loader/node_readers.hpp>
 
+#if defined(REALISTIC_REMOTE_SENSING)
+#include <wt/remote_sensing/spectral_mix.hpp>
+#endif
+
 using namespace wt;
 using namespace texture;
 
@@ -63,6 +67,10 @@ std::shared_ptr<texture_t> texture_t::load(std::string id,
         return scale_t::load(std::move(id), loader, node, context);
     else if (type=="transform")
         return transform_t::load(std::move(id), loader, node, context);
+#if defined(REALISTIC_REMOTE_SENSING)
+    else if (type=="spectral_mix")
+        return remote_sensing::spectral_mix_t::load(std::move(id), loader, node, context);
+#endif
 
     throw scene_loading_exception_t("(texture loader) unrecognized texture type", node);
 }

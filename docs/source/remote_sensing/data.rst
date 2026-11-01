@@ -60,9 +60,9 @@ Sun, materials and atmosphere
      - Free; cite
      - LASP LISIRD, e.g. ``https://lasp.colorado.edu/lisird/latis/dap/tsis1_hsrs_1nm.csv``
    * - USGS Spectral Library 7 (splib07)
-     - Laboratory, field and airborne reflectance spectra of minerals, soils, vegetation, coatings and man-made materials, 0.2–200 µm, in ASCII.
+     - Laboratory, field and airborne reflectance spectra of minerals, soils, vegetation, coatings and man-made materials, 0.2–200 µm, in ASCII. ``materials.py`` uses its spectra convolved to an ASD spectrometer (``ASCIIdata_splib07b_cvASD.zip``: 350–2500 nm at 1 nm), e.g. Stonewall Playa's dry mud as an analogue of Railroad Valley Playa's.
      - CC0
-     - `USGS data release <https://doi.org/10.5066/F7RR1WDJ>`_
+     - `USGS data release <https://doi.org/10.5066/F7RR1WDJ>`_ (ScienceBase item ``586e8c88e4b0f5ce109fccae``)
    * - ECOSTRESS Spectral Library 1.0
      - About 3400 spectra (vegetation, soils, rocks, man-made materials, water), visible to thermal infrared. Directional-hemispherical reflectances give emissivities by Kirchhoff's law, for the thermal infrared.
      - © Caltech, all rights reserved; reproduced with acknowledgement. Fetch, don't redistribute.

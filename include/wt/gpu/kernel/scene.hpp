@@ -189,6 +189,14 @@ struct material {
     // diffuse
     real reflectance;           // `diffuse_t`'s reflectance, clamped to [0,1] (once textured)
     u32 reflectance_texture;
+#if defined(REALISTIC_REMOTE_SENSING)
+    /**
+     * @brief A `remote_sensing::spectral_mix_t` reflectance (if nonzero): the texture's RGBA (unclamped and not
+     *        uplifted) weights the mixed spectra's values, `reflectance_mix`, rather than its value.
+     */
+    u32 reflectance_mixed;
+    real reflectance_mix[4];
+#endif
 };
 
 WT_GPU_CONSTANT constexpr u32 emitter_point = 0;          // `emitter::point_t`
