@@ -12,7 +12,8 @@ Writes into the site directory:
   <name>.xml       the scene: the terrain, the sun, the sky, and a
                    satellite_frame camera recording band radiance (needs a
                    wave_tracer built with REALISTIC_REMOTE_SENSING)
-  <name>.json      what toa.py needs to add the atmosphere's own radiance
+  <name>.json      what toa.py and detector.py need: the bands, the camera,
+                   and the atmosphere's own radiance
 
 The scene's frame is local to the site: x east, y up, z south (north is -z),
 in metres, with the origin on the ground at the site's centre. The camera is
@@ -289,7 +290,8 @@ def main():
     if not args.no_atmosphere and atm_path.exists():
         atm_info, atm = load_atmosphere(atm_path, nm, zen, args.view_zenith, args.view_azimuth)
     sidecar = {"bands_nm": BANDS, "gsd_m": args.gsd, "pixels": args.pixels, "view_zenith_deg": args.view_zenith,
-               "altitude_m": args.altitude, "atmosphere": None}
+               "view_azimuth_deg": args.view_azimuth, "altitude_m": args.altitude, "focal_length_m": focal_length,
+               "pixel_pitch_m": args.pixel_pitch, "time": args.time.isoformat(), "atmosphere": None}
     if atm is None:
         print("no atmosphere" + ("" if args.no_atmosphere else f" ({atm_path} not found)"))
         sun_irradiance = E0
