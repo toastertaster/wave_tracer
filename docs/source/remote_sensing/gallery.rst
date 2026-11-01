@@ -121,3 +121,191 @@ Each band is stretched over its own percentiles.
 
    ``event_camera.py``: 10 ms of an event camera of 10 µm pixels (2 m GSD) scanning at the orbit's ground speed, with thresholds of 0.03 (``event_camera.json``'s are 0.25, which the scene's contrast at 2 m never reaches).
    10 830 events (5061 ON, 5769 OFF), 354 time steps, in 45 s; their counts per pixel over 512 m around the facility, ON red, OFF blue (square root of the counts, zoomed 2 ×).
+
+
+Towns and cities
+----------------
+
+Five sites built by the town workflow of :doc:`tools` (``fetch_site.py --lidar --sentinel2``, ``materials.py --classes``, ``atmosphere.py`` with 6S, ``build_scene.py``), each 2048 m on a side around the given centre and seen at nadir at the Sentinel-2 pass whose surface reflectance calibrated NAIP.
+Each scene is a 2048² vertex surface model from the lidar (a 1 m grid: 8.38 M triangles, split by lidar class into ground, grass, tree, building, water and wall meshes, plus a 64 k triangle sky), with each class's material a per-pixel mix of four library spectra unmixed from calibrated NAIP.
+Rendered on the GPU (NVIDIA GB10, CUDA + OptiX) at 1920², 1 m GSD, 64 samples per pixel, with beams and without forward scattering detection (``--fsd`` is off for surface models); times are the command line's ``Elapsed``, which excludes loading the scene (1–2.5 min, most of it reading the PLY meshes and building the BVH).
+The images are ``toa.py``'s top-of-atmosphere radiance (render + path radiance + adjacency effect), each band stretched over its own 0.1–99.9th percentiles: the whole 1920 m binned 3 × 3, and a 640 m window at full resolution.
+
+.. list-table:: Input data
+   :header-rows: 1
+   :widths: 16 21 27 18 18
+
+   * - Site (centre)
+     - Bare-earth DEM (3DEP 1 m)
+     - Lidar (3DEP)
+     - NAIP
+     - Sentinel-2 L2A (calibration r²: red, green, blue, nir)
+   * - Goddard Space Flight Center, Greenbelt MD (38.9925, −76.8398)
+     - ``MD_Central_Processing_D24``
+     - ``MD_VA_Sandy_NCR_2014``: 19.1 M returns, 4.6 /m², highest 45.5 m
+     - 2023-09-01, 0.3 m
+     - S2A, 2023-09-02 15:48 UTC (0.81, 0.78, 0.83, 0.46)
+   * - UMBC, Catonsville MD (39.2546, −76.7094)
+     - ``MD_4County_D24``
+     - ``MD_4County_2_D24`` (LAZ tiles): 64.2 M returns, 15.3 /m², highest 113 m
+     - 2023-05-25, 0.3 m
+     - S2A, 2023-05-25 15:49 UTC (0.86, 0.84, 0.88, 0.71)
+   * - Downtown Reno NV (39.533, −119.814)
+     - ``NV_USFSR4_D23``
+     - ``NV_Reno_Carson_QL1_2017``: 38.6 M returns, 9.2 /m², highest 70.6 m
+     - 2022-06-14, 0.6 m
+     - S2B, 2022-06-15 18:39 UTC (0.71, 0.71, 0.74, 0.54)
+   * - Downtown Fresno CA (36.7378, −119.7871)
+     - ``CA_SanJoaquin_2021_A21``
+     - ``CA_SanJoaquin_3_2021``: 79.9 M returns, 19 /m², highest 106 m
+     - 2022-06-20, 0.6 m
+     - S2B, 2022-06-25 18:39 UTC (0.48, 0.49, 0.54, 0.42)
+   * - Midtown Manhattan NY (40.754, −73.984)
+     - ``NY_CMPG_2013``
+     - ``NY_NewYorkCity``: 18.8 M returns, 4.5 /m², highest 431 m
+     - 2022-07-19 (and 2022-07-10, New Jersey), 0.6 m
+     - S2A, 2022-07-19 15:49 UTC (0.22, 0.22, 0.23, 0.27)
+
+.. list-table:: Conditions and surface
+   :header-rows: 1
+   :widths: 16 26 10 24 24
+
+   * - Site
+     - AERONET site (distance): AOT at 550 nm, water vapour
+     - Sun zenith
+     - Lidar classes (ground, grass, tree, building, water)
+     - Relief of the surface model
+   * - Goddard
+     - GSFC (0 km): 0.073, 1.9 cm
+     - 35.8°
+     - 7, 45, 44, 4, 0%
+     - −25 .. 55 m
+   * - UMBC
+     - MD_Science_Center (8.9 km): 0.130, 0.92 cm
+     - 24.2°
+     - 10.5, 48.8, 36.5, 4.1, 0.1%
+     - −37 .. 144 m
+   * - Reno
+     - Univ_of_Nevada-Reno (0.9 km): 0.036, 0.75 cm
+     - 23.5°
+     - 51.5, 7.7, 12.6, 27.0, 1.2%
+     - −12 .. 72 m
+   * - Fresno
+     - Fresno_2 (5.4 km): 0.075, 1.7 cm
+     - 22.2°
+     - 56.7, 6.6, 8.0, 28.6, 0%
+     - −10 .. 104 m
+   * - Manhattan
+     - CCNY (8 km): 0.148, 2.8 cm
+     - 25.2°
+     - 34.2, 1.4, 2.0, 62.4, 0%
+     - −25 .. 425 m
+
+The sites differ in what limits them.
+Goddard's lidar is from 2014, nine years before its NAIP, and buildings are 4% of the site: it is mostly lawns and forest.
+UMBC's lidar is the densest of the five (15 returns/m²) and its NAIP was flown on the day of its Sentinel-2 pass, so its calibration fits best.
+Reno's lidar is from 2017 and Fresno's from 2021; both have NAIP and Sentinel-2 within days of one another.
+Fresno's calibration fits worse than Reno's (r² ≈ 0.5 against 0.7), as does Goddard's in the near infrared, likely because NAIP and Sentinel-2 see the surface at different times of day and from different angles.
+Manhattan's fits worst: NAIP's off-nadir views lean its towers over the streets (relief displacement) and its shadows are long, so the NAIP and lidar pixels of a building disagree, and a quarter of the surface model's triangles are walls.
+
+.. list-table:: Renders (radiances in W/m²/sr/µm: blue, green, red, nir)
+   :header-rows: 1
+   :widths: 16 28 12 22 22
+
+   * - Site
+     - Surface model's triangles by class (ground, grass, tree, building, water, wall)
+     - Time (``Elapsed``)
+     - Mean top-of-atmosphere radiance
+     - Path radiance
+   * - Goddard
+     - 6.7, 45.1, 43.9, 3.6, 0, 0.7%
+     - 3 min 31 s
+     - 51.8, 38.7, 26.4, 42.7
+     - 35.1, 17.9, 8.1, 2.5
+   * - UMBC
+     - 10.2, 48.8, 36.5, 3.5, 0.1, 0.9%
+     - 2 min 27 s
+     - 63.7, 52.3, 37.3, 74.2
+     - 40.6, 21.3, 10.0, 3.4
+   * - Reno
+     - 47.4, 7.7, 12.5, 21.5, 1.1, 9.8%
+     - 1 min 45 s
+     - 90.2, 80.1, 67.7, 61.4
+     - 32.0, 16.1, 7.1, 2.1
+   * - Fresno
+     - 52.9, 6.6, 8.0, 23.9, 0, 8.5%
+     - 1 min 35 s
+     - 95.5, 82.7, 70.2, 57.2
+     - 38.7, 19.9, 9.0, 2.9
+   * - Manhattan
+     - 29.4, 1.4, 2.0, 41.5, 0, 25.7%
+     - 3 min 15 s
+     - 64.6, 47.1, 35.2, 22.9
+     - 40.8, 21.6, 10.3, 3.5
+
+.. grid:: 1 2 2 2
+   :gutter: 2
+
+   .. grid-item-card:: Goddard Space Flight Center
+      :img-top: ../_static/remote_sensing/city_gsfc.jpg
+
+      1920 m, binned 3 × 3.
+
+   .. grid-item-card:: Goddard, 640 m at 1 m
+      :img-top: ../_static/remote_sensing/city_gsfc_crop.jpg
+
+      The campus's buildings among lawns and trees (``--crop 760,560,640,640``).
+
+   .. grid-item-card:: UMBC
+      :img-top: ../_static/remote_sensing/city_umbc.jpg
+
+      1920 m, binned 3 × 3.
+
+   .. grid-item-card:: UMBC, 640 m at 1 m
+      :img-top: ../_static/remote_sensing/city_umbc_crop.jpg
+
+      The campus core: its quad and paths, the library and academic buildings, and parking lots along the loop road (``--crop 640,640,640,640``).
+
+   .. grid-item-card:: Reno
+      :img-top: ../_static/remote_sensing/city_reno.jpg
+
+      1920 m, binned 3 × 3.
+
+   .. grid-item-card:: Reno, 640 m at 1 m
+      :img-top: ../_static/remote_sensing/city_reno_crop.jpg
+
+      Downtown's casino blocks (``--crop 560,1000,640,640``).
+
+   .. grid-item-card:: Fresno
+      :img-top: ../_static/remote_sensing/city_fresno.jpg
+
+      1920 m, binned 3 × 3.
+
+   .. grid-item-card:: Fresno, 640 m at 1 m
+      :img-top: ../_static/remote_sensing/city_fresno_crop.jpg
+
+      Downtown, its street trees and the buildings' shadows (``--crop 640,640,640,640``).
+
+   .. grid-item-card:: Manhattan
+      :img-top: ../_static/remote_sensing/city_manhattan.jpg
+
+      1920 m, binned 3 × 3.
+
+   .. grid-item-card:: Manhattan, 640 m at 1 m
+      :img-top: ../_static/remote_sensing/city_manhattan_crop.jpg
+
+      Bryant Park and the New York Public Library, with Times Square at the top left (``--crop 600,480,640,640``).
+
+What went into Reno's 640 m window: NAIP (true colour), the lidar surface model (shaded relief, tinted by height) and its classes (ground grey, grass light green, tree dark green, building red, water blue; walls are the steep triangles between classes, not a class of the grid).
+
+.. grid:: 1 3 3 3
+   :gutter: 2
+
+   .. grid-item-card:: NAIP, 2022-06-14
+      :img-top: ../_static/remote_sensing/city_reno_naip.jpg
+
+   .. grid-item-card:: Lidar surface model
+      :img-top: ../_static/remote_sensing/city_reno_dsm.jpg
+
+   .. grid-item-card:: Lidar classes
+      :img-top: ../_static/remote_sensing/city_reno_classes.jpg

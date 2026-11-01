@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["numpy", "rasterio", "pyproj", "pystac-client", "planetary-computer", "requests"]
+# dependencies = ["numpy", "scipy", "rasterio", "pyproj", "pystac-client", "planetary-computer", "requests", "laspy[lazrs]", "shapely"]
 # ///
 """Fetches the terrain and imagery of a remote sensing reference site.
 
@@ -17,6 +17,21 @@ Downloads, for a square area around a point in the conterminous US:
              precipitable water, for --date, from the nearest site within
              --aeronet-radius (if any): inputs for atmosphere.py
   site.json  the area, its coordinate system, and where the data came from
+and, optionally:
+  dsm.tif, lidar_class.tif  (--lidar)
+             a surface model from USGS 3DEP's lidar point clouds: the highest
+             return of each cell (roofs, tree crowns, bridges; float32 metres,
+             NAVD88, its datum matched to the DEM's), and its ASPRS class
+             (uint8: 2 ground, 3-5 vegetation, 6 building, 9 water, 17 bridge;
+             0 where no return fell, filled from the DEM). The point clouds
+             (3DEP's Entwine Point Tiles on AWS, else its LAZ tiles; see
+             lidar.py) are downloaded once into --lidar-cache.
+  sentinel2.tif  (--sentinel2)
+             Sentinel-2's Level-2A surface reflectance (blue, green, red, near
+             infrared: bands 2, 3, 4, 8, float32; then the scene
+             classification, SCL) of the clearest pass over the area within
+             --sentinel2-days of --date, on a 10 m grid: materials.py
+             calibrates NAIP with it
 into OUT_DIR. Both rasters share the area's bounds in its UTM zone (NAD83),
 north up. Only the area is read from the sources (they are cloud-optimized
 GeoTIFFs), not whole tiles.
@@ -43,6 +58,11 @@ import rasterio.merge
 import requests
 from pyproj import CRS, Transformer
 from rasterio.enums import Resampling
+from rasterio.vrt import WarpedVRT
+from rasterio.windows import from_bounds
+
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+import lidar  # noqa: E402
 
 TNM_API = "https://tnmaccess.nationalmap.gov/api/v1/products"
 DEM_DATASET = "Digital Elevation Model (DEM) 1 meter"
@@ -50,6 +70,21 @@ STAC_API = "https://planetarycomputer.microsoft.com/api/stac/v1"
 TSIS_HSRS = "https://lasp.colorado.edu/lisird/latis/dap/tsis1_hsrs_1nm.csv"
 AERONET_SITES = "https://aeronet.gsfc.nasa.gov/aeronet_locations_v3.txt"
 AERONET_DATA = "https://aeronet.gsfc.nasa.gov/cgi-bin/print_web_data_v3"
+
+
+def get(url, tries=4, **kwargs):
+    """requests.get, retried on timeouts, connection errors and server errors (these services are often busy)."""
+    timeout = kwargs.pop("timeout", 60)
+    for attempt in range(tries):
+        try:
+            r = requests.get(url, timeout=timeout, **kwargs)
+            if r.status_code < 500 or attempt == tries - 1:
+                r.raise_for_status()
+                return r
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == tries - 1:
+                raise
+        print(f"retrying {url}", file=sys.stderr)
 
 
 def utm_crs(lon: float) -> CRS:
@@ -73,16 +108,36 @@ def lonlat_bbox(bounds, crs: CRS):
     return (min(lons), min(lats), max(lons), max(lats))
 
 
-def dem_tiles(bbox):
-    """URLs of the 1 m DEM tiles that cover the bounding box, newest project first."""
-    params = {"datasets": DEM_DATASET, "bbox": ",".join(map(str, bbox)), "max": 100, "outputFormat": "JSON"}
-    items = requests.get(TNM_API, params=params, timeout=60).json()["items"]
+def dem_projects(bbox):
+    """The 1 m DEM projects with tiles in the bounding box, newest first: {project: tile URLs}."""
+    params = {"datasets": DEM_DATASET, "bbox": ",".join(map(str, bbox)), "max": 200, "outputFormat": "JSON"}
+    items = get(TNM_API, params=params).json()["items"]
     if not items:
         sys.exit("no 3DEP 1 m DEM covers this area")
     items.sort(key=lambda i: i["publicationDate"], reverse=True)
-    # one project only: tiles of different projects overlap and may disagree
-    project = items[0]["title"].split()[-1]
-    return project, [i["downloadURL"] for i in items if i["title"].endswith(project)]
+    projects = {}
+    for i in items:
+        # .../Elevation/1m/Projects/<project>/TIFF/<tile>.tif
+        project = i["downloadURL"].split("/Projects/")[-1].split("/")[0]
+        projects.setdefault(project, []).append(i["downloadURL"])
+    return projects
+
+
+def read_dem(bounds, crs: CRS, nodata=-999999.0):
+    """The DEM over the area at 1 m, its transform, its project and its tiles' URLs: of the newest project that covers
+    the whole area (tiles of different projects overlap and may disagree), else of all projects, the newer covering
+    the older."""
+    projects = dem_projects(lonlat_bbox(bounds, crs))
+    for project, urls in projects.items():
+        dem, transform, _ = merge(["/vsicurl/" + u for u in urls], bounds, 1.0, Resampling.bilinear, nodata)
+        if not (dem == nodata).any():
+            return dem, transform, project, urls
+        print(f"DEM: {project} does not cover the whole area", file=sys.stderr)
+    urls = [u for us in projects.values() for u in us]
+    dem, transform, _ = merge(["/vsicurl/" + u for u in urls], bounds, 1.0, Resampling.bilinear, nodata)
+    if (dem == nodata).any():
+        sys.exit("the DEMs do not cover the whole area")
+    return dem, transform, " + ".join(projects), urls
 
 
 def naip_items(bounds, crs: CRS, date: datetime.date):
@@ -100,7 +155,7 @@ def naip_items(bounds, crs: CRS, date: datetime.date):
 
 def aeronet_daily(lat: float, lon: float, date: datetime.date, radius_km: float):
     """The nearest AERONET site with Level 2.0 data on `date` within `radius_km`, and its daily averages (CSV)."""
-    lines = requests.get(AERONET_SITES, timeout=60).text.splitlines()
+    lines = get(AERONET_SITES).text.splitlines()
     sites = []
     for line in lines[2:]:
         name, slon, slat, *_ = line.split(",")
@@ -112,13 +167,51 @@ def aeronet_daily(lat: float, lon: float, date: datetime.date, radius_km: float)
     for d, name in sorted(sites):
         params = {"site": name, "year": date.year, "month": date.month, "day": date.day, "year2": date.year,
                   "month2": date.month, "day2": date.day, "AOD20": 1, "AVG": 20, "if_no_html": 1}
-        text = requests.get(AERONET_DATA, params=params, timeout=60).text
+        text = get(AERONET_DATA, params=params).text
         # (the service also returns neighbouring days)
         rows = [l for l in text.splitlines() if l.startswith(f"{name},{date:%d:%m:%Y},")]
         if rows:
             header = next(l for l in text.splitlines() if l.startswith("AERONET_Site,"))
             return name, d, header + "\n" + "\n".join(rows) + "\n"
     return None
+
+
+S2_BANDS = ["B02", "B03", "B04", "B08"]      # blue, green, red, near infrared (10 m)
+S2_CLOUDY = (3, 8, 9, 10)                   # SCL: cloud shadow, cloud (medium, high probability), cirrus
+
+
+def read_warped(href, bounds, crs, res, resampling):
+    """A band of a cloud-optimized GeoTIFF, warped onto the area's grid at `res`."""
+    with rasterio.open(href) as src, WarpedVRT(src, crs=crs, resampling=resampling) as vrt:
+        window = from_bounds(*bounds, transform=vrt.transform)
+        w, h = int(round((bounds[2] - bounds[0]) / res)), int(round((bounds[3] - bounds[1]) / res))
+        return vrt.read(1, window=window, out_shape=(h, w), resampling=resampling)
+
+
+def sentinel2(bounds, crs: CRS, date: datetime.date, days: int):
+    """The clearest Sentinel-2 L2A pass over the area within `days` of `date` (the nearest of those with < 1% of
+    clouds over it, else the least cloudy): its surface reflectance in bands 2, 3, 4, 8 and its SCL, on a 10 m grid."""
+    catalog = pystac_client.Client.open(STAC_API, modifier=planetary_computer.sign_inplace)
+    span = f"{date - datetime.timedelta(days=days)}/{date + datetime.timedelta(days=days)}"
+    items = list(catalog.search(collections=["sentinel-2-l2a"], bbox=lonlat_bbox(bounds, crs), datetime=span,
+                                query={"eo:cloud_cover": {"lt": 50}}).items())
+    items.sort(key=lambda i: (abs((i.datetime.date() - date).days), i.properties["eo:cloud_cover"]))
+    best = None
+    for item in items:
+        scl = read_warped(item.assets["SCL"].href, bounds, crs, 10.0, Resampling.nearest)
+        cloudy = float(np.isin(scl, S2_CLOUDY).mean() + (scl == 0).mean())      # 0: no data
+        if best is None or cloudy < best[1]:
+            best = (item, cloudy, scl)
+        if cloudy < 0.01:
+            break
+    if best is None:
+        return None
+    item, cloudy, scl = best
+    # baseline 04.00 and later (from 2022-01-25) add 1000 to the digital numbers
+    offset = -1000 if float(item.properties.get("s2:processing_baseline", "0")) >= 4 else 0
+    bands = [(read_warped(item.assets[b].href, bounds, crs, 10.0, Resampling.bilinear).astype(np.float32) + offset) / 1e4
+             for b in S2_BANDS]
+    return item, cloudy, np.stack(bands + [scl.astype(np.float32)])
 
 
 def merge(urls, bounds, res, resampling, nodata=None):
@@ -150,6 +243,13 @@ def main():
     parser.add_argument("--date", type=datetime.date.fromisoformat, default=datetime.date(2022, 7, 19),
                         help="choose the NAIP year nearest this date, and AERONET's data of it (default 2022-07-19)")
     parser.add_argument("--aeronet-radius", type=float, default=50, help="km (default 50)")
+    parser.add_argument("--lidar", action="store_true", help="also make a surface model from 3DEP's lidar")
+    parser.add_argument("--lidar-project", help="a 3DEP collection to use (part of its name; default: the newest "
+                        "that covers the area, from the Entwine Point Tiles if any)")
+    parser.add_argument("--lidar-cache", type=pathlib.Path, default=pathlib.Path.home() / ".cache/wave_tracer/lidar",
+                        help="where the point clouds are kept (default ~/.cache/wave_tracer/lidar)")
+    parser.add_argument("--sentinel2", action="store_true", help="also fetch Sentinel-2's surface reflectance")
+    parser.add_argument("--sentinel2-days", type=int, default=20, help="search window around --date (default 20)")
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -157,13 +257,23 @@ def main():
     bounds = aoi_bounds(args.lat, args.lon, args.size, crs)
     print(f"area: {args.size:g} m square around {args.lat}, {args.lon}: {crs.name} {bounds}")
 
-    project, urls = dem_tiles(lonlat_bbox(bounds, crs))
+    dem, dem_transform, project, urls = read_dem(bounds, crs)
     print(f"DEM: 3DEP 1 m project {project}, {len(urls)} tile(s)")
-    nodata = -999999.0
-    dem, dem_transform, _ = merge(["/vsicurl/" + u for u in urls], bounds, 1.0, Resampling.bilinear, nodata)
-    if (dem == nodata).any():
-        sys.exit("the DEM does not cover the whole area")
     write(args.out_dir / "dem.tif", dem.astype(np.float32), dem_transform, crs)
+
+    lidar_info = None
+    if args.lidar:
+        dsm, cls, lidar_info = lidar.fetch(bounds, crs, dem[0].astype(np.float64), args.lidar_cache, args.lidar_project)
+        write(args.out_dir / "dsm.tif", dsm[None], dem_transform, crs)
+        write(args.out_dir / "lidar_class.tif", cls[None], dem_transform, crs)
+        classes = {int(c): float(np.mean(cls == c)) for c in np.unique(cls)}
+        print(f"lidar: {lidar_info['returns']:,} returns ({lidar_info['returns'] / args.size**2:.1f}/m²); heights in "
+              f"{'m' if lidar_info['height_unit_m'] == 1 else 'US survey ft'}, datum offset from the DEM "
+              f"{lidar_info['datum_offset_m']:+.2f} m; {lidar_info['filled_from_dem']:.1%} of cells without returns "
+              f"(from the DEM); {lidar_info['spikes_removed']:.3%} spikes removed; highest {np.max(dsm - dem[0]):.1f} m "
+              "above ground; classes "
+              + ", ".join(f"{c}: {f:.1%}" for c, f in classes.items()))
+        lidar_info = {"dsm": "dsm.tif", "classes": "lidar_class.tif", "resolution_m": 1.0, **lidar_info}
 
     items = naip_items(bounds, crs, args.date)
     naip_res = min(i.properties["gsd"] for i in items)
@@ -173,10 +283,23 @@ def main():
         print("warning: the NAIP imagery leaves parts of the area empty", file=sys.stderr)
     write(args.out_dir / "naip.tif", naip, naip_transform, crs)
 
-    solar = requests.get(TSIS_HSRS, timeout=120)
-    solar.raise_for_status()
+    solar = get(TSIS_HSRS, timeout=120)
     (args.out_dir / "tsis1_hsrs_1nm.csv").write_text(solar.text)
     print("solar spectrum: TSIS-1 HSRS (1 nm)")
+
+    s2_info = None
+    if args.sentinel2:
+        found = sentinel2(bounds, crs, args.date, args.sentinel2_days)
+        if found is None:
+            print(f"Sentinel-2: no pass within {args.sentinel2_days} days of {args.date}", file=sys.stderr)
+        else:
+            item, cloudy, s2 = found
+            transform = rasterio.transform.from_origin(bounds[0], bounds[3], 10.0, 10.0)
+            write(args.out_dir / "sentinel2.tif", s2, transform, crs)
+            print(f"Sentinel-2: {item.id}, {cloudy:.1%} of the area cloudy or empty")
+            s2_info = {"file": "sentinel2.tif", "item": item.id, "datetime": item.datetime.isoformat(),
+                       "bands": ["blue (B02)", "green (B03)", "red (B04)", "nir (B08)", "SCL"],
+                       "cloudy_fraction": round(cloudy, 4), "source": "Sentinel-2 Level-2A (Planetary Computer)"}
 
     aeronet = aeronet_daily(args.lat, args.lon, args.date, args.aeronet_radius)
     if aeronet:
@@ -195,13 +318,16 @@ def main():
                 "tiles": urls, "vertical_datum": "NAVD88"},
         "naip": {"file": "naip.tif", "resolution_m": naip_res, "bands": ["red", "green", "blue", "nir"],
                  "items": [i.id for i in items], "dates": sorted({str(i.datetime.date()) for i in items})},
+        "lidar": lidar_info,
+        "sentinel2": s2_info,
         "date": str(args.date),
         "aeronet": {"file": "aeronet.csv", "site": aeronet[0], "distance_km": round(aeronet[1], 2)} if aeronet else None,
         "solar_spectrum": {"file": "tsis1_hsrs_1nm.csv", "source": "TSIS-1 HSRS, 1 nm resolution", "url": TSIS_HSRS,
                            "units": "W/m^2/nm at 1 AU"},
     }
     (args.out_dir / "site.json").write_text(json.dumps(site, indent=2) + "\n")
-    print(f"wrote {args.out_dir}/dem.tif, naip.tif, tsis1_hsrs_1nm.csv, site.json")
+    extra = ("dsm.tif, lidar_class.tif, " if lidar_info else "") + ("sentinel2.tif, " if s2_info else "")
+    print(f"wrote {args.out_dir}/dem.tif, naip.tif, {extra}tsis1_hsrs_1nm.csv, site.json")
 
 
 if __name__ == "__main__":

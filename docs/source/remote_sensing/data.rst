@@ -44,6 +44,31 @@ Being uniform and well measured, it is a good first check of absolute radiometry
      - Planetary Computer collections ``sentinel-2-l1c``/``sentinel-2-l2a``; SentiWiki document library
 
 
+Towns
+-----
+
+The :doc:`gallery`'s cities add a surface model from lidar (``fetch_site.py --lidar``) and Sentinel-2's surface reflectance (``--sentinel2``), to which ``materials.py`` calibrates NAIP.
+Each site's DEM, NAIP and AERONET data come from the sources above.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 42 20 20
+
+   * - Data
+     - What
+     - Terms
+     - Access
+   * - USGS 3DEP lidar point clouds
+     - Classified returns (ground, vegetation, building, water, bridge, noise) of 3DEP's collections, typically 2–20 points per m² in towns, in each collection's own coordinate system and vertical datum.
+       ``lidar.py`` reads them from the Entwine Point Tiles (octrees in EPSG:3857) when the collection has them, else from the LAZ tiles of The National Map (e.g. ``MD_4County_2_D24``, which has no EPT).
+     - Public domain
+     - EPT: AWS Open Data, ``s3://usgs-lidar-public`` (Hobu, Inc. and USGS; index: `hobuinc/usgs-lidar <https://github.com/hobuinc/usgs-lidar>`_); LAZ: TNM Access API, dataset "Lidar Point Cloud (LPC)"
+   * - Sentinel-2 L2A
+     - Surface reflectance at 10 m (bands 2, 3, 4, 8) and the scene classification, of the clearest pass within 20 days of the site's date.
+     - Free and open (Copernicus)
+     - Planetary Computer STAC, collection ``sentinel-2-l2a``
+
+
 Sun, materials and atmosphere
 -----------------------------
 

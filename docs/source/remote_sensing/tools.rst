@@ -12,6 +12,18 @@ Tools
    ./build/wave_tracer render --gpu sites/railroad_valley/scene.xml -o out
    uv run tools/remote_sensing/toa.py sites/railroad_valley/scene.json out/camera.exr out/toa.exr
 
+A town needs its buildings and trees: ``--lidar`` adds a surface model from 3DEP's lidar, and ``--sentinel2`` the Sentinel-2 surface reflectance that calibrates NAIP;
+``materials.py`` then maps surface classes, each with its own materials, and ``build_scene.py`` meshes the surface model (the :doc:`gallery`'s cities):
+
+.. code-block:: sh
+
+   uv run tools/remote_sensing/fetch_site.py sites/reno --lat 39.533 --lon -119.814 --date 2022-06-15 \
+       --lidar --sentinel2                                                       # ~1 GB of point clouds, ~5 min
+   python tools/remote_sensing/atmosphere.py sites/reno --time 2022-06-15T18:39:19Z
+   uv run tools/remote_sensing/materials.py sites/reno                           # classes; ~3 min
+   uv run tools/remote_sensing/build_scene.py sites/reno --time 2022-06-15T18:39:19Z   # 8.4 M triangles, ~1 min
+   ./build/wave_tracer render --gpu sites/reno/scene.xml -o out_reno -D spp=64
+
 To image the scene onto a detector, render it on a grid finer than the detector's (here 4 × 4 render pixels per detector pixel), then:
 
 .. code-block:: sh
@@ -26,13 +38,22 @@ To image the scene onto a detector, render it on a grid finer than the detector'
        tools/remote_sensing/event_camera.json out_k4/events.npz --duration 0.01 --preview out_k4/events.png
    uv run tools/remote_sensing/preview.py out_k4/dn.exr out_k4/dn.jpg --per-band                    # a viewable image
 
-``fetch_site.py OUT_DIR [--lat --lon --size --date --aeronet-radius]``
+``fetch_site.py OUT_DIR [--lat --lon --size --date --aeronet-radius --lidar --lidar-project --lidar-cache --sentinel2 --sentinel2-days]``
    Fetches, for a square area in the conterminous US (default: 2048 m around the RadCalNet site at Railroad Valley Playa), the USGS 3DEP 1 m elevation (``dem.tif``), the NAIP orthophoto nearest ``--date`` (``naip.tif``, default 2022-07-19), the TSIS-1 solar spectrum (``tsis1_hsrs_1nm.csv``), and AERONET's Level 2.0 daily averages of ``--date`` from the nearest site within ``--aeronet-radius`` (``aeronet.csv``, default 50 km; Railroad Valley's is 0.8 km away), with ``site.json`` describing them.
    Both rasters share the area's bounds in its UTM zone (NAD83); only the area is read from the sources (cloud-optimized GeoTIFFs).
+   The DEM is the newest 3DEP project that covers the whole area (else the projects' tiles merged, newest first): a project's tiles can stop at a state line.
    See :doc:`data` for the sources and their terms.
 
+   ``--lidar`` adds a surface model, ``dsm.tif`` (``lidar.py``): the highest return of each 1 m cell of a 3DEP lidar collection (the newest that covers the area, or ``--lidar-project``), and its ASPRS class (``lidar_class.tif``: ground, vegetation, building, water, bridge).
+   The returns come from 3DEP's Entwine Point Tiles on AWS, of which only the octree's nodes over the area are read, else from 3DEP's LAZ tiles (whole tiles, from a slower server); both are kept in ``--lidar-cache`` (``~/.cache/wave_tracer/lidar``).
+   Noise classes are dropped, the collection's vertical datum is matched to the DEM's (by the median difference of its ground returns), cells without returns take the DEM's height, and isolated spikes (a cell with at most 2 of its 24 neighbours within 8 m below it: wires, birds, missed noise) are lowered to their surroundings.
+   ``--sentinel2`` adds ``sentinel2.tif``: Sentinel-2's Level-2A surface reflectance (bands 2, 3, 4, 8 and the scene classification) of the clearest pass within ``--sentinel2-days`` (20) of ``--date``, on the area's 10 m grid, which ``materials.py`` calibrates NAIP with.
+
 ``build_scene.py SITE_DIR [options]``
-   Writes ``terrain.ply`` (the elevation as a mesh, every ``--mesh-spacing`` DEM pixels: 2 m, ~2 M triangles for 2048 m) and ``scene.xml``:
+   Writes ``terrain.ply`` (the elevation as a mesh, every ``--mesh-spacing`` pixels) and ``scene.xml``.
+   The elevation is the lidar surface model if the site has one (``--surface dsm``: roofs and tree crowns, flat-shaded triangles every 1 m, 8.4 M triangles for 2048 m), else the bare-earth DEM (``--surface dem``: every 2 m, ~2 M triangles, with vertex normals).
+   With ``materials.py``'s classes, the terrain is split by class instead (``terrain_<class>.ply``: each triangle the class at its centroid; steep triangles, over 60°, that are not vegetation are walls, ``terrain_wall.ply``), each with its own reflectance.
+   The scene has:
 
    * the scene frame of the ``satellite_frame`` sensor (x east, y up, z south, origin on the ground at the area's centre);
    * a ``satellite_frame`` camera (``--altitude``, ``--view-zenith``, ``--view-azimuth``, ``--gsd``, ``--pixel-pitch``, ``--pixels``) recording band-averaged radiance in W/m²/sr/µm in four placeholder bands (blue 450–520, green 520–600, red 630–690, near infrared 760–900 nm);
@@ -41,11 +62,12 @@ To image the scene onto a detector, render it on a grid finer than the detector'
      The render is then the top-of-atmosphere radiance that comes straight from the ground; ``scene.json`` gives ``toa.py`` what it needs to add the rest. The ``satellite_frame`` camera's rays start inside the sky.
      Without an atmosphere, radiances are of the surface, under the top-of-atmosphere sun.
 
-   * the terrain's reflectance: with ``materials.json`` (from ``materials.py``), a ``spectral_mix`` of the materials' spectra weighted by their abundances (``materials.exr``).
+   * the terrain's reflectance: with ``materials.json`` (from ``materials.py``), a ``spectral_mix`` of the materials' spectra weighted by their abundances (``materials.exr``); with classes, each class's (``materials_<class>.exr``), and the walls' material.
      Without it, or with ``--reflectance R``, a placeholder, ``reflectance.png``: spectrally flat, scaled from NAIP's brightness so that its median is R (default 0.35).
 
 
    The scene's defines ``spp`` and ``ray_tracing`` (beams by default) can be overridden with ``-D``.
+   ``--fsd``/``--no-fsd`` turn the beams' free-space diffraction by the terrain's edges on or off: on by default for the DEM, off for the surface model, whose millions of sharp edges make it slow and leave fireflies (and diffraction by metre-sized edges is negligible at these wavelengths).
 
 ``atmosphere.py SITE_DIR [--time --view-zenith --view-azimuth --aot550 --water --ozone]``
    Computes the atmosphere at the site with 6S (Vermote et al. 1997), at 400–1000 nm every 2.5 nm (6S's resolution), for the sun at ``--time`` and the camera's view: a continental aerosol model with AERONET's optical depth at 550 nm (from 500 nm and the 440–870 nm Ångström exponent) and precipitable water, ozone 0.30 cm-atm, the ground at the site's elevation. Writes ``atmosphere.json``: the direct and total transmittances down and up, the diffuse upward transmittances of molecules and of aerosols, the gases' transmittances (down, up and two-way: in absorption bands the two-way one is not the product), the spherical albedo and the intrinsic reflectance.
@@ -62,6 +84,19 @@ To image the scene onto a detector, render it on a grid finer than the detector'
    NAIP is not radiometrically calibrated: its 8-bit values are taken to be proportional to radiance, its median pixel to be the first material, and each band is scaled accordingly (its bands taken to be the Leica ADS100's boxes: blue 420–492, green 533–587, red 604–664, near infrared 833–920 nm).
    NAIP's mosaics vary in colour over hundreds of metres (vignetting, seams between flight lines), so of its colour only the detail finer than ``--colour-scale`` (default 256 m) is kept; brightness is kept at every scale.
    At Railroad Valley: 99.1% playa, 0.7% concrete, 2.0% asphalt (mean abundances; they need not sum to one), with an RMS residual of 0.0009 in reflectance.
+
+   With ``--classes`` (the default for a site with a lidar surface model and ``sentinel2.tif``), a town's surfaces are mapped by class instead:
+
+   #. NAIP is calibrated to surface reflectance, per band, by a robust linear fit of its means over Sentinel-2's 10 m pixels (clear land) to Sentinel-2's Level-2A reflectance.
+   #. Each NAIP pixel gets a class, from the lidar's classes and heights above the bare earth and NAIP's NDVI (``--ndvi``, 0.3; ``--min-height``, 2.5 m): water, building, tree, grass or ground (roads, pavement, bare soil). ``classes.png`` has them.
+      Collections can leave most of a river's returns unclassified, so low, dark cells within 300 m of water returns and within 1 m of their height are water too.
+   #. NAIP's own shadows are found (the sun's direction during NAIP's flight is fitted: the one whose shadows, cast by the surface model, best match NAIP's dark pixels), and shadowed pixels take the reflectance of the nearest sunlit pixel of their class: the renderer casts its own shadows.
+   #. Each class is unmixed into four materials, chosen from its candidates (USGS spectra; ``--class-material CLASS:NAME=SOURCE`` replaces them) as the four whose mixtures best fit the class's sunlit pixels.
+      The candidates (``CLASS_CANDIDATES``): for ground, asphalt, concrete, dry mud, lawn, dark and tan paving bricks, dry grass and sand; for grass, green, dry, mixed and cheat grass, dry mud and asphalt; for trees, maple, walnut, oak and aspen leaves, dry grass and asphalt (gaps in the crowns); for buildings, white and green fibreglass roofing, light grey, dark grey and tan asphalt shingles, tar roofing, red and light grey building bricks, concrete and galvanized sheet metal; for water, coastal seawater, water with 0.5 and 5 g/l of clay, and marsh water.
+      Here abundances are fractions of the surface: they sum to at most one, the rest being shade finer than NAIP's pixels, so that each material keeps its own brightness.
+   #. Walls, which NAIP does not see, get one material, ``--wall-material`` (default a light grey building brick).
+
+   ``materials_<class>.exr`` has each class's abundances.
 
 ``toa.py SCENE_JSON RENDER.exr OUT.exr [--components]``
    Adds to a render of a scene with an atmosphere, per band, the path radiance (sunlight scattered towards the camera by the atmosphere) and the adjacency effect: the render averaged with 6S's environment function (a satellite's, corrected for the view zenith; it reaches kilometres, so beyond the image the ground is taken to be as bright as the image's mean) times the ratio of diffuse to direct upward transmittance. ``--components`` also writes them separately.

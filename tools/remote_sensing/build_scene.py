@@ -5,8 +5,15 @@
 """Builds a wave_tracer scene of a site fetched by fetch_site.py.
 
 Writes into the site directory:
-  terrain.ply      the DEM as a triangle mesh, with vertex normals and texture
-                   coordinates
+  terrain.ply      the terrain as a triangle mesh, with texture coordinates:
+                   the lidar surface model (fetch_site.py --lidar: roofs, tree
+                   crowns) at 1 m, with flat triangles; else (or with
+                   --surface dem) the bare-earth DEM, with vertex normals
+  terrain_<class>.ply
+                   instead, with materials of classes (materials.py
+                   --classes): the terrain's triangles of each class (by its
+                   centroid in classes.png), the steep ones that are not
+                   vegetation (walls) in terrain_wall.ply
   reflectance.png  without materials.json: a 16-bit linear reflectance map
   sky.ply          with an atmosphere: the sky, a hemisphere around the scene
   <name>.xml       the scene: the terrain, the sun, the sky, and a
@@ -41,7 +48,8 @@ radiance, and the ground's light that the atmosphere scatters into the view
 
 The terrain's reflectance is that of the materials that materials.py mapped
 (SITE_DIR/materials.json): a spectral_mix of their spectra, weighted by their
-abundances (materials.exr). Without them, or with --reflectance, a
+abundances (materials.exr); with classes, each class's own (materials_<class>
+.exr), and the walls' one material. Without them, or with --reflectance, a
 placeholder: spectrally flat, scaled from NAIP's brightness so that its median
 is --reflectance (default .35). (NAIP is not radiometrically calibrated; its
 RGB would also leave the near infrared dark.)
@@ -59,7 +67,6 @@ import datetime
 import json
 import math
 import pathlib
-import struct
 
 import numpy as np
 import rasterio
@@ -72,14 +79,15 @@ BANDS = {"blue": (450, 520), "green": (520, 600), "red": (630, 690), "nir": (760
 
 
 def write_ply(path, vertices, normals, uvs, faces):
+    """A binary PLY mesh; without vertex normals if `normals` is None."""
     with open(path, "wb") as f:
         f.write(("ply\nformat binary_little_endian 1.0\n"
                  f"element vertex {len(vertices)}\n"
                  "property float x\nproperty float y\nproperty float z\n"
-                 "property float nx\nproperty float ny\nproperty float nz\n"
+                 + ("" if normals is None else "property float nx\nproperty float ny\nproperty float nz\n") +
                  "property float u\nproperty float v\n"
                  f"element face {len(faces)}\nproperty list uchar int vertex_indices\nend_header\n").encode())
-        v = np.concatenate([vertices, normals, uvs], axis=1).astype("<f4")
+        v = np.concatenate([vertices] + ([] if normals is None else [normals]) + [uvs], axis=1).astype("<f4")
         f.write(v.tobytes())
         fc = np.empty(len(faces), dtype=[("n", "u1"), ("i", "<i4", (3,))])
         fc["n"] = 3
@@ -88,7 +96,8 @@ def write_ply(path, vertices, normals, uvs, faces):
 
 
 def terrain(dem_path, spacing: int, centre_en, centre_h):
-    """The DEM, sampled every `spacing` pixels (at pixel centres), as a mesh in the scene frame."""
+    """A height map (the DEM, or the surface model), sampled every `spacing` pixels (at pixel centres), as a mesh in
+    the scene frame."""
     with rasterio.open(dem_path) as ds:
         dem = ds.read(1).astype(np.float64)
         west, north = ds.transform.c, ds.transform.f
@@ -115,6 +124,42 @@ def terrain(dem_path, spacing: int, centre_en, centre_h):
     return vertices, normals, E.reshape(-1), N.reshape(-1), faces
 
 
+def face_classes(vertices, E, N, faces, materials, site_dir, tex_bounds, wall_slope=60.0):
+    """Each face's class of materials.json (an index into its classes; the wall after them): the class (classes.png)
+    at its centroid; the wall if steeper than `wall_slope` degrees and not vegetation."""
+    names = [c["name"] for c in materials["classes"]]
+    ids = np.array([c["id"] for c in materials["classes"]])
+    cmap = np.asarray(Image.open(site_dir / materials["class_map"]))
+    h, w = cmap.shape
+    ce, cn = E[faces].mean(axis=1), N[faces].mean(axis=1)
+    col = np.clip(((ce - tex_bounds.left) / (tex_bounds.right - tex_bounds.left) * w).astype(int), 0, w - 1)
+    row = np.clip(((tex_bounds.top - cn) / (tex_bounds.top - tex_bounds.bottom) * h).astype(int), 0, h - 1)
+    lookup = np.full(256, names.index("ground") if "ground" in names else 0)     # no data (0): ground
+    lookup[ids] = np.arange(len(ids))
+    fc = lookup[cmap[row, col]]
+    if materials.get("wall"):
+        v = vertices[faces]
+        n = np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0])
+        steep = np.abs(n[:, 1]) < np.cos(np.radians(wall_slope)) * np.linalg.norm(n, axis=1)
+        vegetation = np.isin(fc, [names.index(c) for c in ("grass", "tree") if c in names])
+        fc[steep & ~vegetation] = len(names)
+    return fc
+
+
+def write_class_meshes(site_dir, vertices, uvs, faces, fc, names):
+    """A mesh of each class's faces, terrain_<name>.ply (without normals). Returns the classes with faces, and their
+    numbers of faces."""
+    written = []
+    for i, name in enumerate(names):
+        f = faces[fc == i]
+        if not len(f):
+            continue
+        used, inverse = np.unique(f, return_inverse=True)
+        write_ply(site_dir / f"terrain_{name}.ply", vertices[used], None, uvs[used], inverse.reshape(-1, 3))
+        written.append((name, len(f)))
+    return written
+
+
 def reflectance_map(naip_path, out_path, mean_reflectance):
     """The placeholder reflectance: NAIP's brightness (mean of red, green, blue), scaled so that its median is
     `mean_reflectance`. Returns its mean."""
@@ -132,6 +177,7 @@ def terrain_bsdf(site_dir, nm, placeholder_reflectance, naip_path):
     materials_path = site_dir / "materials.json"
     if placeholder_reflectance is None and materials_path.exists():
         materials = json.loads(materials_path.read_text())
+        assert "classes" not in materials       # see class_bsdfs
         wl = np.asarray(materials["wavelength_nm"])
         if nm[0] < wl[0] or nm[-1] > wl[-1]:
             raise SystemExit(f"{materials_path} covers {wl[0]:g}-{wl[-1]:g} nm, not {nm[0]:g}-{nm[-1]:g} nm")
@@ -164,6 +210,44 @@ def terrain_bsdf(site_dir, nm, placeholder_reflectance, naip_path):
 				<string name="wrap_mode" value="clamp"/>
 			</texture>
 		</bsdf>''', np.full(len(nm), mean)
+
+
+def class_bsdfs(materials, nm):
+    """Of materials.json of classes (materials.py --classes): each class's diffuse BSDF (XML; the wall's, of its one
+    material, is uniform), and the site's mean reflectance, at wavelengths `nm`."""
+    wl = np.asarray(materials["wavelength_nm"])
+    if nm[0] < wl[0] or nm[-1] > wl[-1]:
+        raise SystemExit(f"materials.json covers {wl[0]:g}-{wl[-1]:g} nm, not {nm[0]:g}-{nm[-1]:g} nm")
+    bsdfs = {}
+    for c in materials["classes"] + ([materials["wall"]] if materials.get("wall") else []):
+        spectra = {name: np.interp(nm, wl, r) for name, r in c["reflectance"].items()}
+        sources = ", ".join(f"{m['name']} ({m['source']})" for m in c["materials"])
+        if c["weights"] is None:
+            (name, r), = spectra.items()
+            bsdfs[c["name"]] = f'''<!-- {c["name"]}: {sources} -->
+\t\t<bsdf type="diffuse">
+\t\t\t<spectrum name="reflectance" type="piecewise_linear">
+{spectrum_xml(nm, r, 4)}
+\t\t\t</spectrum>
+\t\t</bsdf>'''
+            continue
+        spectra_xml = "\n".join(f'''\t\t\t\t<spectrum type="piecewise_linear" id="{c["name"]}_{name}">
+{spectrum_xml(nm, r, 5)}
+\t\t\t\t</spectrum>''' for name, r in spectra.items())
+        bsdfs[c["name"]] = f'''<!-- {c["name"]}: {sources} -->
+\t\t<bsdf type="diffuse">
+\t\t\t<texture name="reflectance" type="spectral_mix">
+\t\t\t\t<texture name="weights" type="bitmap">
+\t\t\t\t\t<path value="{c["weights"]}"/>
+\t\t\t\t\t<string name="filter_type" value="bilinear"/>
+\t\t\t\t\t<string name="wrap_mode" value="clamp"/>
+\t\t\t\t</texture>
+{spectra_xml}
+\t\t\t</texture>
+\t\t</bsdf>'''
+    mean = np.interp(nm, wl, materials["mean_reflectance"])
+    print(f"materials: classes {', '.join(bsdfs)}; mean reflectance at 550 nm {np.interp(550, nm, mean):.3f}")
+    return bsdfs, mean
 
 
 def solar_spectrum(csv_path, nm):
@@ -243,10 +327,18 @@ def main():
     p.add_argument("--pixels", type=int, default=1920, help="film width and height (default 1920)")
     p.add_argument("--spp", type=int, default=16, help="samples per pixel (default 16)")
     p.add_argument("--ray-tracing", action="store_true", help="trace rays rather than beams")
-    p.add_argument("--mesh-spacing", type=int, default=2, help="DEM pixels between mesh vertices (default 2)")
+    p.add_argument("--surface", choices=["dsm", "dem"],
+                   help="the terrain's heights: the lidar surface model (buildings, trees; the default if the site "
+                        "has one) or the bare-earth DEM")
+    p.add_argument("--mesh-spacing", type=int,
+                   help="height map pixels between mesh vertices (default 1 for the surface model, 2 for the DEM)")
     p.add_argument("--reflectance", type=float,
                    help="use a placeholder reflectance map of this median rather than SITE_DIR/materials.json "
                         "(default, without it: .35)")
+    p.add_argument("--fsd", action=argparse.BooleanOptionalAction,
+                   help="free-space diffraction by the terrain's edges (beams only; default: on for the DEM, off for "
+                        "the surface model, whose many sharp edges make it slow and spiky, while diffraction by "
+                        "metre-sized edges is negligible at these wavelengths)")
     p.add_argument("--no-atmosphere", action="store_true", help="ignore SITE_DIR/atmosphere.json")
     p.add_argument("--sky-radius", type=float, default=100e3, help="m (default 100 km)")
     args = p.parse_args()
@@ -256,14 +348,32 @@ def main():
     centre_en = ((west + east) / 2, (south + north) / 2)
     centre_h = site["centre"]["elevation_m"]
 
-    vertices, normals, E, N, faces = terrain(args.site_dir / site["dem"]["file"], args.mesh_spacing, centre_en, centre_h)
+    surface = args.surface or ("dsm" if site.get("lidar") else "dem")
+    if surface == "dsm" and not site.get("lidar"):
+        raise SystemExit("--surface dsm needs the site's lidar surface model: fetch_site.py --lidar")
+    height_map = site["lidar"]["dsm"] if surface == "dsm" else site["dem"]["file"]
+    spacing = args.mesh_spacing or (1 if surface == "dsm" else 2)
+    vertices, normals, E, N, faces = terrain(args.site_dir / height_map, spacing, centre_en, centre_h)
     naip_path = args.site_dir / site["naip"]["file"]
     with rasterio.open(naip_path) as ds:
-        tex_bounds = ds.bounds      # materials.exr and reflectance.png are on NAIP's grid
+        tex_bounds = ds.bounds      # the materials' weights and reflectance.png are on NAIP's grid
     uvs = np.stack([(E - tex_bounds.left) / (tex_bounds.right - tex_bounds.left),
                     (N - tex_bounds.bottom) / (tex_bounds.top - tex_bounds.bottom)], axis=-1)
-    write_ply(args.site_dir / "terrain.ply", vertices, normals, uvs, faces)
-    print(f"terrain: {len(vertices)} vertices, {len(faces)} triangles; relief {vertices[:, 1].min():.2f} .. {vertices[:, 1].max():.2f} m")
+    print(f"terrain: {height_map}, {len(vertices)} vertices, {len(faces)} triangles; relief "
+          f"{vertices[:, 1].min():.2f} .. {vertices[:, 1].max():.2f} m")
+    # the surface model's edges (walls, crowns) are sharp: flat triangles; the DEM is smooth: vertex normals
+    face_normals = surface == "dsm"
+    fsd = args.fsd if args.fsd is not None else surface != "dsm"
+    materials_path = args.site_dir / "materials.json"
+    materials = json.loads(materials_path.read_text()) if materials_path.exists() and args.reflectance is None else None
+    classes = materials is not None and "classes" in materials
+    if classes:
+        names = [c["name"] for c in materials["classes"]] + (["wall"] if materials.get("wall") else [])
+        fc = face_classes(vertices, E, N, faces, materials, args.site_dir, tex_bounds)
+        meshes = write_class_meshes(args.site_dir, vertices, uvs, faces, fc, names)
+        print("terrain classes: " + ", ".join(f"{n} {k / len(faces):.1%}" for n, k in meshes))
+    else:
+        write_ply(args.site_dir / "terrain.ply", vertices, None if face_normals else normals, uvs, faces)
 
     zen, az = solar_position(args.time, site["centre"]["lat"], site["centre"]["lon"])
     d = earth_sun_distance(args.time.date())
@@ -283,7 +393,20 @@ def main():
     E0 = solar_spectrum(args.site_dir / site["solar_spectrum"]["file"], nm) / d**2
     mus = math.cos(z)
     in_band = {name: (nm >= lo) & (nm <= hi) for name, (lo, hi) in BANDS.items()}
-    terrain_xml, mean_reflectance = terrain_bsdf(args.site_dir, nm, args.reflectance, naip_path)
+    if classes:
+        bsdfs, mean_reflectance = class_bsdfs(materials, nm)
+        shapes = [(f"terrain_{name}.ply", bsdfs[name]) for name, _ in meshes]
+    else:
+        bsdf_xml, mean_reflectance = terrain_bsdf(args.site_dir, nm, args.reflectance, naip_path)
+        shapes = [("terrain.ply", bsdf_xml)]
+    terrain_xml = "".join(f'''
+\t<shape type="ply">
+\t\t<path value="{path}"/>
+\t\t<quantity name="scale" value="1m"/>
+\t\t<boolean name="face_normals" value="{str(face_normals).lower()}"/>
+\t\t{bsdf_xml}
+\t</shape>
+''' for path, bsdf_xml in shapes)
 
     atm_path = args.site_dir / "atmosphere.json"
     atm = None
@@ -349,9 +472,10 @@ def main():
                                   for b, m in in_band.items()},
         }
 
+    lidar_note = f"; surface: 3DEP lidar, {site['lidar']['collection']}" if surface == "dsm" else ""
     xml = f'''<?xml version="1.0" encoding="utf-8"?>
 <!-- Generated by tools/remote_sensing/build_scene.py from {args.site_dir.name}: {site["size_m"]:g} m around
-     {site["centre"]["lat"]}, {site["centre"]["lon"]} ({site["dem"]["source"]}, {site["dem"]["project"]}; NAIP {", ".join(site["naip"]["dates"])}).
+     {site["centre"]["lat"]}, {site["centre"]["lon"]} ({site["dem"]["source"]}, {site["dem"]["project"]}{lidar_note}; NAIP {", ".join(site["naip"]["dates"])}).
      Frame: x east, y up, z south, metres, origin on the ground at the centre ({centre_h:.2f} m NAVD88).
      Camera: {args.altitude / 1e3:g} km, view zenith {args.view_zenith:g}°, azimuth {args.view_azimuth:g}°, {args.gsd:g} m GSD at nadir.
      Pixels record band-averaged radiance, W/m²/sr/µm, {radiance_where}.
@@ -363,6 +487,7 @@ def main():
 	<integrator type="plt_path">
 		<integer name="max_depth" value="4"/>
 		<string name="direction" value="backward"/>
+		<boolean name="FSD" value="{str(fsd).lower()}"/>
 	</integrator>
 
 	<sensor type="satellite_frame" id="camera">
@@ -393,17 +518,12 @@ def main():
 {spectrum_xml(nm, sun_irradiance, 3)}
 		</spectrum>
 	</emitter>
-{sky_xml}
-	<shape type="ply">
-		<path value="terrain.ply"/>
-		<quantity name="scale" value="1m"/>
-		{terrain_xml}
-	</shape>
-</scene>
+{sky_xml}{terrain_xml}</scene>
 '''
     (args.site_dir / f"{args.name}.xml").write_text(xml)
     (args.site_dir / f"{args.name}.json").write_text(json.dumps(sidecar, indent=1) + "\n")
-    print(f"wrote {args.site_dir}/terrain.ply, {'sky.ply, ' if atm is not None else ''}{args.name}.xml, "
+    print(f"wrote {args.site_dir}/{', '.join(path for path, _ in shapes)}, {'sky.ply, ' if atm is not None else ''}"
+          f"{args.name}.xml, "
           f"{args.name}.json; camera focal length {focal_length:g} m")
 
 
