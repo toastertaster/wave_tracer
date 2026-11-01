@@ -956,7 +956,8 @@ WT_GPU_FN u32 trace_bdpt_path(const WT_GPU_THREAD plt_scene& scene, const WT_GPU
     // the emitter and the wavenumber (scene_t::sample_emitter_and_spectrum), and the sensor element
     const u32 ei = sample_emitter(scene, rnd.r());
     if (spectral==choose_spectral)
-        spectral = table + ei*scene.samples_per_emitter + spectral_sample_for_path(path, scene.samples_per_emitter);
+        spectral = table + ei*scene.samples_per_emitter +
+                   spectral_sample_for_path(path, scene.samples_per_emitter, u64(scene.film.width)*scene.film.height);
     const spectral_sample spec = scene.spectra[spectral];
     const u32 element = u32(path % (u64(scene.film.width)*scene.film.height));
     const u32 ex = element % scene.film.width;

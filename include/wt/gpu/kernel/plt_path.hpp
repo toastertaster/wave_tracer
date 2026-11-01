@@ -1165,17 +1165,25 @@ WT_GPU_FN u32 sample_emitter(const WT_GPU_THREAD plt_scene& scene, real u) {
 WT_GPU_CONSTANT constexpr u32 choose_spectral = 0xffffffffu;
 
 /**
- * @brief Which of an emitter's `count` spectral samples path `path` takes: a
- *        hash of the path index, so that the samples of a sensor element
- *        take different ones (and not the path's random numbers).
+ * @brief Which of an emitter's `count` spectral samples path `path` takes
+ *        (of a film of `elements` elements: path `path` is sample
+ *        path/elements of element path%elements). The samples, stratified
+ *        over the spectrum (see src/gpu/renderer.cpp), are taken along a
+ *        Weyl sequence of the element's sample index, from a hash of the
+ *        element: an element's successive samples spread evenly over the
+ *        spectrum (each band of a multispectral sensor gets its share), as
+ *        the CPU's do (plt_path_t::integrate), and different elements start
+ *        at different samples. (Not the path's random numbers.)
  */
-WT_GPU_FN u32 spectral_sample_for_path(u64 path, u32 count) {
-    // the splitmix64 finalizer
-    u64 z = path + 0x9e3779b97f4a7c15ull;
+WT_GPU_FN u32 spectral_sample_for_path(u64 path, u32 count, u64 elements) {
+    // the splitmix64 finalizer, of the element
+    u64 z = path % elements + 0x9e3779b97f4a7c15ull;
     z = (z ^ (z>>30)) * 0xbf58476d1ce4e5b9ull;
     z = (z ^ (z>>27)) * 0x94d049bb133111ebull;
     z = z ^ (z>>31);
-    return u32(z>>32) % count;
+    // the golden ratio's fraction, in 32-bit fixed point: x/2^32 = start + sample*0.618... (mod 1)
+    const u32 x = u32(z>>32) + u32(path / elements) * 0x9e3779b9u;
+    return u32((u64(x) * count) >> 32);
 }
 
 /**
@@ -1194,7 +1202,8 @@ WT_GPU_FN path_state_t<P> start_path(const WT_GPU_THREAD plt_scene& scene, rng r
     path_state_t<P> p;
     const u32 ei = sample_emitter(scene, rnd.r());
     p.spectral = spectral!=choose_spectral ? spectral :
-        table + ei*scene.samples_per_emitter + spectral_sample_for_path(path, scene.samples_per_emitter);
+        table + ei*scene.samples_per_emitter +
+        spectral_sample_for_path(path, scene.samples_per_emitter, u64(scene.film.width)*scene.film.height);
     p.prev_dpd = 0;
 
     if (scene.params.backward!=0) {

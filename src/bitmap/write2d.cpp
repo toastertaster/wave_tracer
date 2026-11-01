@@ -50,7 +50,7 @@ void wt::bitmap::write_bitmap2d_exr(const std::filesystem::path &path,
         if (c<channel_names.size()) return channel_names[c];
         if (components==1) return "L";
         static constexpr std::array<char, 4> RGBA = { 'R', 'G', 'B', 'A' };
-        if (c >= 0 && c < 4) return std::string{ 1,RGBA[c] };
+        if (c < 4) return std::string(1, RGBA[c]);
         return std::string{ "X" };
     };
 

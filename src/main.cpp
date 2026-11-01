@@ -252,7 +252,8 @@ void write_out(const std::filesystem::path& output_dir,
                const std::string& scene_name,
                const std::string& sensor_id,
                const std::size_t spe,
-               const wt::bitmap::colour_encoding_type_e colour_encoding) {
+               const wt::bitmap::colour_encoding_type_e colour_encoding,
+               const std::vector<std::string>& channel_names = {}) {
     std::map<std::string,std::string> attributes;
     attributes["renderer"] = "wave_tracer " + wt::wt_version_t{}.short_version_string();
     attributes["scene"]    = scene_name;
@@ -269,7 +270,7 @@ void write_out(const std::filesystem::path& output_dir,
         << "..." << '\n';
 
     if (colour_encoding == wt::bitmap::colour_encoding_type_e::linear)
-        wt::bitmap::write_bitmap2d_exr(output_dir / (filename + ".exr"), bm, {}, attributes);
+        wt::bitmap::write_bitmap2d_exr(output_dir / (filename + ".exr"), bm, channel_names, attributes);
     else {
         auto bm16 = bm.convert_texels<std::uint16_t>();
         // TODO: indicate colourspace for bitmap writer
@@ -307,9 +308,14 @@ inline void write_out_2d(
         const wt::bitmap::colour_encoding_type_e colour_encoding,
         bool postprocess) {
     if (!postprocess) {
-        // write out as is
+        // write out as is, naming the channels as the sensor's response does
+        std::vector<std::string> channel_names;
+        if (const auto* response = sensor.sensor_response(); response)
+            channel_names = response->channel_names();
+        if (channel_names.size()!=developed_film.components())
+            channel_names.clear();
         write_out(output_dir, sensor_name, developed_film,
-                  scene_name, sensor_name, spe_written, colour_encoding);
+                  scene_name, sensor_name, spe_written, colour_encoding, channel_names);
     } else {
         // watermark
         auto developed = developed_film;

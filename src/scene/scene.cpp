@@ -89,3 +89,10 @@ scene::element::info_t scene_t::description() const {
         }
     };
 }
+
+emitter_wavenumber_sample_t scene_t::sample_emitter_and_spectrum(
+        const sensor::sensor_t* sensor,
+        f_t spectral_u) const noexcept {
+    const auto* scs = get_scene_sensor(sensor);
+    return scs->sample_emitter_and_spectrum(*this, sampler(), spectral_u);
+}
