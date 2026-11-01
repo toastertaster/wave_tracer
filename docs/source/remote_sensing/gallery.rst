@@ -4,6 +4,7 @@ Gallery
 The Railroad Valley Playa scene (:doc:`tools`) on 2022-07-19, at Sentinel-2B's pass (the sun at a zenith of 26.25°), seen at nadir from 500 km by a ``satellite_frame`` camera of 2.5 m focal length, in four bands (blue 450–520, green 520–600, red 630–690, near infrared 760–900 nm), and imaged by the example instruments.
 Rendered on the GPU (an NVIDIA GB10, CUDA + OptiX build, ray tracing) at ``f565eed``; times as the command line reports them (``Elapsed``, without loading the scene's 2.16 M triangles, ~40 s).
 The images (but the events') are previews of the EXR outputs, made with ``preview.py``: values mapped linearly from the range given (by default from percentiles of the values), then sRGB-encoded.
+Where a preview is binned, cropped or zoomed, its caption links to a JPEG of the whole image at full resolution, made the same way.
 
 .. list-table::
    :header-rows: 1
@@ -53,12 +54,12 @@ The playa fills almost all of the 1920 m: the facility near its centre (roads, s
    .. grid-item-card:: True colour (red, green, blue)
       :img-top: ../_static/remote_sensing/toa_rgb.jpg
 
-      1920 m, binned 3 × 3.
+      1920 m, binned 3 × 3. `Full resolution (1920², 1.7 MB) <../_static/remote_sensing/full/rrv_toa_rgb.jpg>`__.
 
    .. grid-item-card:: Colour infrared (near infrared, red, green)
       :img-top: ../_static/remote_sensing/toa_cir.jpg
 
-      1920 m, binned 3 × 3.
+      1920 m, binned 3 × 3. `Full resolution (1920², 1.8 MB) <../_static/remote_sensing/full/rrv_toa_cir.jpg>`__.
 
 .. figure:: ../_static/remote_sensing/toa_facility.jpg
    :width: 60%
@@ -72,12 +73,12 @@ The playa fills almost all of the 1920 m: the facility near its centre (roads, s
    .. grid-item-card:: Surface radiance, blue
       :img-top: ../_static/remote_sensing/surface_blue.jpg
 
-      ``noatm.xml``: the ground under the top-of-atmosphere sun, without an atmosphere. 142–166 W/m²/sr/µm.
+      ``noatm.xml``: the ground under the top-of-atmosphere sun, without an atmosphere. 142–166 W/m²/sr/µm. `Full resolution (1920², 1.3 MB) <../_static/remote_sensing/full/rrv_surface_blue.jpg>`__.
 
    .. grid-item-card:: Top-of-atmosphere radiance, blue
       :img-top: ../_static/remote_sensing/toa_blue.jpg
 
-      ``scene.xml`` and ``toa.py``, on the same scale: the atmosphere attenuates the ground's contrast, the path radiance offsets it, and the adjacency effect blurs it.
+      ``scene.xml`` and ``toa.py``, on the same scale: the atmosphere attenuates the ground's contrast, the path radiance offsets it, and the adjacency effect blurs it. `Full resolution (1920², 0.9 MB) <../_static/remote_sensing/full/rrv_toa_blue.jpg>`__.
 
 
 Materials
@@ -103,17 +104,17 @@ Each band is stretched over its own percentiles.
    .. grid-item-card:: Radiance
       :img-top: ../_static/remote_sensing/detector_ideal.jpg
 
-      ``toa.py``'s output, binned to the detector's pixels: no blur, no noise.
+      ``toa.py``'s output, binned to the detector's pixels: no blur, no noise. `Full resolution (the 4096² render, 9.4 MB) <../_static/remote_sensing/full/rrv_k4_toa_rgb.jpg>`__.
 
    .. grid-item-card:: Frame camera
       :img-top: ../_static/remote_sensing/detector_frame.jpg
 
-      ``instrument.json``: 0.4 m telescope, 0.1 ms exposure; 551–1238 electrons, SNR 23–35.
+      ``instrument.json``: 0.4 m telescope, 0.1 ms exposure; 551–1238 electrons, SNR 23–35. `Full resolution (1024², 0.7 MB) <../_static/remote_sensing/full/rrv_detector_frame.jpg>`__.
 
    .. grid-item-card:: TDI camera
       :img-top: ../_static/remote_sensing/detector_tdi.jpg
 
-      ``instrument_tdi.json``: 16 stages, 141.6 µs lines, 100 Hz jitter; 1.2–2.8 × 10⁴ electrons, SNR 110–166.
+      ``instrument_tdi.json``: 16 stages, 141.6 µs lines, 100 Hz jitter; 1.2–2.8 × 10⁴ electrons, SNR 110–166. `Full resolution (1024², 0.6 MB) <../_static/remote_sensing/full/rrv_detector_tdi.jpg>`__.
 
 .. figure:: ../_static/remote_sensing/events.png
    :width: 60%
@@ -249,7 +250,7 @@ Manhattan's fits worst: NAIP's off-nadir views lean its towers over the streets 
    .. grid-item-card:: Goddard Space Flight Center
       :img-top: ../_static/remote_sensing/city_gsfc.jpg
 
-      1920 m, binned 3 × 3.
+      1920 m, binned 3 × 3. `Full resolution (1920², 1.8 MB) <../_static/remote_sensing/full/city_gsfc.jpg>`__.
 
    .. grid-item-card:: Goddard, 640 m at 1 m
       :img-top: ../_static/remote_sensing/city_gsfc_crop.jpg
@@ -259,7 +260,7 @@ Manhattan's fits worst: NAIP's off-nadir views lean its towers over the streets 
    .. grid-item-card:: UMBC
       :img-top: ../_static/remote_sensing/city_umbc.jpg
 
-      1920 m, binned 3 × 3.
+      1920 m, binned 3 × 3. `Full resolution (1920², 1.8 MB) <../_static/remote_sensing/full/city_umbc.jpg>`__.
 
    .. grid-item-card:: UMBC, 640 m at 1 m
       :img-top: ../_static/remote_sensing/city_umbc_crop.jpg
@@ -269,7 +270,7 @@ Manhattan's fits worst: NAIP's off-nadir views lean its towers over the streets 
    .. grid-item-card:: Reno
       :img-top: ../_static/remote_sensing/city_reno.jpg
 
-      1920 m, binned 3 × 3.
+      1920 m, binned 3 × 3. `Full resolution (1920², 1.7 MB) <../_static/remote_sensing/full/city_reno.jpg>`__.
 
    .. grid-item-card:: Reno, 640 m at 1 m
       :img-top: ../_static/remote_sensing/city_reno_crop.jpg
@@ -279,7 +280,7 @@ Manhattan's fits worst: NAIP's off-nadir views lean its towers over the streets 
    .. grid-item-card:: Fresno
       :img-top: ../_static/remote_sensing/city_fresno.jpg
 
-      1920 m, binned 3 × 3.
+      1920 m, binned 3 × 3. `Full resolution (1920², 1.7 MB) <../_static/remote_sensing/full/city_fresno.jpg>`__.
 
    .. grid-item-card:: Fresno, 640 m at 1 m
       :img-top: ../_static/remote_sensing/city_fresno_crop.jpg
@@ -289,7 +290,7 @@ Manhattan's fits worst: NAIP's off-nadir views lean its towers over the streets 
    .. grid-item-card:: Manhattan
       :img-top: ../_static/remote_sensing/city_manhattan.jpg
 
-      1920 m, binned 3 × 3.
+      1920 m, binned 3 × 3. `Full resolution (1920², 2.1 MB) <../_static/remote_sensing/full/city_manhattan.jpg>`__.
 
    .. grid-item-card:: Manhattan, 640 m at 1 m
       :img-top: ../_static/remote_sensing/city_manhattan_crop.jpg
@@ -354,7 +355,7 @@ The input data limit the detail: the surface model is a 1 m grid and NAIP 0.6 m,
    .. grid-item-card:: Manhattan, 4096 m
       :img-top: ../_static/remote_sensing/city_manhattan_4k.jpg
 
-      8192², binned 13 × 13.
+      8192², binned 13 × 13. `Full resolution (8192², 32 MB) <../_static/remote_sensing/full/city_manhattan_4k.jpg>`__.
 
    .. grid-item-card:: 320 m at 0.5 m
       :img-top: ../_static/remote_sensing/city_manhattan_4k_crop.jpg
