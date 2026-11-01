@@ -7,7 +7,8 @@
  *
  */
 
-#include <list>
+#include <array>
+#include <future>
 #include <vector>
 #include <memory>
 
@@ -43,30 +44,22 @@ inline void extract_bvh_nodes(const bvh_t::node_t& bvn,
 }
 
 
-struct work_item_t {
-    const bvh_t::node_t* n;
-};
-struct build_result_t {
-    bvh8w::node_t w8node{};
-
-    std::vector<work_item_t> work_items;
-    idx_t w8_idx;
-
-    int bbvh_nodes_consumed=0;
+// One 8-wide node: up to 8 nodes from the 3 binary levels below a binary node.
+struct w8_build_t {
+    std::array<const bvh_t::node_t*, 8> children;
+    std::uint8_t count = 0;
+    int bbvh_nodes_consumed = 0;
 };
 
-inline auto build_node8w(idx_t w8_idx, 
+inline void build_node8w(bvh8w::node_t& w8node,
+                         w8_build_t& out,
                          const bvh::node_t& bvn,
-                         const aabb_t& parent_aabb,
                          const std::vector<bvh_t::node_cluster_t>& bvnc,
-                         const std::vector<tri_t>& tris,
-                         progress_track_t& pt) {
-    auto ret = build_result_t{ .w8_idx = w8_idx };
-
+                         const std::vector<tri_t>& tris) noexcept {
     // extract 3 levels of nodes from the BVH
     std::vector<const bvh_t::node_t*> bvh_child_nodes;
     bvh_child_nodes.reserve(8);
-    extract_bvh_nodes<3>(bvn, bvnc, bvh_child_nodes, ret.bbvh_nodes_consumed);
+    extract_bvh_nodes<3>(bvn, bvnc, bvh_child_nodes, out.bbvh_nodes_consumed);
 
     std::array<length_t,8> node_min_x, node_max_x, node_min_y, node_max_y, node_min_z, node_max_z;
 
@@ -80,26 +73,24 @@ inline auto build_node8w(idx_t w8_idx,
         node_max_y[c] = n->aabb.max.y;
         node_max_z[c] = n->aabb.max.z;
 
-        // create child construction work item
-        ret.work_items.push_back({ .n=n });
+        out.children[c] = n;
     }
+    out.count = (std::uint8_t)bvh_child_nodes.size();
 
-    ret.w8node.min = pqvec3_w8_t{ node_min_x.data(), node_min_y.data(), node_min_z.data(), simd::unaligned_data };
-    ret.w8node.max = pqvec3_w8_t{ node_max_x.data(), node_max_y.data(), node_max_z.data(), simd::unaligned_data };
-    ret.w8node.tris_start = bvn.tris_offset;
-    ret.w8node.tris_count = bvn.tri_count;
+    w8node.min = pqvec3_w8_t{ node_min_x.data(), node_min_y.data(), node_min_z.data(), simd::unaligned_data };
+    w8node.max = pqvec3_w8_t{ node_max_x.data(), node_max_y.data(), node_max_z.data(), simd::unaligned_data };
+    w8node.tris_start = bvn.tris_offset;
+    w8node.tris_count = bvn.tri_count;
 
 #ifdef DEBUG
     // sanity
-    for (auto t = ret.w8node.tris_start; t<ret.w8node.tris_start+ret.w8node.tris_count; ++t) {
+    for (auto t = w8node.tris_start; t<w8node.tris_start+w8node.tris_count; ++t) {
         const auto& tri = tris[t];
-        assert(parent_aabb.contains<range_inclusiveness_e::inclusive>(tri.a));
-        assert(parent_aabb.contains<range_inclusiveness_e::inclusive>(tri.b));
-        assert(parent_aabb.contains<range_inclusiveness_e::inclusive>(tri.c));
+        assert(bvn.aabb.contains<range_inclusiveness_e::inclusive>(tri.a));
+        assert(bvn.aabb.contains<range_inclusiveness_e::inclusive>(tri.b));
+        assert(bvn.aabb.contains<range_inclusiveness_e::inclusive>(tri.c));
     }
 #endif
-
-    return ret;
 }
 
 void calculate_occupancy(const bvh8w::node_t& n, const std::vector<bvh8w::node_t>& nodes,
@@ -192,47 +183,60 @@ bvh8w_constructor_t::bvh8w_constructor_t(
     // create 8-wide clusters in parallel
     auto w8tris_future = std::async(std::launch::async, [&](){ return create_w8_tris(bvh->tree_tris); });
 
-    // encode 8-wide tree
-    std::list<std::future<build_result_t>> futures;
+    // Encode the 8-wide tree breadth first, a level at a time. A level's nodes are built
+    // in parallel; then, in order, their inner children get the next level's indices and
+    // their leaves the next leaf indices.
     const auto world = bvh->V();
+    std::vector<const bvh_t::node_t*> level = { &bvh->root() };
+    std::vector<w8_build_t> built;
+    constexpr std::size_t chunk = 4096;
 
-    w8nodes.emplace_back();     // create root
-    futures.emplace_back(ctx.threadpool->enqueue([&]() {
-        return build_node8w(0, bvh->root(), world, bvhnc, bvh->tree_tris, pt);
-    }));
-    for (;!futures.empty();) {
-        const auto ret = std::move(futures.front()).get();
-        futures.pop_front();
+    while (!level.empty()) {
+        const auto first = w8nodes.size();
+        w8nodes.resize(first + level.size());
+        built.assign(level.size(), w8_build_t{});
 
-        w8nodes[ret.w8_idx] = ret.w8node;
-        for (auto c=0ul; c<ret.work_items.size(); ++c) {
-            const auto& wi = ret.work_items[c];
-            const auto& n  = *wi.n;
-
-            if (n.is_leaf) {
-                w8_leaf_nodes.emplace_back(bvh8w::leaf_node_t{ .tris_ptr = n.tris_offset, .count = n.tri_count });
-                if (w8_leaf_nodes.size()>limits<std::int32_t>::max())       // panic
-                    throw std::runtime_error("(BVH8w) Too many nodes!");
-
-                w8nodes[ret.w8_idx].child_ptrs[c] = -(std::int32_t)(w8_leaf_nodes.size());  // leaf ptrs have set signs
-            } else {
-                const auto cidx = (idx_t)w8nodes.size();
-                w8nodes.emplace_back();     // create new node
-
-                if (cidx>limits<std::int32_t>::max())       // panic
-                    throw std::runtime_error("(BVH8w) Too many nodes!");
-
-                w8nodes[ret.w8_idx].child_ptrs[c] = (std::int32_t)cidx+1;   // child ptrs have unset signs
-
-                const auto paabb = wi.n->aabb;
-                futures.emplace_back(ctx.threadpool->enqueue([w8idx=cidx, &n, paabb, &bvhnc, &bvh, this]() {
-                    return build_node8w(w8idx, n, paabb, bvhnc, bvh->tree_tris, pt);
+        const auto build_range = [&](std::size_t begin, std::size_t end) {
+            for (auto i=begin; i<end; ++i)
+                build_node8w(w8nodes[first+i], built[i], *level[i], bvhnc, bvh->tree_tris);
+        };
+        if (level.size()<=chunk) {
+            build_range(0, level.size());
+        } else {
+            std::vector<std::future<void>> chunks;
+            for (auto begin=0ul; begin<level.size(); begin+=chunk)
+                chunks.emplace_back(ctx.threadpool->enqueue([&, begin]() {
+                    build_range(begin, std::min(begin+chunk, level.size()));
                 }));
-            }
+            for (auto& f : chunks)
+                f.get();
         }
 
-        completed += ret.bbvh_nodes_consumed;
+        std::vector<const bvh_t::node_t*> next;
+        for (auto i=0ul; i<level.size(); ++i) {
+            auto& w8node = w8nodes[first+i];
+            const auto& b = built[i];
+            for (auto c=0; c<b.count; ++c) {
+                const auto& n = *b.children[c];
+                if (n.is_leaf) {
+                    w8_leaf_nodes.emplace_back(bvh8w::leaf_node_t{ .tris_ptr = n.tris_offset, .count = n.tri_count });
+                    if (w8_leaf_nodes.size()>limits<std::int32_t>::max())       // panic
+                        throw std::runtime_error("(BVH8w) Too many nodes!");
+
+                    w8node.child_ptrs[c] = -(std::int32_t)(w8_leaf_nodes.size());  // leaf ptrs have set signs
+                } else {
+                    const auto cidx = first + level.size() + next.size();
+                    if (cidx>limits<std::int32_t>::max())       // panic
+                        throw std::runtime_error("(BVH8w) Too many nodes!");
+
+                    w8node.child_ptrs[c] = (std::int32_t)cidx+1;   // child ptrs have unset signs
+                    next.push_back(&n);
+                }
+            }
+            completed += b.bbvh_nodes_consumed;
+        }
         pt.set_progress(completed / f_t(total));
+        level = std::move(next);
     }
     assert(completed==total-1);
 

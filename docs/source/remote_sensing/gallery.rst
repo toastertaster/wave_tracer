@@ -128,7 +128,7 @@ Towns and cities
 
 Five sites built by the town workflow of :doc:`tools` (``fetch_site.py --lidar --sentinel2``, ``materials.py --classes``, ``atmosphere.py`` with 6S, ``build_scene.py``), each 2048 m on a side around the given centre and seen at nadir at the Sentinel-2 pass whose surface reflectance calibrated NAIP.
 Each scene is a 2048² vertex surface model from the lidar (a 1 m grid: 8.38 M triangles, split by lidar class into ground, grass, tree, building, water and wall meshes, plus a 64 k triangle sky), with each class's material a per-pixel mix of four library spectra unmixed from calibrated NAIP.
-Rendered on the GPU (NVIDIA GB10, CUDA + OptiX) at 1920², 1 m GSD, 64 samples per pixel, with beams and without forward scattering detection (``--fsd`` is off for surface models); times are the command line's ``Elapsed``, which excludes loading the scene (1–2.5 min, most of it reading the PLY meshes and building the BVH).
+Rendered on the GPU (NVIDIA GB10, CUDA + OptiX) at 1920², 1 m GSD, 64 samples per pixel, with beams and without forward scattering detection (``--fsd`` is off for surface models); times are the command line's ``Elapsed``, which excludes loading the scene (10–20 s).
 The images are ``toa.py``'s top-of-atmosphere radiance (render + path radiance + adjacency effect), each band stretched over its own 0.1–99.9th percentiles: the whole 1920 m binned 3 × 3, and a 640 m window at full resolution.
 
 .. list-table:: Input data

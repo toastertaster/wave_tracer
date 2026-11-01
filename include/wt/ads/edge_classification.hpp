@@ -214,18 +214,12 @@ auto find_edges(
         }));
     }
 
+    // Wait in order: polling and erasing finished workers made waiting quadratic in their count.
     const auto total = (std::uint32_t)workers.size();
     std::uint32_t completed=0;
-    while (!workers.empty()) {
-        for (auto it=workers.begin(); it!=workers.end();) {
-            using namespace std::chrono_literals;
-            if (it->wait_for(10us) == std::future_status::ready) {
-                it = workers.erase(it);
-                pt.set_progress((++completed)/f_t(total));
-            } else {
-                ++it;
-            }
-        }
+    for (auto& w : workers) {
+        w.get();
+        pt.set_progress((++completed)/f_t(total));
     }
 
     if (found_duplicate_tris)

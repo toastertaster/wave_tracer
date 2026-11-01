@@ -30,7 +30,6 @@
 #define BVHBINS 128
 #define HQBVHBINS 256
 #define MAXHQBINS 1024
-static constexpr auto tbvh_optimize_iterations = 32;
 
 #ifdef __GNUC__
 #pragma GCC diagnostic push
@@ -127,8 +126,7 @@ bvh_constructor_t::bvh_constructor_t(
         const wt::wt_context_t& ctx,
         progress_track_t& pt)
 {
-    constexpr auto build_pb = .35f;
-    constexpr auto optimize_pb = .95f;
+    constexpr auto build_pb = .95f;
 
     {
         // extract tris from shapes and initialize bvh_primitives
@@ -209,22 +207,10 @@ bvh_constructor_t::bvh_constructor_t(
             }
 #endif
 
+            // No tinybvh Optimize(): reinserting nodes lowered the SAH cost by at most 1%
+            // (Sponza, kitchen, Sionna scenes; 0.1-0.2% on lidar surface models) while its
+            // single-threaded passes grew from under a second to 13 minutes at 34 M triangles.
             pt.set_progress(build_pb);
-            pt.set_status("tiny_bvh optimize()");
-
-#ifdef TBVH_USE_SINGLES
-            {
-                tinybvh::BVH_Verbose tmp;
-                tmp.progressCallback = [&](f_t p) {
-                    pt.set_progress(p * (optimize_pb-build_pb) + build_pb);
-                };
-                tmp.ConvertFrom(tbvh);
-                tmp.Optimize(tbvh_optimize_iterations);
-                tbvh.ConvertFrom(tmp);
-            }
-#endif
-
-            pt.set_progress(optimize_pb);
         }
 
         const auto sah_cost = tbvh.SAHCost();
