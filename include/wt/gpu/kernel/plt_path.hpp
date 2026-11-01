@@ -1395,22 +1395,23 @@ WT_GPU_FN observed_t<P> emission_hit(const WT_GPU_THREAD plt_scene& scene, u32 s
 }
 
 /**
- * @brief The surface the beam `b` hits at `primary`, along its axis from
- *        `origin`, at the interaction distance `dist`: the intersection `s`,
- *        and its material at spectral sample `spectral`, textured. Returns the
- *        surface's emitter, or no_emitter.
+ * @brief The surface the beam `b` hits at `primary`, at the interaction
+ *        distance `dist`: the intersection `s`, and its material at spectral
+ *        sample `spectral`, textured. Returns the surface's emitter, or
+ *        no_emitter.
  */
 template <bool P>
 WT_GPU_FN u32 hit_surface(const WT_GPU_THREAD plt_scene& scene, u32 spectral, const WT_GPU_THREAD primary_t& primary,
-                          vec3 origin, real dist, const WT_GPU_THREAD beam_t<P>& b,
+                          real dist, const WT_GPU_THREAD beam_t<P>& b,
                           WT_GPU_THREAD surface& s, WT_GPU_THREAD material& mat) {
     const bvh_tri tri = scene.bvh.tris[primary.tri];
     const tri_shading sh = scene.tris[primary.tri];
     mat = scene.materials[spectral*scene.material_count + sh.material];
     s.tri = primary.tri;
-    s.wp = origin + primary.dist*b.dir();
-    s.geo = build_shading_frame(tri.n, sh.dpdu);
+    // interpolated from the triangle, not origin + dist*dir: see the CPU's intersection_surface_t
     const real bz = 1 - primary.baryx - primary.baryy;
+    s.wp = primary.baryx*tri.a + primary.baryy*tri.b + bz*tri.c;
+    s.geo = build_shading_frame(tri.n, sh.dpdu);
     s.shading = build_shading_frame(normalize(primary.baryx*sh.n[0] + primary.baryy*sh.n[1] + bz*sh.n[2]),
                                     sh.dpdu);
     s.fp = b.surface_footprint_static(s.geo, dist);
@@ -1539,7 +1540,7 @@ WT_GPU_FN bool interact(const WT_GPU_THREAD plt_scene& scene,
     material mat;
     u32 surface_emitter = no_emitter;
     if (has_surface)
-        surface_emitter = hit_surface(scene, p.spectral, primary, origin_wp, dist_to_interaction, b, s, mat);
+        surface_emitter = hit_surface(scene, p.spectral, primary, dist_to_interaction, b, s, mat);
 
     // edges: of the triangles around a ballistic intersection, or of the diffusive intersection's
     u32 edge_count = 0;
