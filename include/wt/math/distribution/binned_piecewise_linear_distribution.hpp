@@ -267,7 +267,7 @@ public:
         const auto& b = ys[idx+1];
 
         if (a==b)
-            return vec2_t{ (idx+f)*dx,a };
+            return vec2_t{ xrange.min + (idx+f)*dx,a };
 
         const auto m = m::mix(m::sqr(a), m::sqr(b), f);
         const auto d = m::sqrt(m);
