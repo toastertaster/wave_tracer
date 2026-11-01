@@ -98,6 +98,14 @@ public:
         const auto* scs = get_scene_sensor(sensor);
         return scs->sample_emitter_and_spectrum(*this, sampler());
     }
+    /**
+     * @brief As `sample_emitter_and_spectrum(sensor)`, drawing the wavenumber with the uniform number `spectral_u`
+     *        (see `scene_sensor_t::sample_emitter_and_spectrum`).
+     */
+    // (out of line: inline, it crashes GCC 13.3's IPA modref pass compiling some files that include this header)
+    [[nodiscard]] emitter_wavenumber_sample_t sample_emitter_and_spectrum(
+            const sensor::sensor_t* sensor,
+            f_t spectral_u) const noexcept;
 
     /**
      * @brief Given a sensor and an emitter, samples a wavenumber from the emitter's spectrum (integrated over the

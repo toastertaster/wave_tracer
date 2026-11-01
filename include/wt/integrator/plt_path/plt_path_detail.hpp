@@ -760,15 +760,20 @@ inline spectral_radiant_flux_stokes_t random_walk(
     return {};
 }
 
+/**
+ * @param spectral_u uniform number in [0,1) the wavenumber is drawn with (see
+ *        `scene_t::sample_emitter_and_spectrum`)
+ */
 inline void integrate_backward(
         const integrator_context_t& ctx,
         const sensor::block_handle_t& block,
         const vec3u32_t& sensor_element,
-        const plt_path_t::options_t& opts) noexcept {
+        const plt_path_t::options_t& opts,
+        const f_t spectral_u) noexcept {
     if (opts.max_depth==0) return;
 
     // draw spectral sample
-    const auto emitter_wavenumber = ctx.scene->sample_emitter_and_spectrum(ctx.sensor);
+    const auto emitter_wavenumber = ctx.scene->sample_emitter_and_spectrum(ctx.sensor, spectral_u);
     const auto& k = emitter_wavenumber.wavenumber.k;
 
     // spectral (importance) sampling weight:
