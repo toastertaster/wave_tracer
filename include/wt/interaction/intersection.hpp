@@ -78,11 +78,17 @@ private:
     {}
 
 public:
+    /**
+     * @brief A surface intersection at barycentric position `bary` of a mesh triangle, with geometric normal `geo_n`.
+     *        The world position is interpolated from the triangle's vertices, not propagated along the incident ray
+     *        or beam: a position o + t·d is only as precise as the ulp of the origin's distance, which for a sensor
+     *        hundreds of kilometres away exceeds the self-intersection offsets (`offseted_ray_origin`), whose error
+     *        model assumes positions interpolated from the triangle.
+     */
     intersection_surface_t(const shape_t* shape,
                            const dir3_t& geo_n,
                            const tidx_t mesh_tri_idx,
-                           const barycentric_t& bary,
-                           const pqvec3_t& beam_intersection_centre) noexcept;
+                           const barycentric_t& bary) noexcept;
 
     intersection_surface_t(const shape_t* shape,
                            const tidx_t mesh_tri_idx,
@@ -90,12 +96,10 @@ public:
 
     inline intersection_surface_t(const shape_t* shape,
                                   const ads::tri_t& ads_tri,
-                                  const ray_t& ray,
                                   const intersect::intersect_ray_tri_ret_t& ray_intersection_record) noexcept
         : intersection_surface_t(shape, ads_tri.n,
                                  ads_tri.shape_tri_idx, 
-                                 ray_intersection_record.bary, 
-                                 ray.propagate(ray_intersection_record.dist))
+                                 ray_intersection_record.bary)
     {}
 
     // dummy surface (no associated shape -- like a virtual coverage sensor) intersection

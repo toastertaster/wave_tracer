@@ -194,7 +194,6 @@ inline bool sample_surface_interaction(bdpt_walk_data_t<BeamType>& data,
                                        const ads::tri_t& tri,
                                        const barycentric_t& bary_centre,
                                        const shape_t* shape,
-                                       const pqvec3_t& sampled_tri_wp,
                                        const length_t beam_dist) noexcept {
     const auto  k = data.beam.k();
     const auto& bsdf = shape->get_bsdf();
@@ -202,7 +201,7 @@ inline bool sample_surface_interaction(bdpt_walk_data_t<BeamType>& data,
     // intersection footprint between beam and surface
     auto intersection = intersection_surface_t{ shape, tri.n,
                                                 tri.shape_tri_idx, 
-                                                bary_centre, sampled_tri_wp };
+                                                bary_centre };
     // TODO: accurate footprint
     intersection.footprint = data.beam.surface_footprint_static(intersection, beam_dist);
     // BSDF query and intersection record
@@ -493,12 +492,9 @@ inline void random_walk(bdpt_walk_data_t<BeamType>& data) noexcept {
         const auto& tri = *closest_triangle.primary;
         const auto* shape = data.ctx.scene->shapes()[tri.shape_idx].get();
 
-        // point where beam mean intersects triangle
-        const auto& sampled_tri_wp = origin_wp + envelope.d() * closest_triangle.primary_intersection_record.dist;
-
-        // sample surface interaction
+        // sample surface interaction, where the beam's mean intersects the triangle
         if (!sample_surface_interaction(data, tri, closest_triangle.primary_intersection_record.bary, shape,  
-                                        sampled_tri_wp, beam_dist))
+                                        beam_dist))
             return;
     } else if (!edges->empty()) {  // sampled free-space, do free-space diffraction
         assert(!is_ballistic && data.opts.FSD);

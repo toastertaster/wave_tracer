@@ -638,12 +638,11 @@ inline spectral_radiant_flux_stokes_t random_walk(
     if (wf_intersection.primary) {
         const auto& tri = *wf_intersection.primary;
         const auto* shape = data.ctx.scene->shapes()[tri.shape_idx].get();
-        const auto& sampled_tri_wp = origin_wp + wf_intersection.primary_intersection_record.dist * beam.dir();
 
         wf_intersection.intersection = intersection_surface_t{
             shape, tri.n,
             tri.shape_tri_idx, 
-            wf_intersection.primary_intersection_record.bary, sampled_tri_wp
+            wf_intersection.primary_intersection_record.bary
         };
         // intersection footprint between beam and surface
         // TODO: accurate footprint
