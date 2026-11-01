@@ -41,12 +41,12 @@ template <bool polarimetric>
 class perspective_t final : public film_backed_sensor_t<2, polarimetric> {
     friend class wt::scene_t;
 
+public:
     // the spatial standard deviation of a sourced beam, w.r.t. sensor element size
     static constexpr f_t beam_source_spatial_stddev = .25;
     // the fake distance of the virtual sensor film from the sensor's origin
     static constexpr length_t image_plane_z = 1 * u::cm;
 
-public:
     using film_t = film_backed_sensor_t<2,polarimetric>::film_t;
 
 private:
@@ -56,6 +56,7 @@ private:
     angle_t sensor_fov;
     f_t sourcing_tan_alpha;
     f_t phase_space_extent_scale;
+    length_t near_clip_dist = 0*u::m;
 
     pqvec2_t snsr_extent;
     pqvec2_t snsr_element_extent;
@@ -96,36 +97,10 @@ protected:
         };
     }
 
-public:
-    perspective_t(const wt_context_t &ctx,
-                  std::string id,
-                  transform_t transform,
-                  angle_t fov,
-                  film_t film,
-                  std::uint32_t samples_per_element,
-                  bool ray_trace,
-                  std::shared_ptr<mask::mask_t> sensor_mask = nullptr,
-                  std::optional<f_t> sourcing_tan_alpha = std::nullopt,
-                  f_t phase_space_extent_scale = 1) noexcept
-        : film_backed_sensor_t<2,polarimetric>(
-                ctx,
-                std::move(id),
-                std::move(film),
-                samples_per_element,
-                ray_trace,
-                std::move(sensor_mask)),
-          sensor_transform(transform),
-          sensor_to_camera_trns((
-              transform_t::viewport(vec2_t{ film.dimensions() }) *
-              transform_t::perspective(fov, film.aspect_ratio(), u::to_m(image_plane_z))
-          ).inverse()),
-          sensor_fov(fov),
-          phase_space_extent_scale(phase_space_extent_scale),
-          ddir_dx(point_on_sensor({ 1,0 })-
-                  point_on_sensor({ 0,0 })),
-          ddir_dy(point_on_sensor({ 0,1 })-
-                  point_on_sensor({ 0,0 }))
-    {
+    /**
+     * @brief Completes construction, once the film-to-camera transform is set.
+     */
+    void init(std::optional<f_t> sourcing_tan_alpha) noexcept {
         // z of partial derivatives is expected to be 0
         assert_iszero(u::to_m(ddir_dx.z));
         assert_iszero(u::to_m(ddir_dy.z));
@@ -143,6 +118,83 @@ public:
             sourcing_tan_alpha = (f_t)(pixel_len / image_plane_z);
         }
         this->sourcing_tan_alpha = *sourcing_tan_alpha;
+    }
+
+public:
+    /**
+     * @param fov vertical field of view
+     */
+    perspective_t(const wt_context_t &ctx,
+                  std::string id,
+                  transform_t transform,
+                  angle_t fov,
+                  film_t film,
+                  std::uint32_t samples_per_element,
+                  bool ray_trace,
+                  std::shared_ptr<mask::mask_t> sensor_mask = nullptr,
+                  std::optional<f_t> sourcing_tan_alpha = std::nullopt,
+                  f_t phase_space_extent_scale = 1,
+                  length_t near_clip = 0*u::m) noexcept
+        : film_backed_sensor_t<2,polarimetric>(
+                ctx,
+                std::move(id),
+                std::move(film),
+                samples_per_element,
+                ray_trace,
+                std::move(sensor_mask)),
+          sensor_transform(transform),
+          sensor_to_camera_trns((
+              transform_t::viewport(vec2_t{ film.dimensions() }) *
+              transform_t::perspective(fov, film.aspect_ratio(), u::to_m(image_plane_z))
+          ).inverse()),
+          sensor_fov(fov),
+          phase_space_extent_scale(phase_space_extent_scale),
+          near_clip_dist(near_clip),
+          ddir_dx(point_on_sensor({ 1,0 })-
+                  point_on_sensor({ 0,0 })),
+          ddir_dy(point_on_sensor({ 0,1 })-
+                  point_on_sensor({ 0,0 }))
+    {
+        init(sourcing_tan_alpha);
+    }
+    /**
+     * @brief A perspective sensor of a given film-to-camera transform, for cameras whose pixel geometry is known
+     *        exactly.
+     * @param film_to_camera maps film (pixel) positions (x,y,1,1) to camera-space points on the plane
+     *                       z=image_plane_z, as `point_on_sensor` documents; a projective transform, so that
+     *                       its inverse maps directions (of any length) back to film positions
+     * @param fov vertical field of view, as described by `fov()`
+     */
+    perspective_t(const wt_context_t &ctx,
+                  std::string id,
+                  transform_t transform,
+                  transform_t film_to_camera,
+                  angle_t fov,
+                  film_t film,
+                  std::uint32_t samples_per_element,
+                  bool ray_trace,
+                  std::shared_ptr<mask::mask_t> sensor_mask = nullptr,
+                  std::optional<f_t> sourcing_tan_alpha = std::nullopt,
+                  f_t phase_space_extent_scale = 1,
+                  length_t near_clip = 0*u::m) noexcept
+        : film_backed_sensor_t<2,polarimetric>(
+                ctx,
+                std::move(id),
+                std::move(film),
+                samples_per_element,
+                ray_trace,
+                std::move(sensor_mask)),
+          sensor_transform(transform),
+          sensor_to_camera_trns(film_to_camera),
+          sensor_fov(fov),
+          phase_space_extent_scale(phase_space_extent_scale),
+          near_clip_dist(near_clip),
+          ddir_dx(point_on_sensor({ 1,0 })-
+                  point_on_sensor({ 0,0 })),
+          ddir_dy(point_on_sensor({ 0,1 })-
+                  point_on_sensor({ 0,0 }))
+    {
+        init(sourcing_tan_alpha);
     }
     perspective_t(perspective_t&&) = default;
 
@@ -175,6 +227,26 @@ public:
     }
 
     [[nodiscard]] inline Angle auto fov() const noexcept { return sensor_fov; }
+
+    /**
+     * @brief Distance along each sourced ray, from the sensor, at which the ray starts: geometry nearer is not seen.
+     *        Lets a distant sensor (e.g., a satellite hundreds of kilometres away) start its rays near the scene, so
+     *        that ray queries and the self-intersection offsets of their hits are computed far from the sensor's
+     *        coordinates, whose rounding (an ulp of hundreds of kilometres) would otherwise exceed them.
+     */
+    [[nodiscard]] inline auto near_clip() const noexcept { return near_clip_dist; }
+
+    /**
+     * @brief The start of the ray sourced in world direction `dir`: `position()` advanced by `near_clip()`, computed
+     *        in double precision. Beams sourced there are restarted (`transform_restart`) from the sensor's: their
+     *        extent there is what propagating from the sensor would give.
+     */
+    [[nodiscard]] inline pqvec3_t ray_origin(const dir3_t& dir) const noexcept {
+        if (near_clip_dist<=zero)
+            return position();
+        const auto o = glm::dvec3{ u::to_m(position()) } + double(u::to_m(near_clip_dist)) * glm::dvec3{ vec3_t{ dir } };
+        return pqvec3_t{ vec3_t{ o } * u::m };
+    }
 
     /**
      * @brief Returns the sensor physical extent.
@@ -253,7 +325,10 @@ public:
         const auto recp_dpd = recp_solid_angle_density_for_sample(dir_local);
         const auto P = ray_t{ position(), dir };
 
-        const auto beam = Se(P, recp_dpd, k) * recp_dpd;
+        auto beam = Se(P, recp_dpd, k) * recp_dpd;
+        // start near the scene: the beam as propagated through vacuum to there
+        if (near_clip_dist>zero)
+            beam.transform_restart(ray_origin(dir), near_clip_dist);
 
         assert(m::isfinite(beam.intensity()));
 
