@@ -75,6 +75,7 @@ std::shared_ptr<perspective_t<polarimetric>> perspective_t<polarimetric>::load(
     f_t phase_space_extent_scale = 1;
 
     std::optional<angle_t> requested_alpha;
+    length_t near_clip = 0*u::m;
 
     for (auto& item : node.children_view()) {
     try {
@@ -95,6 +96,7 @@ std::shared_ptr<perspective_t<polarimetric>> perspective_t<polarimetric>::load(
                  !scene::loader::read_attribute(item, "fov_axis", fov_axis) &&
                  !scene::loader::read_attribute(item, "ray_trace_only", ray_trace) &&
                  !scene::loader::read_attribute(item, "phase_space_extent_scale", phase_space_extent_scale) &&
+                 !scene::loader::read_attribute(item, "near_clip", near_clip) &&
                  !scene::loader::load_scene_element(item, sensor_mask, loader, context))
             logger::cwarn()
                 << loader->node_description(item)
@@ -115,6 +117,8 @@ std::shared_ptr<perspective_t<polarimetric>> perspective_t<polarimetric>::load(
 
     if (requested_alpha && requested_alpha<=zero)
         throw scene_loading_exception_t("(perspective sensor loader) 'alpha' must be a positive real", node);
+    if (near_clip<zero)
+        throw scene_loading_exception_t("(perspective sensor loader) 'near_clip' must be non-negative", node);
 
     if (!film)
         throw scene_loading_exception_t("(perspective sensor loader) film must be provided", node);
@@ -146,7 +150,8 @@ std::shared_ptr<perspective_t<polarimetric>> perspective_t<polarimetric>::load(
         ray_trace || context.renderer_force_ray_tracing,
         std::move(sensor_mask),
         requested_alpha ? m::tan(*requested_alpha) : std::optional<f_t>{},
-        phase_space_extent_scale
+        phase_space_extent_scale,
+        near_clip
     );
 }
 template std::shared_ptr<perspective_t<false>> perspective_t<false>::load(

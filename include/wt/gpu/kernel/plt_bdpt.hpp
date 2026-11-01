@@ -495,7 +495,7 @@ WT_GPU_FN u32 bdpt_random_walk(const WT_GPU_THREAD plt_scene& scene, const WT_GP
             // sample_surface_interaction
             surface s;
             material mat;
-            const u32 surface_emitter = hit_surface(scene, spectral, primary, tr.origin, tr.dist, w.b, s, mat);
+            const u32 surface_emitter = hit_surface(scene, spectral, primary, tr.dist, w.b, s, mat);
 
             const vec3 wiworld = -dir;
             const vec3 wi = s.shading.to_local(wiworld);

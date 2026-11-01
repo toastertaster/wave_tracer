@@ -57,14 +57,12 @@ intersection_surface_t::intersection_surface_t(
         const shape_t* shape,
         const dir3_t& geo_n,
         const intersection_surface_t::tidx_t mesh_tri_idx,
-        const barycentric_t& bary,
-        const pqvec3_t& beam_intersection_centre) noexcept
+        const barycentric_t& bary) noexcept
     : intersection_surface_t(shape,
                              geo_n,
                              mesh_tri_idx,
                              bary(shape->get_mesh().triangle(mesh_tri_idx)),
-                             shape->get_mesh().tangent_frame(mesh_tri_idx),
-                             beam_intersection_centre)
+                             shape->get_mesh().tangent_frame(mesh_tri_idx))
 {}
 
 intersection_surface_t::intersection_surface_t(const shape_t* shape,
