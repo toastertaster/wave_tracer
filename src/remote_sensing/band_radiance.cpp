@@ -8,6 +8,7 @@
 */
 
 #include <format>
+#include <set>
 
 #include <wt/remote_sensing/band_radiance.hpp>
 
@@ -43,7 +44,9 @@ struct resampled_band_t {
  *        scene_build_sensor_sampling_data.cpp), whose bins would not resolve a sharper edge, making samples just
  *        inside it very unlikely for their weight.
  */
-resampled_band_t resample_band(const spectrum::spectrum_real_t& band, band_radiance_t::spectral_unit_e unit) {
+resampled_band_t resample_band(const spectrum::spectrum_real_t& band,
+                               const spectrum::spectrum_real_t* transmittance,
+                               band_radiance_t::spectral_unit_e unit) {
     const auto krange = band.wavenumber_range();
     const double kmin = u::to_inv_mm(krange.min), kmax = u::to_inv_mm(krange.max);
     if (!(kmin>0) || !(kmax>kmin) || !std::isfinite(kmax))
@@ -62,7 +65,8 @@ resampled_band_t resample_band(const spectrum::spectrum_real_t& band, band_radia
         // stay inside the band's range despite rounding
         const double s = band.f(m::clamp(k, kmin, kmax) / u::mm);
         const double jacobian = m::two_pi/(k*k) / mm_per_unit;   // dλ/dk, spectral_unit per mm⁻¹
-        values.emplace_back(f_t(k), f_t(s*jacobian));
+        const double t = transmittance ? transmittance->f(k / u::mm) : 1;
+        values.emplace_back(f_t(k), f_t(s*jacobian*t));
         if (i>0)
             integral += (s+prev_s)/2 * (lmax-lmin)/steps / mm_per_unit;
         prev_s = s;
@@ -89,12 +93,13 @@ resampled_band_t resample_band(const spectrum::spectrum_real_t& band, band_radia
 
 band_radiance_t::resampled_t band_radiance_t::resample(
         const std::vector<std::shared_ptr<spectrum::spectrum_real_t>>& bands,
+        const spectrum::spectrum_real_t* transmittance,
         spectral_unit_e unit) {
     if (bands.empty())
         throw std::runtime_error("(band_radiance response) at least one band must be provided");
     resampled_t ret;
     for (const auto& b : bands) {
-        auto r = resample_band(*b, unit);
+        auto r = resample_band(*b, transmittance, unit);
         ret.weighted.emplace_back(std::move(r.weighted));
         ret.integrals.emplace_back(f_t(r.integral));
     }
@@ -103,26 +108,44 @@ band_radiance_t::resampled_t band_radiance_t::resample(
 
 band_radiance_t::band_radiance_t(std::string id,
                                  std::vector<std::shared_ptr<spectrum::spectrum_real_t>> bands,
+                                 std::vector<std::string> band_names,
+                                 std::shared_ptr<spectrum::spectrum_real_t> transmittance,
                                  spectral_unit_e unit,
                                  bool normalize)
     // bands are shared pointers: copying them is cheap, and keeps them valid for resample()
-    : band_radiance_t(id, bands, unit, normalize, resample(bands, unit))
+    : band_radiance_t(id, bands, std::move(band_names), transmittance, unit, normalize,
+                      resample(bands, transmittance.get(), unit))
 {}
 
 band_radiance_t::band_radiance_t(std::string id,
                                  std::vector<std::shared_ptr<spectrum::spectrum_real_t>> bands,
+                                 std::vector<std::string> band_names,
+                                 std::shared_ptr<spectrum::spectrum_real_t> transmittance,
                                  spectral_unit_e unit,
                                  bool normalize,
                                  resampled_t resampled)
     : response_t(id, nullptr),
       bands(std::move(bands)),
+      band_names(std::move(band_names)),
+      transmittance(std::move(transmittance)),
       weighted(id+"_jacobian", std::move(resampled.weighted)),
       band_integral(std::move(resampled.integrals)),
       unit(unit),
       normalized(normalize)
 {
+    if (!this->band_names.empty() && this->band_names.size()!=this->bands.size())
+        throw std::runtime_error("(band_radiance response) one name per band expected");
     for (const auto integral : band_integral)
         band_scale.emplace_back(normalize ? 1/integral : 1);
+}
+
+std::vector<std::string> band_radiance_t::channel_names() const {
+    std::set<std::string> unique;
+    for (const auto& name : band_names) {
+        if (name.empty() || !unique.insert(name).second)
+            return {};
+    }
+    return band_names;
 }
 
 scene::element::info_t band_radiance_t::description() const {
@@ -134,7 +157,7 @@ scene::element::info_t band_radiance_t::description() const {
         integrals.emplace_back(attributes::make_scalar(band_integral[c]));
     }
     const std::string unit_name = unit==spectral_unit_e::nm ? "nm" : "µm";
-    return info_for_scene_element(*this, "band_radiance", {
+    auto ret = info_for_scene_element(*this, "band_radiance", {
         { "bands", attributes::make_array(std::move(channels)) },
         { "band integrals", attributes::make_array(std::move(integrals)) },
         { "spectral unit", attributes::make_string(unit_name) },
@@ -142,6 +165,9 @@ scene::element::info_t band_radiance_t::description() const {
                 "band-averaged spectral radiance (per " + unit_name + ")" :
                 "band radiance (radiance per " + unit_name + " times " + unit_name + ")") },
     });
+    if (transmittance)
+        ret.attribs.emplace("transmittance", attributes::make_element(transmittance.get()));
+    return ret;
 }
 
 std::unique_ptr<sensor::response::response_t> band_radiance_t::load(
@@ -150,14 +176,23 @@ std::unique_ptr<sensor::response::response_t> band_radiance_t::load(
         const scene::loader::node_t& node,
         const wt::wt_context_t &context) {
     std::vector<std::shared_ptr<spectrum::spectrum_real_t>> bands;
+    std::vector<std::string> band_names;
+    std::shared_ptr<spectrum::spectrum_real_t> transmittance;
     std::string unit = "nm";
     bool normalize = false;
 
     for (auto& item : node.children_view()) {
     try {
         std::shared_ptr<spectrum::spectrum_real_t> band;
-        if (scene::loader::load_scene_element(item, band, loader, context))
+        if (item["name"]=="transmittance") {
+            if (!scene::loader::load_scene_element(item, transmittance, loader, context))
+                throw scene_loading_exception_t("(band_radiance response loader) 'transmittance' must be a spectrum", item);
+        }
+        else if (scene::loader::load_scene_element(item, band, loader, context)) {
             bands.emplace_back(std::move(band));
+            // nested elements are loaded without their ids; a reference's is its target's
+            band_names.emplace_back(item["id"]);
+        }
         else if (!scene::loader::read_attribute(item, "spectral_unit", unit) &&
                  !scene::loader::read_attribute(item, "normalize", normalize))
             logger::cwarn()
@@ -175,7 +210,7 @@ std::unique_ptr<sensor::response::response_t> band_radiance_t::load(
 
     try {
         return std::make_unique<band_radiance_t>(
-            std::move(id), std::move(bands),
+            std::move(id), std::move(bands), std::move(band_names), std::move(transmittance),
             unit=="nm" ? spectral_unit_e::nm : spectral_unit_e::um,
             normalize);
     } catch(const std::runtime_error& exp) {

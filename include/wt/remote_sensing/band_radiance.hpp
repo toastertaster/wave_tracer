@@ -31,6 +31,11 @@ namespace wt::remote_sensing {
  *        \f$ d\lambda/dk = 2\pi/k^2 \f$, converted to `spectral_unit`.
  *        The response functions may be given at any wavelengths; they are resampled finely, and are zero outside
  *        their range.
+ *
+ *        An optional `transmittance` spectrum (e.g. the atmosphere's, from the ground to the sensor) multiplies what
+ *        every band records, wavelength by wavelength, but not \f$ \int S \, d\lambda \f$.
+ *
+ *        Channels are named after their bands' ids (`id` attributes), e.g. in EXR files.
  */
 class band_radiance_t final : public sensor::response::response_t {
 public:
@@ -38,7 +43,9 @@ public:
 
 private:
     std::vector<std::shared_ptr<spectrum::spectrum_real_t>> bands;
-    sensor::response::multichannel_t weighted;   // the bands times the Jacobian
+    std::vector<std::string> band_names;
+    std::shared_ptr<spectrum::spectrum_real_t> transmittance;
+    sensor::response::multichannel_t weighted;   // the bands times the Jacobian (and the transmittance)
     std::vector<f_t> band_scale;                 // 1, or 1/∫S dλ with `normalize`
     std::vector<f_t> band_integral;              // ∫S dλ, in spectral_unit
     spectral_unit_e unit;
@@ -49,17 +56,26 @@ private:
         std::vector<f_t> integrals;
     };
     static resampled_t resample(const std::vector<std::shared_ptr<spectrum::spectrum_real_t>>& bands,
+                                const spectrum::spectrum_real_t* transmittance,
                                 spectral_unit_e unit);
 
     band_radiance_t(std::string id,
                     std::vector<std::shared_ptr<spectrum::spectrum_real_t>> bands,
+                    std::vector<std::string> band_names,
+                    std::shared_ptr<spectrum::spectrum_real_t> transmittance,
                     spectral_unit_e unit,
                     bool normalize,
                     resampled_t resampled);
 
 public:
+    /**
+     * @param band_names the channels' names: one per band, or empty
+     * @param transmittance optional (nullptr)
+     */
     band_radiance_t(std::string id,
                     std::vector<std::shared_ptr<spectrum::spectrum_real_t>> bands,
+                    std::vector<std::string> band_names,
+                    std::shared_ptr<spectrum::spectrum_real_t> transmittance,
                     spectral_unit_e unit,
                     bool normalize);
     band_radiance_t(band_radiance_t&&) = default;
@@ -67,6 +83,11 @@ public:
     [[nodiscard]] bitmap::pixel_layout_t pixel_layout() const noexcept override {
         return weighted.pixel_layout();
     }
+
+    /**
+     * @brief The bands' names, or empty if any is missing or repeated.
+     */
+    [[nodiscard]] std::vector<std::string> channel_names() const override;
 
     [[nodiscard]] const f_t f(std::uint32_t channel, const wavenumber_t& k) const noexcept override {
         return channel<band_scale.size() ? weighted.f(channel, k) * band_scale[channel] : 0;
