@@ -45,8 +45,15 @@ void plt_path_t::integrate(const integrator_context_t& ctx,
         for (std::uint32_t sample=0; sample<samples_per_element; ++sample)
             plt_path::integrate_forward(ctx, sensor_element, options);
     } else {
-        for (std::uint32_t sample=0; sample<samples_per_element; ++sample)
-            plt_path::integrate_backward(ctx, block, sensor_element, options);
+        // the element's wavenumbers: stratified over these samples (a Weyl sequence from a random start), so that
+        // they cover the spectrum evenly, e.g. each band of a multispectral sensor gets its share of the samples
+        constexpr double golden = 0.6180339887498949;
+        const double u0 = ctx.scene->sampler().r();
+        for (std::uint32_t sample=0; sample<samples_per_element; ++sample) {
+            const auto u = f_t(m::fract(u0 + golden*sample));
+            plt_path::integrate_backward(ctx, block, sensor_element, options,
+                                         m::min(u, std::nextafter(f_t(1), f_t(0))));
+        }
     }
 }
 

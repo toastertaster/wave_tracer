@@ -108,6 +108,16 @@ private:
     [[nodiscard]] emitter_wavenumber_sample_t sample_emitter_and_spectrum(
             const scene_t& parent,
             sampler::sampler_t& sampler) const noexcept;
+    /**
+     * @brief As `sample_emitter_and_spectrum(parent, sampler)`, but draws the wavenumber with the uniform number
+     *        `spectral_u` (in [0,1)) rather than the sampler's next: with numbers stratified over a sensor element's
+     *        samples, the element's wavenumbers cover the spectrum evenly (each band of a multispectral sensor gets
+     *        its share of the samples), while each one is still distributed as the sampler would draw it.
+     */
+    [[nodiscard]] emitter_wavenumber_sample_t sample_emitter_and_spectrum(
+            const scene_t& parent,
+            sampler::sampler_t& sampler,
+            f_t spectral_u) const noexcept;
 
     /**
      * @brief Samples a wavenumber from an emitter's spectrum (integrated over the sensor's spectrum).
