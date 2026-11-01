@@ -309,3 +309,54 @@ What went into Reno's 640 m window: NAIP (true colour), the lidar surface model 
 
    .. grid-item-card:: Lidar classes
       :img-top: ../_static/remote_sensing/city_reno_classes.jpg
+
+Manhattan at 8192²
+~~~~~~~~~~~~~~~~~~
+
+Renders are not limited to 1920².
+``manhattan_4k`` is 4096 m on a side around the same centre, from the Hudson to the East River and from Union Square to Central Park, built the same way and rendered at 8192², 0.5 m GSD, 64 samples per pixel.
+
+.. code-block:: sh
+
+   uv run tools/remote_sensing/fetch_site.py sites/manhattan_4k --lat 40.754 --lon -73.984 --size 4096 \
+       --date 2022-07-19 --lidar --sentinel2
+   python tools/remote_sensing/atmosphere.py sites/manhattan_4k --time 2022-07-19T15:49:51Z
+   uv run tools/remote_sensing/materials.py sites/manhattan_4k
+   uv run tools/remote_sensing/build_scene.py sites/manhattan_4k --time 2022-07-19T15:49:51Z --pixels 8192 --gsd 0.5
+   ./build/wave_tracer render --gpu sites/manhattan_4k/scene.xml -o out_m4k -D spp=64
+   uv run tools/remote_sensing/toa.py sites/manhattan_4k/scene.json out_m4k/camera.exr out_m4k/toa.exr
+
+.. list-table::
+   :widths: 40 60
+
+   * - Lidar (3DEP ``NY_NewYorkCity``)
+     - 78.8 M returns, 4.7 /m², highest 431 m
+   * - Calibration r² (red, green, blue, nir)
+     - 0.40, 0.39, 0.48, 0.44
+   * - Lidar classes (ground, grass, tree, building, water)
+     - 28.3, 5.5, 7.5, 43.7, 15.0%
+   * - Surface model's triangles by class (ground, grass, tree, building, water, wall)
+     - 33.5 M: 24.6, 5.5, 7.5, 30.0, 14.8, 17.4%
+   * - Time: fetching, ``materials.py``, loading the scene, rendering (``Elapsed``)
+     - about 6 min, 7 min and 1 min; 50 min 50 s
+   * - Peak memory of the render
+     - 36.8 GB
+   * - Mean top-of-atmosphere radiance (blue, green, red, nir)
+     - 69.7, 53.1, 40.1, 28.4 W/m²/sr/µm
+
+Most of the rivers' lidar returns are unclassified (4.6% of the site's cells are classed water), but ``materials.py``'s water rule (:doc:`tools`, step 2) makes the Hudson and the East River water: 15% of the site.
+The rivers are about as bright as the city in the visible, as Sentinel-2 sees them: relative to the site's mean, 0.92–1.20 in the render's visible bands and 0.68–0.77 in the near infrared, against Sentinel-2's 0.84–1.01 and 0.51–0.60.
+The input data limit the detail: the surface model is a 1 m grid and NAIP 0.6 m, so a finer GSD only resamples them.
+
+.. grid:: 1 2 2 2
+   :gutter: 2
+
+   .. grid-item-card:: Manhattan, 4096 m
+      :img-top: ../_static/remote_sensing/city_manhattan_4k.jpg
+
+      8192², binned 13 × 13.
+
+   .. grid-item-card:: 320 m at 0.5 m
+      :img-top: ../_static/remote_sensing/city_manhattan_4k_crop.jpg
+
+      Bryant Park's lawn and plane trees, with the New York Public Library at the lower right (``--crop 3776,3776,640,640``).
