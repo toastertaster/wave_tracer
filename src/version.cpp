@@ -14,6 +14,7 @@
 #include <cassert>
 
 #include <wt/version.hpp>
+#include <wt/remote_sensing/remote_sensing.hpp>
 #include <wt/util/logger/logger.hpp>
 
 #include <GitHash.hpp>
@@ -38,6 +39,8 @@ void wt_version_t::print_wt_version() {
 			<< italic << yellow << " #" << build_string()
 		<< reset << "   by  Shlomi Steinberg" 
 		<< '\n';
+    if (remote_sensing::enabled())
+        wt::logger::cout(verbosity_e::important) << "   with realistic remote sensing" << '\n';
 }
 
 wt_version_t::wt_version_t() {

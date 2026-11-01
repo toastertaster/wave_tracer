@@ -38,6 +38,7 @@ Support for additional features, emitter, sensor and interaction models will be 
    ads/ads
    cli
    gpu/gpu
+   remote_sensing/remote_sensing
    units
    theory
    bib

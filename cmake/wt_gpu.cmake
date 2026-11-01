@@ -19,7 +19,9 @@
 #                      available with GPU_METAL)
 # One backend per build: GPU_CUDA and GPU_METAL are exclusive.
 # The resulting compile definitions (WT_GPU_CUDA, WT_GPU_OPTIX, WT_GPU_METAL,
-# WT_GPU_DBL_PRECISION) are PUBLIC on <target>.
+# WT_GPU_DBL_PRECISION) are PUBLIC on <target>. They, and REALISTIC_REMOTE_SENSING
+# when cmake/wt_remote_sensing.cmake enabled it, are also defined in the
+# backends and in the kernels they compile.
 
 option(GPU_CUDA "Build the CUDA GPU backend" OFF)
 option(GPU_OPTIX "Use OptiX for GPU ray queries (requires GPU_CUDA)" OFF)
@@ -112,6 +114,11 @@ function(wt_add_gpu_backends target)
     if(defines)
         target_compile_definitions(${target} PUBLIC ${defines})
     endif()
+    # The kernels share code with <target>, so they need its feature definitions;
+    # wt_add_remote_sensing() already defined this one on <target>.
+    if(REALISTIC_REMOTE_SENSING)
+        list(APPEND defines REALISTIC_REMOTE_SENSING)
+    endif()
     if(GPU_METAL)
         wt_add_metal_backend(${target} "${defines}")
     endif()
@@ -171,8 +178,11 @@ function(wt_add_metal_backend target defines)
     set(metal_dir "${WT_GPU_ROOT}/src/gpu/metal")
     set(kernel_sources geometry plt layout)
     # Kernels need IEEE-conforming arithmetic (wt/gpu/kernel/math.hpp): no fast math.
+    # The kernels get the backend's definitions, as the CUDA kernels do.
+    list(TRANSFORM defines PREPEND "-D" OUTPUT_VARIABLE kernel_defines)
     set(metal_flags -std=metal3.2 -fno-fast-math -Wno-c++17-extensions
                     -mmacosx-version-min=15.0
+                    ${kernel_defines}
                     "-I${WT_GPU_ROOT}/include" "-I${metal_dir}")
     set(air_files)
     foreach(name ${kernel_sources})

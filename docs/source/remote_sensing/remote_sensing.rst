@@ -1,0 +1,49 @@
+Realistic remote sensing
+=======================================
+
+The fork's ``remote-sensing`` branch extends **wave_tracer** to render realistic Earth-observation imagery: a satellite camera hundreds of kilometres above a terrain scene, lit by the sun through an atmosphere, recorded by a modelled detector.
+It is developed for simulating several kinds of cameras (frame, and later TDI/pushbroom, event and Geiger-mode APD cameras), from the visible and near infrared first, and later the shortwave, longwave and thermal infrared.
+Instrument analysis (stray light, polarization sensitivity, tolerancing) is left to optical design software; the telescope enters as a point-spread function.
+
+These features are unlikely to be merged upstream, so they are compiled only with the CMake option ``REALISTIC_REMOTE_SENSING``:
+
+.. code-block:: sh
+
+   cmake -B build -DCMAKE_BUILD_TYPE=Release -DREALISTIC_REMOTE_SENSING=ON
+   cmake --build build
+   ./build/wave_tracer version     # prints "with realistic remote sensing"
+
+The option combines with the GPU backends (``-DGPU_CUDA=ON`` or ``-DGPU_METAL=ON``).
+Without it, the build is the same as ``main-gpu``'s.
+
+.. toctree::
+   :maxdepth: 1
+
+   data
+
+
+What is gated
+-------------
+
+* Code that only remote sensing needs lives in ``include/wt/remote_sensing/`` and ``src/remote_sensing/``, and is compiled only with the option.
+  Hooks it needs elsewhere (scene loaders, integrators, GPU kernels) are wrapped in ``#if defined(REALISTIC_REMOTE_SENSING)``.
+* General improvements that remote sensing happens to need (e.g. time-varying scenes, environment emitters, bug fixes) are not gated: they land on ``gpu-experiment``/``main-gpu`` and reach ``remote-sensing`` by merging.
+
+``cmake/wt_remote_sensing.cmake`` defines the option and ``wt_add_remote_sensing(<target>)``, which compiles ``src/remote_sensing/`` into the target and defines ``REALISTIC_REMOTE_SENSING`` on it.
+``cmake/wt_gpu.cmake`` passes the definition on to the CUDA and Metal backends and their kernels.
+Builds that embed **wave_tracer** (e.g. the Rust bindings) include the module before ``cmake/wt_gpu.cmake``, and exclude ``src/remote_sensing/`` if they glob the sources.
+
+
+Plan
+----
+
+The first goal is stage one of the simulation: the radiance that reaches the telescope's entrance pupil, rendered by **wave_tracer**, with the telescope's blur applied afterwards from point-spread functions.
+
+0. Scaffolding: the option, its propagation to the GPU backends and the Rust bindings, and the data survey (:doc:`data`).
+1. Reference site: a fetch script and a scene builder for a terrain tile (elevation model and orthophoto) at Railroad Valley Playa, Nevada.
+2. Satellite frame camera: placed by altitude and look angles, with focal length, pixel pitch and pixel count; radiance per band in physical units; precision at orbital distances.
+3. Sun and atmosphere: the top-of-atmosphere solar spectrum and the sun's position; atmospheric transmittance, path radiance and sky light from tables precomputed with a radiative transfer code.
+4. Spectral materials: material maps that refer to measured reflectance spectra.
+5. Detector: point-spread functions, conversion to electrons and digital numbers, noise and quantization.
+6. Time: camera trajectories, platform motion and jitter, TDI and pushbroom cameras; then event cameras.
+7. Later: Geiger-mode APD cameras (time-of-flight rendering), and the shortwave, longwave and thermal infrared (thermal emission).

@@ -205,6 +205,11 @@ else()
     add_executable(wave_tracer ${SRC})
 endif()
 
+# Realistic remote sensing (option REALISTIC_REMOTE_SENSING, OFF by default);
+# before the GPU backends, which compile their kernels with its definition
+include(cmake/wt_remote_sensing.cmake)
+wt_add_remote_sensing(wave_tracer)
+
 # GPU backends (options GPU_CUDA, GPU_OPTIX, GPU_METAL, GPU_DBL_PRECISION, all OFF by default)
 include(cmake/wt_gpu.cmake)
 wt_add_gpu_backends(wave_tracer)
