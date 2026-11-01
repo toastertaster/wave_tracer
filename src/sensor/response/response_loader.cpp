@@ -24,6 +24,10 @@ using namespace wt;
 using namespace sensor::response;
 
 
+std::vector<std::string> response_t::channel_names() const {
+    return {};
+}
+
 std::unique_ptr<response_t> response_t::load(std::string id, 
                                              scene::loader::loader_t* loader, 
                                              const scene::loader::node_t& node, 

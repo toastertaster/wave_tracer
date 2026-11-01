@@ -11,6 +11,7 @@
 
 #include <string>
 #include <memory>
+#include <vector>
 
 #include <wt/spectrum/spectrum.hpp>
 
@@ -59,6 +60,11 @@ public:
      * @brief Returns number of channels in the sensor's pixel layout.
      */
     [[nodiscard]] auto channels() const noexcept { return pixel_layout().components; }
+
+    /**
+     * @brief Names of the channels, e.g. for output files' channels; or empty, for the pixel layout's default names.
+     */
+    [[nodiscard]] virtual std::vector<std::string> channel_names() const;
     
     /**
      * @brief Evaluates the sensor sensitivity function
