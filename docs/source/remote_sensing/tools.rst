@@ -22,6 +22,8 @@ To image the scene onto a detector, render it on a grid finer than the detector'
    uv run tools/remote_sensing/toa.py sites/railroad_valley/scene_k4.json out_k4/camera.exr out_k4/toa.exr
    uv run tools/remote_sensing/detector.py sites/railroad_valley/scene_k4.json out_k4/toa.exr \
        tools/remote_sensing/instrument.json out_k4/dn.exr                                            # 1024² pixels
+   uv run tools/remote_sensing/event_camera.py sites/railroad_valley/scene_k4.json out_k4/toa.exr \
+       tools/remote_sensing/event_camera.json out_k4/events.npz --duration 0.01 --preview out_k4/events.png
 
 ``fetch_site.py OUT_DIR [--lat --lon --size --date --aeronet-radius]``
    Fetches, for a square area in the conterminous US (default: 2048 m around the RadCalNet site at Railroad Valley Playa), the USGS 3DEP 1 m elevation (``dem.tif``), the NAIP orthophoto nearest ``--date`` (``naip.tif``, default 2022-07-19), the TSIS-1 solar spectrum (``tsis1_hsrs_1nm.csv``), and AERONET's Level 2.0 daily averages of ``--date`` from the nearest site within ``--aeronet-radius`` (``aeronet.csv``, default 50 km; Railroad Valley's is 0.8 km away), with ``site.json`` describing them.
@@ -65,20 +67,46 @@ To image the scene onto a detector, render it on a grid finer than the detector'
    The image is taken as a grid on the ground at the nadir sampling distance: off nadir, an approximation.
 
 ``detector.py SCENE_JSON RADIANCE.exr INSTRUMENT.json OUT.exr [--electrons E.exr --seed N]``
-   Images a render (of band-averaged spectral radiance: ``toa.py``'s output, or a render without an atmosphere) through a telescope onto a detector, and writes its digital numbers: one channel of unsigned integers per band.
+   Images a render (of band-averaged spectral radiance: ``toa.py``'s output, or a render without an atmosphere) through a telescope onto a moving detector (a frame, pushbroom or TDI camera), and writes its digital numbers: one channel of unsigned integers per band.
    The render's pixel pitch must divide the detector's (``k`` render pixels per detector pixel, across); its focal length and bands are the scene's (``scene.json``). Per band:
 
-   #. The telescope and the line of sight's jitter blur the radiance, by their modulation transfer functions (in the Fourier domain, with the image extended by reflection): diffraction by a circular aperture with a central obscuration, averaged over the band's wavelengths (weighted by their photons); the wavefront error (Shannon's approximation for a random error, 1 − (W/0.18)² (1 − 4(ν − ½)²), W the RMS error in waves, ν the frequency over the cut-off; good to ~0.15 waves); and Gaussian jitter.
+   #. The telescope blurs the radiance, by its modulation transfer functions (in the Fourier domain, with the image extended by reflection): diffraction by a circular aperture with a central obscuration, averaged over the band's wavelengths (weighted by their photons); the wavefront error (Shannon's approximation for a random error, 1 − (W/0.18)² (1 − 4(ν − ½)²), W the RMS error in waves, ν the frequency over the cut-off; good to ~0.15 waves); and, as a Gaussian, jitter faster than the time steps (``jitter_urad_rms``).
       The render's own blur beyond its pixels' area, the film's Gaussian reconstruction filter (σ ¼ render pixel), is divided out.
-   #. Each detector pixel integrates the ``k`` × ``k`` render pixels on it: the pixel's area (its MTF, and aliasing).
+   #. Each detector pixel integrates the radiance over its area (``k`` × ``k`` render pixels: its MTF, and aliasing), where the platform's motion puts its footprint at each time step of its exposure (between render pixels, by cubic spline interpolation).
    #. Radiance becomes electrons: *L* Δλ (λ̄/*hc*) *A* Ω τ η *t*, Δλ and λ̄ the band's width and centre, *A* the pixel's area, Ω the projected solid angle of the (annular) aperture from the focal plane, τ the optics' transmittance, η the quantum efficiency, *t* the integration time.
    #. Noise and quantization: photo-response non-uniformity multiplies the signal and dark current adds to it (with its own non-uniformity), both fixed patterns of the instrument's seed; Poisson shot noise of both; the full well clips; Gaussian read noise adds; the converter divides by its gain, adds its offset, rounds and clips to its bits.
 
-   ``INSTRUMENT.json`` gives the telescope (``aperture_diameter_m``, ``obscuration``, ``transmittance``, ``wavefront_error_nm_rms``), ``jitter_urad_rms`` (per axis), and the detector (``pixel_pitch_m``, ``integration_time_s``, ``quantum_efficiency``, ``full_well_e``, ``read_noise_e``, ``dark_current_e_per_s``, ``prnu``, ``dsnu``, ``gain_e_per_dn``, ``offset_dn``, ``adc_bits``, ``fixed_pattern_seed``); any value may be given per band, as an object keyed by band.
-   ``tools/remote_sensing/instrument.json`` is an example: a 1 m GSD frame camera at 500 km (2.5 m focal length, 5 µm pixels) with a 0.4 m telescope (f/6.25, obscuration 0.3, 40 nm RMS wavefront error), 0.2 µrad of jitter, and a 0.1 ms exposure (0.7 m of the platform's motion, not yet modelled).
-   It prints per band the electrons per unit radiance, the mean signal and its SNR, λ*N*/*p*, and the MTF at the detector's Nyquist frequency; ``--electrons`` also writes the signal's electrons without noise.
+   Time: the scene is rendered once, and the platform's motion moves the pixels' footprints over that render (which ignores the parallax and the change of view during an acquisition: right over a TDI line's few milliseconds, approximate for a pushbroom scan of a whole scene with relief).
+   The footprints move along the render's columns (its rows are along track: north–south, as ``satellite_frame`` cameras look at nadir), at the ground speed of a circular orbit at the scene's altitude (or ``platform.ground_speed_m_s``), less ``platform.motion_compensation`` (a fraction: 1 for a staring camera), towards the south (``platform.scan``, or ``"north"``), at ``platform.drift_deg`` from the columns (a crab angle).
+   The line of sight jitters: ``platform.jitter`` has sinusoids (``frequency_hz``, ``along_urad``, ``across_urad``, ``phase_deg``) and random jitter (``random_urad_rms`` per axis, of a Lorentzian spectrum of corner ``random_bandwidth_hz``), of a ``seed``. Without ``platform``, nothing moves. The camera (``camera.type``) is
 
-   The render's own noise adds to the detector's: render twice and compare, per detector pixel. At Railroad Valley (``k`` = 4), 64 samples per render pixel leave ~2% of noise per detector pixel, 256 ~1%, against the example detector's 3–4.5%.
+   * ``frame``: every pixel integrates during ``integration_time_s``;
+   * ``pushbroom``: a line of pixels across track; each row of the image is a line period later;
+   * ``tdi``: time delay and integration, the charge of each row moving with the image across ``camera.stages`` lines of pixels, one per line period; ``camera.readout`` ``"charge"`` (a CCD's: read once) or ``"digital"`` (each line read: √stages times the read noise, and each line's full well).
+
+   The line period is ``camera.line_period_s``, or by default the time the footprints take to move by one pixel, times 1 + ``camera.line_period_error`` (a synchronization error); lines integrate during ``integration_time_s`` (default: the whole period).
+   Lines' PRNU and dark current are per line pixel, averaged over the stages a row's charge visits.
+   Exposures are sampled at ``camera.time_steps`` (default: steps of at most a tenth of a pixel of motion, and ten per period of the jitter's fastest component).
+
+   ``INSTRUMENT.json`` gives the telescope (``aperture_diameter_m``, ``obscuration``, ``transmittance``, ``wavefront_error_nm_rms``), ``jitter_urad_rms`` (per axis), the detector (``pixel_pitch_m``, ``integration_time_s``, ``quantum_efficiency``, ``full_well_e``, ``read_noise_e``, ``dark_current_e_per_s``, ``prnu``, ``dsnu``, ``gain_e_per_dn``, ``offset_dn``, ``adc_bits``, ``fixed_pattern_seed``), ``camera`` and ``platform``; any number may be given per band, as an object keyed by band.
+   Examples in ``tools/remote_sensing/``: ``instrument.json``, a 1 m GSD frame camera at 500 km (2.5 m focal length, 5 µm pixels) with a 0.4 m telescope (f/6.25, obscuration 0.3, 40 nm RMS wavefront error) and a 0.1 ms exposure (0.7 pixels of motion); ``instrument_tdi.json``, its telescope with a 16-stage TDI camera and a 100 Hz jitter line.
+   It prints per band the electrons per unit radiance, the mean signal and its SNR, λ*N*/*p*, and the static MTF at the detector's Nyquist frequency; ``--electrons`` also writes the signal's electrons without noise.
+
+   The render's own noise adds to the detector's: render twice and compare, per detector pixel. At Railroad Valley (``k`` = 4), 64 samples per render pixel leave ~2% of noise per detector pixel, 256 ~1%, against the frame camera's 3–4.5%; the TDI camera's 0.6–0.9% needs thousands.
+
+``event_camera.py SCENE_JSON RADIANCE.exr INSTRUMENT.json OUT.npz --duration S [--band NAME --seed N --preview PNG]``
+   An event camera's pixels report changes of brightness asynchronously: a pixel emits an ON (OFF) event when the logarithm of its photocurrent rises (falls) by a contrast threshold since its last event.
+   Its pixels see what ``detector.py``'s do (the telescope, the platform's motion and jitter), sampled at time steps; per pixel:
+
+   * the photocurrent: the electrons per second of the render's bands (each with its quantum efficiency; or only ``--band``'s), plus the dark current;
+   * its logarithm, through the photoreceptor's first-order low-pass filter (``events.cutoff_hz``, optional; solved exactly for a current varying linearly within a step);
+   * an event for each crossing of the thresholds (``events.threshold_on``, ``events.threshold_off``: contrasts in the natural logarithm, each pixel's drawn with an RMS of ``events.threshold_sigma``, a fixed pattern) since the pixel's reference level, timed by interpolation within the step; the reference moves by the threshold. During ``events.refractory_s`` after an event, the pixel emits none, and its reference stays;
+   * noise events of random polarity at ``events.noise_rate_hz`` per pixel.
+
+   The time steps (``events.time_step_s``) default to a tenth of a pixel of motion and a tenth of the jitter's fastest period.
+   ``OUT.npz`` has the events in time order (``x``, ``y``, ``t`` in µs, ``p`` ±1) and the camera's ``width`` and ``height``; ``--preview`` draws their sums per pixel (ON red, OFF blue).
+   ``tools/remote_sensing/event_camera.json`` is an example: the telescope with 10 µm pixels (2 m GSD), scanning at the orbit's ground speed (as Falcon Neuro did from the ISS), thresholds of 0.25.
+   At Railroad Valley the largest log contrast at 2 m is 0.24: with these thresholds, the camera sees only its noise events; with thresholds of 0.03, the facility's edges stream events along the scan (10 ms of 512² pixels, 354 steps, in 25 s).
 
 With the default scene (1920² pixels at 1 m GSD), 1024 samples per pixel render in 25 s on an NVIDIA GB10 (ray tracing); loading the 2 M-triangle terrain takes ~18 s.
 Under the 2022-07-19 sun without an atmosphere, the mean band radiances of the playa (reflectance 0.35) match a hand calculation, ρ E cos θ / π, to 0.3%.
@@ -89,4 +117,7 @@ With the materials of ``materials.py``, the mean radiance renders the same decom
 
 * MTF: a slanted edge (5°) rendered at 1.25 µm pixels, imaged onto 5 µm pixels, measures the model's system MTF (telescope × jitter × pixel) to 0.006 up to the Nyquist frequency (0.218 against 0.222 there, green). The renders' own MTF, box × Gaussian (σ ¼ pixel), measures to 0.003 to 1 cycle per pixel, with ray and with beam tracing.
 * Radiometry and noise: a uniform radiance gives the electrons of a numerical integration of its photons to 10⁻⁸, and digital numbers whose mean and standard deviation match the model's (signal, dark current, PRNU, DSNU, read and quantization noise) to 0.02 DN and 0.15%.
-* Railroad Valley at the example instrument: 551, 1072, 998 and 1238 electrons (blue, green, red, near infrared) and an SNR of 23–35 at the mean radiance; 26 s for 4096² render pixels, after ``toa.py``'s 22 s.
+* Railroad Valley at the example instrument: 551, 1072, 998 and 1238 electrons (blue, green, red, near infrared) and an SNR of 23–35 at the mean radiance; 26 s for 4096² render pixels, after ``toa.py``'s 22 s. With the TDI camera, 1.2–2.8 × 10⁴ electrons and an SNR of 110–166, in 52 s.
+* Time, against closed forms (the slanted edge, along track or across it; the residual is the static case's): a frame camera's smear of one pixel (× sinc *f*), a synchronous 8-stage TDI camera (× sinc *f* along track, and 8 times a line's electrons), one whose line period is 5% long (× sinc((1 + ε) *f*) sin(π *f N* ε) / (*N* sin(π *f* ε))), and a staring camera's sinusoidal jitter of 0.5 pixels over many periods (× J₀(2π *a f*)), each to 0.0054 up to the Nyquist frequency. The random jitter's RMS and autocorrelation match its model's to 0.3% and 0.003.
+
+``event_camera.py``: an exponential radiance (*L* ∝ e\ :sup:`ax`, whose blurred logarithm rises at exactly *a v* in a pixel moving at *v*) gives every pixel an ON event every 12.504 ms (12.5 expected), half as many (10) with a refractory period of twice their spacing, and with a 10 Hz low-pass filter, events within 20 µs of the analytic lag's times; noise events count as their rate gives (32 774 for 32 768).

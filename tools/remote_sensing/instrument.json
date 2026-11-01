@@ -7,10 +7,26 @@
         "wavefront_error_nm_rms": 40
     },
     "jitter_urad_rms": 0.2,
+    "camera": {
+        "type": "frame"
+    },
+    "platform": {
+        "scan": "south",
+        "jitter": {
+            "random_urad_rms": 0.5,
+            "random_bandwidth_hz": 10,
+            "seed": 1
+        }
+    },
     "detector": {
-        "pixel_pitch_m": 5e-6,
-        "integration_time_s": 1e-4,
-        "quantum_efficiency": {"blue": 0.55, "green": 0.70, "red": 0.70, "nir": 0.40},
+        "pixel_pitch_m": 5e-06,
+        "integration_time_s": 0.0001,
+        "quantum_efficiency": {
+            "blue": 0.55,
+            "green": 0.7,
+            "red": 0.7,
+            "nir": 0.4
+        },
         "full_well_e": 12000,
         "read_noise_e": 4,
         "dark_current_e_per_s": 20,

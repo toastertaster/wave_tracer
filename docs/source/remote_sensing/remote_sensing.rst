@@ -50,7 +50,9 @@ The first goal is stage one of the simulation: the radiance that reaches the tel
    Matches 6S's top-of-atmosphere radiance for the materials' mean spectrum to 0.19%.
 5. *Done.* Detector: the telescope's and the jitter's MTFs, the pixels' integration of a finer render, conversion to electrons and digital numbers, noise and quantization (``detector.py``, :doc:`tools`).
    Its MTF matches a slanted edge's to 0.006, and its radiometry an independent calculation to 10⁻⁸.
-6. Time: camera trajectories, platform motion and jitter, TDI and pushbroom cameras; then event cameras.
+6. *Done.* Time: platform motion (orbital ground speed, motion compensation, crab angle) and jitter (sinusoids, random), over one render; frame cameras' smear, pushbroom and TDI cameras (``detector.py``); event cameras (``event_camera.py``) (:doc:`tools`).
+   Matches closed-form MTFs of smear, TDI synchronization errors and jitter to 0.0054, and an event camera's analytic events.
+   Not yet: trajectories rendered frame by frame (views changing during an acquisition, parallax).
 7. Later: Geiger-mode APD cameras (time-of-flight rendering), and the shortwave, longwave and thermal infrared (thermal emission).
 
 
@@ -59,6 +61,6 @@ Known issues
 
 * A ``directional`` emitter whose direction is exactly parallel to a coordinate axis (e.g. ``target="0m, -1m, 0m"``) lights a plane perpendicular to it with a pattern of rings, and too dimly; tilted by 0.001°, it lights it exactly. Suns computed from ephemerides are unaffected. Not yet investigated.
 * Materials: the default playa spectrum is an analogue's (Stonewall Playa), not Railroad Valley's own (RadCalNet's, which needs registration); NAIP is uncalibrated and 8-bit, so abundances are only as good as the assumption that its values are proportional to radiance; at most four materials per ``spectral_mix``.
-* Detector: the telescope's PSF is the same over the field (diffraction and a statistical wavefront error; no aberrations of a design, nor PSFs from optical design software, yet); the pixels have no MTF beyond their area (no diffusion or crosstalk); the platform's motion during the exposure is not modelled (milestone 6). Renders must be oversampled (``k`` ≥ 2–4, so that the optics' cut-off is within the render's Nyquist frequency; ``detector.py`` warns otherwise), and their Monte Carlo noise kept below the detector's.
+* Detector: the telescope's PSF is the same over the field (diffraction and a statistical wavefront error; no aberrations of a design, nor PSFs from optical design software, yet); the pixels have no MTF beyond their area (no diffusion or crosstalk); time is modelled over a single render: footprints move over it along its columns (north–south), without parallax or changes of view, so pushbroom scans of whole scenes with relief, and other headings, need renders per frame (not yet). Event cameras are sampled at fine time steps: seconds of a large array take hours. Renders must be oversampled (``k`` ≥ 2–4, so that the optics' cut-off is within the render's Nyquist frequency; ``detector.py`` warns otherwise), and their Monte Carlo noise kept below the detector's.
 * Bands share wavelength samples (see ``band_radiance``): images of several disjoint bands are noisier per band than images of one.
 * From a camera hundreds of kilometres away, ~10⁻⁴ of oblique views' samples still shadow themselves with ``near_clip``'s default margin (2 km); nearer margins leave fewer.

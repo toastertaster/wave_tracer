@@ -1,0 +1,48 @@
+{
+    "description": "An example: instrument.json's telescope with a TDI pushbroom camera: 16 stages of 5 µm pixels at its 1 m GSD from 500 km, line period synchronized with the ground speed (~142 µs), a CCD's charge transfer, and slow attitude jitter with a 100 Hz reaction-wheel line",
+    "telescope": {
+        "aperture_diameter_m": 0.4,
+        "obscuration": 0.3,
+        "transmittance": 0.8,
+        "wavefront_error_nm_rms": 40
+    },
+    "jitter_urad_rms": 0.2,
+    "camera": {
+        "type": "tdi",
+        "stages": 16,
+        "readout": "charge"
+    },
+    "platform": {
+        "scan": "south",
+        "jitter": {
+            "random_urad_rms": 0.5,
+            "random_bandwidth_hz": 10,
+            "sinusoids": [
+                {
+                    "frequency_hz": 100,
+                    "along_urad": 0.3,
+                    "across_urad": 0.3
+                }
+            ],
+            "seed": 1
+        }
+    },
+    "detector": {
+        "pixel_pitch_m": 5e-06,
+        "quantum_efficiency": {
+            "blue": 0.55,
+            "green": 0.7,
+            "red": 0.7,
+            "nir": 0.4
+        },
+        "full_well_e": 60000,
+        "read_noise_e": 20,
+        "dark_current_e_per_s": 20,
+        "prnu": 0.005,
+        "dsnu": 0.2,
+        "gain_e_per_dn": 15,
+        "offset_dn": 64,
+        "adc_bits": 12,
+        "fixed_pattern_seed": 1
+    }
+}

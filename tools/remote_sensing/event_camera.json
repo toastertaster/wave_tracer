@@ -1,0 +1,37 @@
+{
+    "description": "An example: instrument.json's telescope with an event camera of 10 µm pixels (2 m GSD from 500 km), scanning the ground at the orbit's ground speed (as Falcon Neuro did from the ISS), with slow attitude jitter",
+    "telescope": {
+        "aperture_diameter_m": 0.4,
+        "obscuration": 0.3,
+        "transmittance": 0.8,
+        "wavefront_error_nm_rms": 40
+    },
+    "jitter_urad_rms": 0.0,
+    "platform": {
+        "scan": "south",
+        "jitter": {
+            "random_urad_rms": 0.5,
+            "random_bandwidth_hz": 10,
+            "seed": 1
+        }
+    },
+    "detector": {
+        "pixel_pitch_m": 1e-05,
+        "quantum_efficiency": {
+            "blue": 0.4,
+            "green": 0.6,
+            "red": 0.6,
+            "nir": 0.3
+        },
+        "dark_current_e_per_s": 100,
+        "fixed_pattern_seed": 1
+    },
+    "events": {
+        "threshold_on": 0.25,
+        "threshold_off": 0.25,
+        "threshold_sigma": 0.03,
+        "refractory_s": 0.0001,
+        "cutoff_hz": 1000,
+        "noise_rate_hz": 0.1
+    }
+}
