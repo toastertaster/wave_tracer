@@ -48,5 +48,7 @@
 
 
 vcpkg.json !filter !diff !merge -text
+# Small configuration files of the remote sensing tools: plain text
+tools/remote_sensing/*.json !filter !diff !merge text
 docs/** filter= diff= merge=
 

@@ -1,3 +1,24 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:e77cedd9290d05db1c33937559b12145fe57121b9da66cc13f103fc83f568f0c
-size 839
+{
+    "description": "An example: a 1 m GSD frame camera at 500 km (2.5 m focal length, 5 µm pixels) with a 0.4 m obscured telescope, an uncooled silicon CMOS detector and a short exposure (0.1 ms: 0.7 m of motion at 7 km/s)",
+    "telescope": {
+        "aperture_diameter_m": 0.4,
+        "obscuration": 0.3,
+        "transmittance": 0.8,
+        "wavefront_error_nm_rms": 40
+    },
+    "jitter_urad_rms": 0.2,
+    "detector": {
+        "pixel_pitch_m": 5e-6,
+        "integration_time_s": 1e-4,
+        "quantum_efficiency": {"blue": 0.55, "green": 0.70, "red": 0.70, "nir": 0.40},
+        "full_well_e": 12000,
+        "read_noise_e": 4,
+        "dark_current_e_per_s": 20,
+        "prnu": 0.005,
+        "dsnu": 0.2,
+        "gain_e_per_dn": 3,
+        "offset_dn": 64,
+        "adc_bits": 12,
+        "fixed_pattern_seed": 1
+    }
+}
