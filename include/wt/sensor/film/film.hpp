@@ -324,11 +324,12 @@ private:
         temp.resize(Dims*W);
         weights.clear();
 
-        // integrate rfilter over pixel footprint
+        // integrate rfilter, centred on the sample (at offset o from its element's centre), over each element's
+        // footprint: element x spans [x-o-.5, x-o+.5] about the sample
 
         for (auto d=0ul;d<Dims;++d)
         for (auto x=-r;x<=r;++x) {
-            temp[x+r + d*W] = rfilter.integrate(range_t{ x+o[d]-f_t(.5), x+o[d]+f_t(.5) });
+            temp[x+r + d*W] = rfilter.integrate(range_t{ x-o[d]-f_t(.5), x-o[d]+f_t(.5) });
             assert(temp[x+r + d*W]>=0);
         }
 

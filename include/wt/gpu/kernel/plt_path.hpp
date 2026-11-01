@@ -187,11 +187,12 @@ WT_GPU_FN void splat(const WT_GPU_THREAD film_desc& film, film_response response
     const stokes watts = as_stokes(observed);
     const i32 r = film.rf_radius;
 
-    // integrate the reconstruction filter over the elements' footprints
+    // integrate the reconstruction filter, centred on the sample (at `offset`
+    // from its element's centre), over the elements' footprints
     real wx[2*max_rf_radius+1], wy[2*max_rf_radius+1];
     for (i32 x=-r; x<=r; ++x) {
-        wx[x+r] = gaussian_integrate(film.rf_sigma, real(x)+offset.x-real(.5), real(x)+offset.x+real(.5));
-        wy[x+r] = gaussian_integrate(film.rf_sigma, real(x)+offset.y-real(.5), real(x)+offset.y+real(.5));
+        wx[x+r] = gaussian_integrate(film.rf_sigma, real(x)-offset.x-real(.5), real(x)-offset.x+real(.5));
+        wy[x+r] = gaussian_integrate(film.rf_sigma, real(x)-offset.y-real(.5), real(x)-offset.y+real(.5));
     }
     real tw = 0;
     for (i32 y=-r; y<=r; ++y)
@@ -235,8 +236,8 @@ WT_GPU_FN void splat_weighted(const WT_GPU_THREAD film_desc& film, film_response
 
     real wx[2*max_rf_radius+1], wy[2*max_rf_radius+1];
     for (i32 x=-r; x<=r; ++x) {
-        wx[x+r] = gaussian_integrate(film.rf_sigma, real(x)+offset.x-real(.5), real(x)+offset.x+real(.5));
-        wy[x+r] = gaussian_integrate(film.rf_sigma, real(x)+offset.y-real(.5), real(x)+offset.y+real(.5));
+        wx[x+r] = gaussian_integrate(film.rf_sigma, real(x)-offset.x-real(.5), real(x)-offset.x+real(.5));
+        wy[x+r] = gaussian_integrate(film.rf_sigma, real(x)-offset.y-real(.5), real(x)-offset.y+real(.5));
     }
     real tw = 0;
     for (i32 y=-r; y<=r; ++y)
