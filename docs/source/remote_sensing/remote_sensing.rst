@@ -19,6 +19,8 @@ Without it, the build is the same as ``main-gpu``'s.
 .. toctree::
    :maxdepth: 1
 
+   scene_elements
+   tools
    data
 
 
@@ -39,11 +41,20 @@ Plan
 
 The first goal is stage one of the simulation: the radiance that reaches the telescope's entrance pupil, rendered by **wave_tracer**, with the telescope's blur applied afterwards from point-spread functions.
 
-0. Scaffolding: the option, its propagation to the GPU backends and the Rust bindings, and the data survey (:doc:`data`).
-1. Reference site: a fetch script and a scene builder for a terrain tile (elevation model and orthophoto) at Railroad Valley Playa, Nevada.
-2. Satellite frame camera: placed by altitude and look angles, with focal length, pixel pitch and pixel count; radiance per band in physical units; precision at orbital distances.
-3. Sun and atmosphere: the top-of-atmosphere solar spectrum and the sun's position; atmospheric transmittance, path radiance and sky light from tables precomputed with a radiative transfer code.
+0. *Done.* Scaffolding: the option, its propagation to the GPU backends and the Rust bindings, and the data survey (:doc:`data`).
+1. *Done.* Reference site: a fetch script and a scene builder for a terrain tile (elevation model and orthophoto) at Railroad Valley Playa, Nevada (:doc:`tools`).
+2. *Done.* Satellite frame camera: placed by altitude and look angles, with focal length, pixel pitch and pixel count; radiance per band in physical units; precision at orbital distances (:doc:`scene_elements`).
+3. Sun and atmosphere: *done:* the top-of-atmosphere solar spectrum and the sun's position (in the scene builder); *to do:* atmospheric transmittance, path radiance and sky light from tables precomputed with a radiative transfer code.
 4. Spectral materials: material maps that refer to measured reflectance spectra.
 5. Detector: point-spread functions, conversion to electrons and digital numbers, noise and quantization.
 6. Time: camera trajectories, platform motion and jitter, TDI and pushbroom cameras; then event cameras.
 7. Later: Geiger-mode APD cameras (time-of-flight rendering), and the shortwave, longwave and thermal infrared (thermal emission).
+
+
+Known issues
+------------
+
+* A ``directional`` emitter whose direction is exactly parallel to a coordinate axis (e.g. ``target="0m, -1m, 0m"``) lights a plane perpendicular to it with a pattern of rings, and too dimly; tilted by 0.001°, it lights it exactly. Suns computed from ephemerides are unaffected. Not yet investigated.
+* EXR files of films with four or more channels name them with a stray control character (``\x01R``, ...); band names would be better.
+* Bands share wavelength samples (see ``band_radiance``): images of several disjoint bands are noisy per band.
+* From a camera hundreds of kilometres away, ~10⁻⁴ of oblique views' samples still shadow themselves with ``near_clip``'s default margin (2 km); nearer margins leave fewer.
