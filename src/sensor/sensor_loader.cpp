@@ -16,6 +16,7 @@
 #include <wt/math/transform/transform.hpp>
 #if defined(REALISTIC_REMOTE_SENSING)
 #include <wt/remote_sensing/satellite_frame.hpp>
+#include <wt/remote_sensing/telescope.hpp>
 #endif
 
 #include <wt/scene/loader/node_readers.hpp>
@@ -44,6 +45,8 @@ std::shared_ptr<sensor_t> sensor_t::load(std::string id,
 #if defined(REALISTIC_REMOTE_SENSING)
     else if (type=="satellite_frame")
         return remote_sensing::satellite_frame_t::load(std::move(id), loader, node, context);
+    else if (type=="telescope")
+        return remote_sensing::load_telescope(std::move(id), loader, node, context);
 #endif
 
     throw scene_loading_exception_t("(sensor loader) unrecognized sensor type", node);

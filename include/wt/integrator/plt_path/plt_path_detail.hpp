@@ -785,7 +785,14 @@ inline void integrate_backward(
 
     // draw sensor sample
     const auto sensor_sample = ctx.sensor->sample(ctx.scene->sampler(), sensor_element, k);
-    
+
+    // a sample of no importance (e.g., a ray a telescope's optics vignette) still counts, as a zero, towards its
+    // element's samples, but needs no path
+    if (!(sensor_sample.beam.intensity()>zero)) {
+        splat_backward(ctx, block, sensor_sample.element, {}, k);
+        return;
+    }
+
     // path trace
     auto data = path_walk_data_t{
         .beam = sensor_sample.beam,

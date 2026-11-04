@@ -20,6 +20,7 @@
 #include <wt/emitter/infinite_emitter.hpp>
 
 #include <wt/scene/element/attributes.hpp>
+#include <wt/integrator/integrator.hpp>
 
 using namespace wt;
 using namespace wt::scene;
@@ -61,6 +62,14 @@ scene_t::scene_t(std::string id,
         throw std::runtime_error("(scene) no sensors provided.");
     if (sensors.size() > max_supported_sensors)
         throw std::runtime_error("(scene) sensor count exceeds limit.");
+    // the integrator must write to the sensors only as they support
+    for (const auto& s : sensors) {
+        const auto needed = scene_integrator->sensor_write_flags();
+        if ((needed & ~s->supported_write_flags()) != 0)
+            throw std::runtime_error("(scene) sensor <" + s->get_id() + "> does not support the integrator <" +
+                                     scene_integrator->get_id() + ">: it cannot connect to scene points "
+                                     "(direct splats), as forward plt_path and plt_bdpt need; use backward plt_path");
+    }
 
     // build emitter sampling data per each sensor
     for (auto&& s : sensors)

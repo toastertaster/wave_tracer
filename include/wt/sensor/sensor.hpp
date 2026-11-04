@@ -137,6 +137,16 @@ public:
     [[nodiscard]] virtual bool is_delta_direction() const noexcept = 0;
 
     /**
+     * @brief The ways an integrator may write to this sensor (see `integrator_t::sensor_write_flags()`): a sensor
+     *        that cannot connect to scene points (`sample_direct`) supports block splats only. The scene refuses
+     *        integrators that need more.
+     */
+    [[nodiscard]] virtual sensor_write_flags_e supported_write_flags() const noexcept {
+        return (sensor_write_flags_e)(sensor_write_flags_e::writes_block_splats |
+                                      sensor_write_flags_e::writes_direct_splats);
+    }
+
+    /**
      * @brief Samples a time-reversed beam ("importance") around the specified film position.
      * @param element sensor element to sample from
      * @param k wavenumber
