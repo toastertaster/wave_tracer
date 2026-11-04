@@ -155,15 +155,16 @@ To image the scene onto a detector, render it on a grid finer than the detector'
    Values map linearly to black and white from ``--range LO,HI`` (one range, or one per channel: ``LO1,HI1,LO2,HI2,LO3,HI3``), or by default from the ``--percentiles P0,P1`` (0.5,99.5) of all the chosen channels together, which keeps their balance (``--per-band``: each channel's own), then are sRGB-encoded (unless ``--linear``). It prints the range used.
    The :doc:`gallery`'s images (but the events') are its previews.
 
-``telescope.py {two-mirror,hubble} [--kind --diameter --focal-length --primary-focal-length --back-focus --off-axis --field-bias --fold --secondary-radius --coating --pixel-pitch --pixels --altitude --view-zenith --view-azimuth --samples --elements-only]``
+``telescope.py {two-mirror,hubble} [--kind --diameter --focal-length --primary-focal-length --back-focus --off-axis --field-bias --fold --secondary-radius --coating --scatter --baffles --baffle-reflectance --pixel-pitch --pixels --altitude --view-zenith --view-azimuth --samples --elements-only]``
    Writes a ``telescope`` sensor (:doc:`scene_elements`) of a design: its mirrors, their clear apertures and placement, and the focal plane's frame.
    ``two-mirror`` is a Cassegrain telescope from its first-order layout (default the example instrument's: 0.4 m aperture, 2.5 m focal length, a 0.6 m primary focal length, 0.15 m back focus): the secondary's magnification *m* = *f*/*f*\ :sub:`1`, its distance *f*\ :sub:`1` (1 − *k*) from the primary, *k* = (1 + *b*/*f*\ :sub:`1`)/(1 + *m*), its radius 2 *k f*\ :sub:`1` *m*/(*m* − 1) (Schroeder, *Astronomical Optics*), with ``--kind cassegrain`` (a paraboloid and a hyperboloid) or ``ritchey-chretien`` (aplanatic conics; the default).
    The secondary's aperture and the primary's hole pass the film's field.
    ``--off-axis Y`` takes an unobscured off-axis segment of the design, its primary's aperture centred Y from the axis; ``--field-bias`` puts the film's centre off the axis; ``--fold`` adds a flat mirror at 45° in the converging beam.
    ``hubble`` is the Hubble Space Telescope (Laikin, as in Optiland's sample).
    ``--coating`` coats every mirror: ``ideal`` (the default), ``aluminium``, ``silver`` or ``gold`` (bare, from wave_tracer's data), or ``protected-aluminium`` (under 25 nm of magnesium fluoride, as Hubble's).
+   For stray light, ``--scatter A,B,g`` makes every mirror rough (ABg scatter), and ``--baffles`` adds to an on-axis two-mirror design a tube in front of the secondary (20% wider than it, long enough that the focal plane's centre cannot see past the secondary's edge) and a vane over the primary's zone in the secondary's shadow (which stops reflections between the mirrors), of ``--baffle-reflectance`` (default black).
    It prints the sensor, placed by its ``--altitude`` and view angles (strings, so that a scene's defines such as ``$vz`` pass through), or with ``--elements-only`` only the optics, to paste into a sensor.
-   As a module, ``two_mirror()`` and ``hubble()`` return designs and ``sensor_xml()`` writes them (e.g. for ``build_scene.py``).
+   As a module, ``two_mirror()`` and ``hubble()`` return designs, ``coat()``, ``roughen()`` and ``baffle()`` modify them, and ``sensor_xml()`` writes them (e.g. for ``build_scene.py``).
 
 ``telescope_reference.py``
    Prints, as JSON, Optiland's (an independent ray tracer's) values that the Rust bindings' tests check the ``telescope`` sensor against: the designs' paraxial focal lengths and entrance pupils, and a vignetting design's relative throughput at the film's corner (the entrance pupil's area whose rays pass, times the solid angle per focal-plane area of the image's height h(θ): A(θ) cos θ sin θ/(h h'), by the conservation of étendue).

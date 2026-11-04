@@ -61,7 +61,7 @@ Its beams start at ``near_clip`` as if propagated there from the camera (their e
 A satellite's camera that images the scene through a telescope's mirrors: a focal-plane array behind optics described by their surfaces, placed as a ``satellite_frame`` camera.
 Each sample takes a point in its pixel and a direction towards the optics, and traces the ray backwards through the mirrors, in double precision, out towards the scene.
 Rays that miss a clear aperture, or meet an obstacle (the secondary mirror's shadow, the primary's central hole), are vignetted.
-The render then has the telescope's geometric optics in it: its distortion, its field-dependent geometric blur (aberrations, the focal plane's defocus off a curved field), vignetting, and the parallax of an off-axis aperture; and its mirrors' coatings: their reflectance, per wavelength and angle of incidence, and the polarization they cause.
+The render then has the telescope's geometric optics in it: its distortion, its field-dependent geometric blur (aberrations, the focal plane's defocus off a curved field), vignetting, and the parallax of an off-axis aperture; its mirrors' coatings: their reflectance, per wavelength and angle of incidence, and the polarization they cause; and, traced non-sequentially, its stray light (below).
 Diffraction by the aperture is not traced: it is the detector model's (``detector.py``).
 
 The telescope's optics are configured, not built in: a list of elements, in the order light meets them.
@@ -119,7 +119,9 @@ Given ``to_world`` instead of ``altitude``, it places the telescope's frame itse
    * - ``<stop>``
      - A flat opening: a ray must pass within its aperture, in turn (an aperture or field stop).
    * - ``<obscuration>``
-     - A flat disc (an annulus, with ``hole_radius``) that blocks every ray crossing it, in no particular order: a baffle or a central obscuration.
+     - A flat disc (an annulus, with ``hole_radius``) that blocks every ray crossing it, in no particular order: a baffle, a vane or a central obscuration.
+   * - ``<tube>``
+     - A cylinder about its local z axis, from z = 0 to its ``length``, of radius ``aperture_radius``, that blocks every ray crossing it: a baffle tube or a sunshade.
 
 Every mirror is also an obstacle to the rays' other segments, within its clear aperture and outside its hole: the secondary's body shadows the primary, and the converging beam must pass the primary's hole.
 
@@ -143,6 +145,12 @@ Every mirror is also an obstacle to the rays' other segments, within its clear a
      - The element's frame in the telescope's (required).
    * - ``<coating>``
      - The mirror's coating (below). Default ideal.
+   * - ``<scatter type="abg">``
+     - The mirror's roughness's scatter (stray light, below): floats ``A``, ``B`` and ``g``. Default smooth.
+   * - ``length``
+     - A tube's length (required for tubes).
+   * - ``reflectance``
+     - A stop's, obscuration's or tube's Lambertian reflectance, when traced non-sequentially (stray light). Default 0: black.
 
 .. list-table:: Sensor parameters
    :header-rows: 1
@@ -160,6 +168,12 @@ Every mirror is also an obstacle to the rays' other segments, within its clear a
      - As for the ``satellite_frame`` sensor.
    * - ``samples``, ``ray_trace_only``, ``alpha``, ``phase_space_extent_scale``, ``polarimetric``
      - As for the ``perspective`` sensor. Beams start at the last mirror, of the pixel's angular extent (pitch over focal length, or ``alpha``) and the narrowest cross section it allows (a minimum-uncertainty beam: ~0.2 m at 550 nm for 2 µrad), then start again at ``near_clip``.
+   * - ``stray_light``
+     - Trace the optics non-sequentially (below). Default false.
+   * - ``scatter_probability``
+     - Non-sequentially, the least probability with which a rough mirror's scatter is sampled (its TIS, if more). Default 0.1.
+   * - ``pst_angles``, ``pst_samples``
+     - Angles off the film centre's line of sight, in degrees (a string, ``"0.5, 1, 2"``), to compute the point-source transmittance at when loading (below), from ``pst_samples`` rays each (default 2\ :sup:`18`).
 
 **Coatings.**
 Each mirror's coating reflects light as the complex Fresnel coefficients r\ :sub:`s` and r\ :sub:`p` of its materials give, at the sample's wavelength and the ray's angle of incidence:
@@ -197,11 +211,25 @@ It logs and describes (the scene's description, e.g. ``Scene::info`` in the Rust
 The rays that the optics vignette are samples of no importance: they cost noise (1.5–3% per pixel at 256 samples, for the designs of the tests).
 Directions are mostly drawn from the cone of those that pass (found on a 5 × 5 grid over the film when loading), and some from the cone bounding the clear aperture nearest the focal plane, which every passing direction is in: weighted by the mixture's density, the render is unbiased.
 
+**Stray light.**
+Light reaches the film by paths other than the design's: past baffles (the focal plane sees the scene through the primary's hole, past the secondary's edge), between the mirrors (in the secondary's shadow, light reflects off the primary, the secondary's face and the primary again), scattered by the mirrors' roughness, and reflected by baffles.
+With ``stray_light``, each sample's ray is traced non-sequentially: it meets whichever element is nearest, in any order.
+
+* Mirrors reflect on their reflective side (the side the design's rays meet), and absorb on their back. Smooth, they reflect specularly; rough, they scatter by the ABg model of stray-light analysis (as in FRED, ASAP or Zemax), BSDF = A / (B + \|β − β₀\|\ :sup:`g`), relative to their coating's reflectance (β and β₀ the projections of the scattered and specular directions on the mirror's tangent plane), and reflect specularly only what they do not scatter: the total integrated scatter TIS = ∫ BSDF d²β, πA ln((B + 1)/B) at normal incidence for g = 2. Scatter depolarizes.
+* Stops (a plate around their opening), obscurations and tubes reflect diffusely (Lambertian, of their ``reflectance``); the focal-plane array absorbs.
+* A tenth of the samples' directions are drawn from the hemisphere in front of the focal plane (cosine-distributed), as such light may arrive from any of them.
+
+Rays that leave the telescope gather the scene's light as the design's do.
+Without ``stray_light``, rough mirrors still lose their TIS from the specular image (that light leaves the image).
+The point-source transmittance (``pst_angles``) is the irradiance a distant point source (the sun) gives the film's centre by stray light, over the irradiance it gives the aperture, at angles off the line of sight (towards the film's +x), at the film's mean wavelength: rays from the film's centre traced non-sequentially (half of their directions drawn from the hemisphere), and, where they meet a rough mirror's reflective side or a reflective baffle, the source's light scattered there towards them (next-event estimation), unless an element is in the way.
+A render cannot find a point source by its rays (a ``directional`` emitter, the sun, is reached only by next-event estimation from the scene's surfaces): the sun's stray light is the PST at its angle times its irradiance.
+
 **Limitations.**
 Only backward ``plt_path``: the sensor cannot connect to scene points, as ``plt_bdpt`` and forward ``plt_path`` need (scenes are refused).
 On the GPU, the kernels trace the optics in their precision: in single precision, directions leaving the telescope are accurate to ~10⁻⁷ rad, a twentieth of a pixel for the tests' designs (f = 2.5 m, 5 µm pixels), but more than one for Hubble's (f = 57.6 m; the GPU warns when it is more than a tenth): render long focal lengths on the CPU, or with ``GPU_DBL_PRECISION``.
 The GPU supports up to 32 elements, 8 aspheric terms per surface, and 16 coating layers and 16 refractive indices over all coatings.
-Coatings are smooth: their roughness's scatter is stray light's (to come). The focal plane is flat, and the scene loader reads transforms in single precision (their rotations are orthonormalized again; translations are good to ~0.1 µm per metre).
+Stray light: on the CPU only (the GPU refuses it); a ray scattered off a mirror does not meet that mirror again; mirrors have no edges or substrates beyond their apertures; baffles are Lambertian; the PST counts the source's light where it shines directly on a scattering surface, not after specular reflections (e.g. the sun reflected by the primary onto a baffle), and only at the film's centre.
+The focal plane is flat, and the scene loader reads transforms in single precision (their rotations are orthonormalized again; translations are good to ~0.1 µm per metre).
 
 
 ``band_radiance`` response

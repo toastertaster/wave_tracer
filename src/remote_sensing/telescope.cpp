@@ -9,6 +9,8 @@
 
 #include <cmath>
 #include <charconv>
+#include <complex>
+#include <numbers>
 #include <cstdlib>
 #include <format>
 #include <optional>
@@ -21,6 +23,7 @@
 #include "prescription.hpp"
 
 #include <wt/scene/element/attributes.hpp>
+#include <wt/sampler/uniform.hpp>
 #include <wt/scene/loader/node_readers.hpp>
 #include <wt/math/transform/transform.hpp>
 #include <wt/math/transform/transform_loader.hpp>
@@ -50,6 +53,51 @@ frame_t sp_frame(const dir3_t& w, const dir3_t& n) noexcept {
     return frame_t{ .t = s, .b = inwards ? -p : p, .n = w };
 }
 
+// a coating's reflectance of unpolarized light at wavenumber k, incidence cos θ
+double reflectance(const optics::coating_t& c, wavenumber_t k, double cos_theta) noexcept {
+    const auto r = c.reflection(k, cos_theta);
+    return (std::norm(std::complex<double>{ r.rs }) + std::norm(std::complex<double>{ r.rp })) / 2;
+}
+
+// the projection of unit vector v on the plane of unit normal n
+inline glm::dvec3 tangential(const glm::dvec3& v, const glm::dvec3& n) noexcept {
+    return v - glm::dot(v,n)*n;
+}
+
+// a direction of the hemisphere about unit `axis`, cosine-distributed, from two uniform numbers
+glm::dvec3 cosine_hemisphere_about(const glm::dvec3& axis, const vec2_t& u) noexcept {
+    const auto l = sampler::sampler_t::cosine_hemisphere(u);
+    const auto helper = std::abs(axis.x)<.9 ? glm::dvec3{ 1,0,0 } : glm::dvec3{ 0,1,0 };
+    const auto t = glm::normalize(glm::cross(helper, axis));
+    const auto b = glm::cross(axis, t);
+    return glm::normalize(double(l.x)*t + double(l.y)*b + double(l.z)*axis);
+}
+
+/**
+ * The distribution samples' directions are drawn from (see `telescope_t`): the cone of passing directions
+ * (`tight`) and the cone bounding them (`bound`), and, with stray light, the hemisphere in front of the focal plane.
+ */
+struct aim_mixture_t {
+    optics::cone_t tight, bound;
+    double tight_fraction;
+    double hemisphere_fraction;
+    glm::dvec3 front;
+
+    // from two uniform numbers, and one choosing the mixture's component
+    [[nodiscard]] glm::dvec3 sample(const vec2_t& u, double choice) const noexcept {
+        const auto h = hemisphere_fraction;
+        if (choice<h)
+            return cosine_hemisphere_about(front, u);
+        return choice<h + (1-h)*tight_fraction ? tight.sample(u.x, u.y) : bound.sample(u.x, u.y);
+    }
+    [[nodiscard]] double pdf(const glm::dvec3& d) const noexcept {
+        const auto h = hemisphere_fraction;
+        return h * std::max(0., glm::dot(d, front)) / std::numbers::pi +
+               (1-h) * ((tight.contains(d) ? tight_fraction / tight.solid_angle() : 0.) +
+                        (bound.contains(d) ? (1-tight_fraction) / bound.solid_angle() : 0.));
+    }
+};
+
 }
 
 
@@ -71,18 +119,24 @@ sensor_sample_t telescope_t<polarimetric>::sample(sampler::sampler_t& sampler,
 
     // a direction towards the optics, from the mixture of the cone of passing directions and the cone bounding all
     // that can pass, traced backwards
-    const auto tight = passing_cone(vec2_t{ film_pos } + offset);
-    const auto bound = optics->aim(p);
+    // (with stray light, some from the hemisphere in front of the focal plane, cosine-distributed)
+    const auto mixture = aim_mixture_t{
+        .tight = passing_cone(vec2_t{ film_pos } + offset),
+        .bound = optics->aim(p),
+        .tight_fraction = aim_tight_fraction,
+        .hemisphere_fraction = stray.enabled ? stray.hemisphere_fraction : 0.,
+        .front = stray.front,
+    };
     const auto u = sampler.r2();
-    const auto d = sampler.r()<aim_tight_fraction ? tight.sample(u.x, u.y) : bound.sample(u.x, u.y);
-    const auto pdf =
-        (tight.contains(d) ? aim_tight_fraction / tight.solid_angle() : 0.) +
-        (bound.contains(d) ? (1-aim_tight_fraction) / bound.solid_angle() : 0.);
-    const auto traced = optics->trace_from_focal_plane({ p,d });
+    const auto d = mixture.sample(u, double(sampler.r()));
+    const auto pdf = mixture.pdf(d);
+    const auto traced = stray.enabled ?
+        optics->trace_nonsequential({ p,d }, stray.detector, stray.scatter_probability, sampler) :
+        optics->trace_from_focal_plane({ p,d });
 
-    // projected solid angle over its sampling density, relative to the film centre's
+    // projected solid angle over its sampling density, relative to the film centre's; and the trace's weight
     const auto weight = traced.passed && pdf>0 ?
-        std::abs(glm::dot(d, focal_plane_normal())) / pdf / props.centre.projected_solid_angle :
+        std::abs(glm::dot(d, focal_plane_normal())) / pdf / props.centre.projected_solid_angle * traced.weight :
         0.;
 
     // towards the scene, in world coordinates (in double precision: the telescope is far away)
@@ -92,14 +146,23 @@ sensor_sample_t telescope_t<polarimetric>::sample(sampler::sampler_t& sampler,
     const auto dir = dir3_t{ vec3_t{ wd } };
 
     // the polarization: the mirrors' reflections, composed as wave_tracer's surfaces compose theirs (in s-p frames),
-    // from the detector's frame (Q along the film's x) to the frame of the light arriving from the scene
+    // from the detector's frame (Q along the film's x) to the frame of the light arriving from the scene. Scatter
+    // depolarizes: a rough mirror's, of its coating's reflectance; a baffle's (its reflectance was sampled).
+    using event_kind_e = optics::telescope_optics_t::event_kind_e;
     auto M = mueller_operator_t::identity();
     auto F = detector_frame(d);
     for (std::uint32_t i=0; i<traced.reflection_count && traced.passed; ++i) {
         const auto& r = traced.reflections[i];
         const auto n = to_dir(r.normal);
-        const auto c = optics->elements()[r.element].coating->reflection(k, glm::dot(r.d_out, r.normal));
-        M = compose(M, mueller_operator_t::fresnel(c.rs, c.rp), F, sp_frame(F.n, n));
+        const auto cos_theta = glm::dot(r.d_out, r.normal);
+        auto Mi = mueller_operator_t::perfect_depolarizer();
+        if (r.kind==event_kind_e::specular) {
+            const auto c = optics->elements()[r.element].coating->reflection(k, cos_theta);
+            Mi = mueller_operator_t::fresnel(c.rs, c.rp);
+        } else if (r.kind==event_kind_e::scattered) {
+            Mi = Mi * f_t(reflectance(*optics->elements()[r.element].coating, k, cos_theta));
+        }
+        M = compose(M, Mi, F, sp_frame(F.n, n));
         F = sp_frame(to_dir(r.d_out), n);
     }
     // ... in world coordinates
@@ -167,8 +230,12 @@ scene::element::info_t telescope_t<polarimetric>::description() const {
         { "projected solid angle (sr)", attributes::make_scalar(c.projected_solid_angle) },
         { "centre RMS blur (rad)",      attributes::make_scalar(c.rms_spread) },
         { "corner relative throughput", attributes::make_scalar(props.corner_relative_throughput) },
+        { "stray light",                attributes::make_scalar(stray.enabled) },
         { "film",                       attributes::make_map(std::move(film_desc)) },
     });
+    for (const auto& [angle, pst] : props.point_source_transmittance)
+        info.attribs.emplace(std::format("point-source transmittance {:g}°", angle * 180/std::numbers::pi),
+                             attributes::make_scalar(pst));
 
     // the mirrors' coatings, and their reflectance at normal incidence at the film's mean wavelength
     const auto k = this->sensitivity_spectrum().mean_wavenumber();
@@ -216,16 +283,35 @@ glm::dmat4 rigid_matrix(const transform_d_t& t, const std::string& what, const s
     return m;
 }
 
+// <scatter type="abg"> of floats A, B and g
+std::shared_ptr<const optics::abg_scatter_t> load_scatter(const scene::loader::node_t& node) {
+    if (node["type"]!="abg")
+        throw std::format_error("unsupported scatter type \"" + node["type"] + "\" (supported: \"abg\")");
+    std::optional<double> A, B, g;
+    for (auto& item : node.children_view())
+        if (!read_number(item, "A", A) && !read_number(item, "B", B) && !read_number(item, "g", g))
+            throw std::format_error("ABg scatter: unexpected node " + item.name() + " (\"" + item["name"] + "\")");
+    if (!A || !B || !g)
+        throw std::format_error("ABg scatter needs floats 'A', 'B' and 'g'");
+    try {
+        return std::make_shared<optics::abg_scatter_t>(*A, *B, *g);
+    } catch (const std::invalid_argument& exp) {
+        throw std::format_error(exp.what());
+    }
+}
+
 optics::element_t load_element(scene::loader::loader_t* loader, const scene::loader::node_t& node,
                                const wt::wt_context_t &context) {
     optics::element_t e;
     e.id = node["id"];
     if      (node.name()=="mirror")      e.kind = optics::element_kind_e::mirror;
     else if (node.name()=="stop")        e.kind = optics::element_kind_e::stop;
+    else if (node.name()=="tube")        e.kind = optics::element_kind_e::tube;
     else                                 e.kind = optics::element_kind_e::obscuration;
     const auto what = std::format("<{}{}>", node.name(), e.id.empty() ? "" : " id=\"" + e.id + "\"");
 
-    std::optional<double> radius, conic, aperture_radius, hole_radius;
+    std::optional<double> radius, conic, aperture_radius, hole_radius, length, reflectance;
+    std::shared_ptr<const optics::abg_scatter_t> scatter;
     std::optional<glm::dvec2> aperture_centre;
     std::optional<transform_d_t> to_telescope;
     std::vector<std::optional<double>> aspheric;
@@ -256,8 +342,15 @@ optics::element_t load_element(scene::loader::loader_t* loader, const scene::loa
                 throw std::format_error("Node \"coating\" already provided");
             coating = optics::coating_t::load(loader, item, context);
         }
+        else if (item.name()=="scatter") {
+            if (scatter)
+                throw std::format_error("Node \"scatter\" already provided");
+            scatter = load_scatter(item);
+        }
         else if (!read_length(item, "radius", radius) &&
                  !read_number(item, "conic", conic) &&
+                 !read_length(item, "length", length) &&
+                 !read_number(item, "reflectance", reflectance) &&
                  !read_length(item, "aperture_radius", aperture_radius) &&
                  !read_length(item, "hole_radius", hole_radius) &&
                  !read_length_vec2(item, "aperture_centre", aperture_centre))
@@ -277,9 +370,13 @@ optics::element_t load_element(scene::loader::loader_t* loader, const scene::loa
     if (!to_telescope)
         throw error("the 'to_telescope' transform must be provided");
     if (e.kind!=optics::element_kind_e::mirror && (radius || conic || !aspheric.empty()))
-        throw error("stops and obscurations are flat: no 'radius', 'conic' or aspheric terms");
-    if (e.kind!=optics::element_kind_e::mirror && coating)
-        throw error("only mirrors have a coating");
+        throw error("stops, obscurations and tubes are flat: no 'radius', 'conic' or aspheric terms");
+    if (e.kind!=optics::element_kind_e::mirror && (coating || scatter))
+        throw error("only mirrors have a coating or scatter");
+    if (e.kind==optics::element_kind_e::mirror && reflectance)
+        throw error("a mirror's reflectance is its coating's: 'reflectance' is of stops, obscurations and tubes");
+    if ((e.kind==optics::element_kind_e::tube)!=length.has_value())
+        throw error("a tube, and only a tube, needs a 'length'");
     if (radius && *radius==0)
         throw error("'radius' must not be 0 (omit it for a flat mirror)");
 
@@ -293,6 +390,9 @@ optics::element_t load_element(scene::loader::loader_t* loader, const scene::loa
         .centre = aperture_centre.value_or(glm::dvec2{ 0,0 }),
     };
     e.coating = coating ? std::move(coating) : std::make_shared<optics::coating_t>();
+    e.scatter = std::move(scatter);
+    e.length = length.value_or(0);
+    e.reflectance = reflectance.value_or(0);
     e.to_telescope = rigid_matrix(*to_telescope, "to_telescope", node);
     e.to_local = glm::inverse(e.to_telescope);
     return e;
@@ -310,6 +410,92 @@ glm::dmat3 rotation_between(const glm::dvec3& from, const glm::dvec3& to) {
     }
     const auto K = glm::dmat3{ 0, v.z, -v.y,   -v.z, 0, v.x,   v.y, -v.x, 0 };     // column major: K x = v × x
     return glm::dmat3(1) + K + K*K / (1+c);
+}
+
+// a list of angles in degrees, "0.5, 1, 2": in radians
+std::vector<double> parse_angles(const std::string& str) {
+    std::vector<double> ret;
+    std::size_t start = 0;
+    while (start<=str.size()) {
+        const auto end = std::min(str.find(',', start), str.size());
+        const auto token = str.substr(start, end-start);
+        const char* first = token.c_str();
+        char* last = nullptr;
+        const auto deg = std::strtod(first, &last);
+        if (last==first || !std::isfinite(deg) || std::string_view{ last }.find_first_not_of(" ")!=std::string_view::npos)
+            throw std::format_error("'pst_angles' are degrees, separated by commas, e.g. \"0.5, 1, 2\"");
+        ret.push_back(deg * std::numbers::pi/180);
+        start = end+1;
+    }
+    return ret;
+}
+
+// samples of the point-source transmittance
+constexpr std::uint32_t default_pst_samples = 1u<<18;
+// the fraction of them drawn from the hemisphere in front of the focal plane: more than the sensor's samples (which
+// mostly render the design's image), as the PST is all stray light, much of which arrives from outside the design's
+// cone
+constexpr double pst_hemisphere_fraction = .5;
+
+/*
+ * The point-source transmittance at focal-plane point `p` of a distant point source in direction `src` (telescope
+ * frame, towards the source): rays from `p` traced backwards non-sequentially (as the sensor's stray light samples),
+ * and, where they meet a rough mirror's reflective side or a reflective baffle, the source's light scattered there
+ * towards them (next-event estimation), unless an element is in its way. Per unit irradiance from the source.
+ */
+template <typename stray_light_t>
+double point_source_transmittance(const optics::telescope_optics_t& optics, const glm::dvec3& p,
+                                  const glm::dvec3& fp_normal, const optics::field_point_t& centre,
+                                  double tight_fraction, const stray_light_t& stray, const glm::dvec3& src,
+                                  wavenumber_t k, std::uint32_t samples) {
+    using event_kind_e = optics::telescope_optics_t::event_kind_e;
+    constexpr double epsilon = 1e-9;
+    const auto& elements = optics.elements();
+    const auto mixture = aim_mixture_t{
+        .tight = centre.passing_cone,
+        .bound = optics.aim(p),
+        .tight_fraction = tight_fraction,
+        .hemisphere_fraction = pst_hemisphere_fraction,
+        .front = stray.front,
+    };
+
+    double sum = 0;
+    double sample_weight = 0;
+    const std::function<void(const optics::telescope_optics_t::scatter_point_t&)> at_scatter =
+        [&](const optics::telescope_optics_t::scatter_point_t& sp) {
+            const auto cos_src = glm::dot(src, sp.normal);
+            if (!(cos_src>0) || !optics.escapes({ sp.p, src }, epsilon, stray.detector))
+                return;
+            const auto& e = elements[sp.element];
+            double f;
+            if (e.kind==optics::element_kind_e::mirror) {
+                const auto spec = sp.d_in - 2*glm::dot(sp.d_in, sp.normal)*sp.normal;
+                const auto offset = glm::length(tangential(src - spec, sp.normal));
+                f = reflectance(*e.coating, k, cos_src) * e.scatter->bsdf(offset);
+            } else {
+                f = e.reflectance / std::numbers::pi;
+            }
+            // the coatings' reflectances so far
+            auto throughput = sp.so_far.weight;
+            for (std::uint32_t i=0; i<sp.so_far.reflection_count; ++i) {
+                const auto& r = sp.so_far.reflections[i];
+                if (r.kind!=event_kind_e::diffuse)
+                    throughput *= reflectance(*elements[r.element].coating, k, glm::dot(r.d_out, r.normal));
+            }
+            sum += sample_weight * throughput * f * cos_src;
+        };
+
+    sampler::uniform_t sampler;
+    for (std::uint32_t i=0; i<samples; ++i) {
+        const auto u = sampler.r2();
+        const auto d = mixture.sample(u, double(sampler.r()));
+        const auto pdf = mixture.pdf(d);
+        if (!(pdf>0))
+            continue;
+        sample_weight = std::abs(glm::dot(d, fp_normal)) / pdf;
+        (void)optics.trace_nonsequential({ p,d }, stray.detector, stray.scatter_probability, sampler, &at_scatter);
+    }
+    return sum / samples;
 }
 
 // rays per analysed focal-plane point
@@ -334,13 +520,19 @@ std::shared_ptr<sensor::sensor_t> load(std::string id,
     bool ray_trace = false;
     f_t phase_space_extent_scale = 1;
     std::optional<angle_t> requested_alpha;
+    typename telescope_t::stray_light_t stray;
+    f_t scatter_probability = stray.scatter_probability;
+    std::vector<double> pst_angles;
+    std::uint32_t pst_samples = default_pst_samples;
 
     for (auto& item : node.children_view()) {
     try {
         transform_d_t t;
-        if (item.name() == "film")
+        if (item.name()=="string" && item["name"]=="pst_angles")
+            pst_angles = parse_angles(item["value"]);
+        else if (item.name() == "film")
             film.emplace(telescope_t::film_t::load(loader, item, telescope_t::beam_source_spatial_stddev, context));
-        else if (item.name()=="mirror" || item.name()=="stop" || item.name()=="obscuration")
+        else if (item.name()=="mirror" || item.name()=="stop" || item.name()=="obscuration" || item.name()=="tube")
             elements.emplace_back(load_element(loader, item, context));
         else if (scene::loader::load_transform(item, "focal_plane", t, loader)) {
             if (focal_plane)
@@ -353,6 +545,9 @@ std::shared_ptr<sensor::sensor_t> load(std::string id,
                  !scene::loader::read_attribute(item, "samples", samples_per_element) &&
                  !scene::loader::read_attribute(item, "alpha", requested_alpha) &&
                  !scene::loader::read_attribute(item, "ray_trace_only", ray_trace) &&
+                 !scene::loader::read_attribute(item, "stray_light", stray.enabled) &&
+                 !scene::loader::read_attribute(item, "scatter_probability", scatter_probability) &&
+                 !scene::loader::read_attribute(item, "pst_samples", pst_samples) &&
                  !scene::loader::read_attribute(item, "phase_space_extent_scale", phase_space_extent_scale))
             logger::cwarn()
                 << loader->node_description(item)
@@ -375,8 +570,13 @@ std::shared_ptr<sensor::sensor_t> load(std::string id,
         throw error("the 'focal_plane' transform (focal-plane array to telescope frame) must be provided");
     if (requested_alpha && *requested_alpha<=zero)
         throw error("'alpha' must be positive");
+    if (!(scatter_probability>=0 && scatter_probability<=1))
+        throw error("'scatter_probability' must be in [0,1]");
+    if (!pst_angles.empty() && pst_samples==0)
+        throw error("'pst_samples' must be positive");
+    stray.scatter_probability = scatter_probability;
 
-    std::shared_ptr<const optics::telescope_optics_t> optics;
+    std::shared_ptr<optics::telescope_optics_t> optics;
     try {
         optics = std::make_shared<optics::telescope_optics_t>(std::move(elements));
     } catch (const std::invalid_argument& exp) {
@@ -439,6 +639,43 @@ std::shared_ptr<sensor::sensor_t> load(std::string id,
         aim_grid.push_back(a.passed_fraction>0 && a.passing_cone.cos_half_angle<1 ? a.passing_cone : optics->aim(p));
     }
 
+    // the mirrors' reflective sides: those a ray from the film's centre that passes meets
+    {
+        const auto& cone = props.centre.passing_cone;
+        bool oriented = false;
+        for (int i=0; i<64 && !oriented; ++i) {
+            const auto designed = optics->trace_from_focal_plane({ fp_point(dims/2.), cone.sample(.75, i/64.) });
+            if (designed.passed) {
+                optics->orient(designed);
+                oriented = true;
+            }
+        }
+    }
+
+    // stray light: the hemisphere in front of the focal plane (the side the passing rays leave towards), and the
+    // focal-plane array
+    stray.front = glm::dot(props.centre.passing_cone.axis, fp_normal)>=0 ? fp_normal : -fp_normal;
+    stray.detector = optics::detector_t{
+        .to_telescope = fp.to_telescope,
+        .to_local = glm::inverse(fp.to_telescope),
+        .half_extent = dims/2. * fp.pixel_pitch,
+    };
+
+    // the point-source transmittance at the film's centre, at the film's mean wavelength
+    if (!pst_angles.empty()) {
+        const auto k = film->response()->sensitivity().mean_wavenumber();
+        const auto x = glm::dvec3{ fp.to_telescope[0] };
+        const auto los = props.centre.line_of_sight;
+        const auto towards_x = glm::normalize(x - glm::dot(x,los)*los);
+        for (const auto angle : pst_angles) {
+            const auto src = std::cos(angle)*los + std::sin(angle)*towards_x;
+            props.point_source_transmittance.emplace_back(
+                angle, point_source_transmittance(*optics, fp_point(dims/2.), fp_normal, props.centre,
+                                                  telescope_t::aim_tight_fraction, stray, src,
+                                                  k, pst_samples));
+        }
+    }
+
     const auto blur_pixels = props.centre.rms_spread * f / fp.pixel_pitch;
     if (blur_pixels>10)
         logger::cwarn()
@@ -474,6 +711,11 @@ std::shared_ptr<sensor::sensor_t> load(std::string id,
                        props.centre.pupil_diameter, props.centre.pupil_obscuration,
                        100*props.centre.passed_fraction, blur_pixels, props.corner_relative_throughput)
         << '\n';
+    for (const auto& [angle, pst] : props.point_source_transmittance)
+        logger::cout(verbosity_e::info)
+            << std::format("(telescope sensor) <{}>: point-source transmittance {:.4g} at {:g}° off the line of sight",
+                           id, pst, angle * 180/std::numbers::pi)
+            << '\n';
 
     return std::make_shared<telescope_t>(
         context,
@@ -481,7 +723,8 @@ std::shared_ptr<sensor::sensor_t> load(std::string id,
         std::move(optics),
         fp,
         place,
-        props,
+        std::move(props),
+        stray,
         std::move(aim_grid),
         std::move(film).value(),
         samples_per_element,

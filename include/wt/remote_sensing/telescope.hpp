@@ -57,8 +57,14 @@ namespace wt::remote_sensing {
  *        the film's centre, and dimmer where the optics vignette; as a `satellite_frame` camera's, the render is the
  *        radiance at the entrance pupil, for a detector model to scale by the aperture.
  *
+ *        Stray light (`stray_light_t`): the optics traced non-sequentially (`optics::telescope_optics_t::
+ *        trace_nonsequential`), so that light reaches the film by paths other than the design's (past baffles,
+ *        scattered by rough mirrors, reflected by baffles); and, when loading, the point-source transmittance at
+ *        given angles off the film centre's line of sight (`properties_t::point_source_transmittance`).
+ *
  *        Only backward transport is supported (backward `plt_path`): the sensor cannot connect to scene points
- *        (`sample_direct`). The GPU kernels port `sample` (wt/gpu/kernel/telescope.hpp), in their precision.
+ *        (`sample_direct`). The GPU kernels port `sample` (wt/gpu/kernel/telescope.hpp), in their precision, but not
+ *        its stray light.
  */
 template <bool polarimetric>
 class telescope_t final : public sensor::film_backed_sensor_t<2, polarimetric> {
@@ -94,6 +100,26 @@ public:
         optics::field_point_t centre;
         /** @brief Throughput of the film's corners, relative to its centre's. */
         double corner_relative_throughput;
+        /**
+         * @brief The point-source transmittance (PST) at the film's centre: of a distant point source at an angle
+         *        (radians) off the film centre's line of sight, towards the film's +x, the irradiance it gives the
+         *        film's centre by stray light (scattered, or reflected by baffles), over the irradiance it gives
+         *        the telescope's aperture; at the film's mean wavelength.
+         */
+        std::vector<std::pair<double, double>> point_source_transmittance;
+    };
+    /**
+     * @brief Stray light: whether samples are traced non-sequentially; and how. A rough mirror scatters with
+     *        probability at least `scatter_probability`; `hemisphere_fraction` of the samples' directions are drawn
+     *        from the hemisphere in front of the focal plane (about `front`), as light that bypasses the design's
+     *        paths may arrive from any of them. The focal-plane array (`detector`) absorbs.
+     */
+    struct stray_light_t {
+        bool enabled = false;
+        double scatter_probability = .1;
+        double hemisphere_fraction = .1;
+        glm::dvec3 front = { 0,0,-1 };
+        optics::detector_t detector;
     };
 
     /** @brief The cones of passing directions are found on aim_grid_size² points spanning the film. */
@@ -108,6 +134,7 @@ private:
     focal_plane_t fp;
     placement_t place;
     properties_t props;
+    stray_light_t stray;
     std::vector<optics::cone_t> aim_grid;      // row major, aim_grid_size²
     f_t tan_alpha;
     f_t phase_space_extent_scale;
@@ -156,6 +183,7 @@ public:
                 focal_plane_t focal_plane,
                 placement_t placement,
                 properties_t properties,
+                stray_light_t stray_light,
                 std::vector<optics::cone_t> aim_grid,
                 film_t film,
                 std::uint32_t samples_per_element,
@@ -171,7 +199,8 @@ public:
           optics(std::move(optics)),
           fp(focal_plane),
           place(placement),
-          props(properties),
+          props(std::move(properties)),
+          stray(stray_light),
           aim_grid(std::move(aim_grid)),
           tan_alpha(tan_alpha),
           phase_space_extent_scale(phase_space_extent_scale)
@@ -182,6 +211,7 @@ public:
     [[nodiscard]] inline const auto& properties() const noexcept { return props; }
     [[nodiscard]] inline const auto& focal_plane() const noexcept { return fp; }
     [[nodiscard]] inline const auto& placement() const noexcept { return place; }
+    [[nodiscard]] inline const auto& stray_light() const noexcept { return stray; }
     /** @brief The cones of passing directions, row major on aim_grid_size² points spanning the film. */
     [[nodiscard]] inline const auto& aim_cones() const noexcept { return aim_grid; }
 

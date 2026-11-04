@@ -338,6 +338,10 @@ WT_GPU_CONSTANT constexpr u32 telescope_aim_grid_size = 5;      // `telescope_t:
 WT_GPU_CONSTANT constexpr u32 telescope_mirror = 0;             // `optics::element_kind_e`
 WT_GPU_CONSTANT constexpr u32 telescope_stop = 1;
 WT_GPU_CONSTANT constexpr u32 telescope_obscuration = 2;
+WT_GPU_CONSTANT constexpr u32 telescope_tube = 3;
+
+/** @brief A rough mirror's TIS table (`optics::abg_scatter_t::tis_samples`): at |β₀| = 0, 1/64, ..., 1. */
+WT_GPU_CONSTANT constexpr u32 telescope_tis_samples = 65;
 
 /** @brief An ideal coating's substrate (`telescope_element::substrate`). */
 WT_GPU_CONSTANT constexpr u32 telescope_ideal = 0xffffffffu;
@@ -351,6 +355,10 @@ struct telescope_element {
     real aspheric[telescope_max_aspheric];
     vec2 aperture_centre;
     real aperture_radius2, hole_radius2;    // squared radii
+    real length;                            // a tube's (along local z)
+    /** @brief A rough mirror (`optics::abg_scatter_t`): its total integrated scatter, which its reflection loses. */
+    u32 rough;
+    real tis[telescope_tis_samples];
     real to_telescope[12];                  // rigid, row-major 3x4: element frame to telescope frame
     real to_local[12];                      // ... and back
     /**

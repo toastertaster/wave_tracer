@@ -36,10 +36,18 @@ number of mirrors. Lengths in the scene are in metres.
   aluminium, silver, gold   the bare metals (wave_tracer's refractive-index data)
   protected-aluminium       aluminium under 25 nm of magnesium fluoride (n = 1.38), as Hubble's mirrors
 
+Stray light (the sensor's stray_light and pst_angles): --scatter A,B,g makes every mirror rough, scattering by the
+ABg model; --baffles adds, to an on-axis two-mirror design, the baffles that keep the focal plane from seeing the scene
+past the secondary: a tube in front of the secondary (20% wider than it, long enough that the directions from the
+focal plane's centre between the secondary's edge and the primary's hole's meet it) and a vane over the part of the
+primary in the secondary's shadow (where light would reflect between the mirrors); of --baffle-reflectance (default 0,
+black).
+
     uv run tools/remote_sensing/telescope.py two-mirror --kind ritchey-chretien [--diameter 0.4 --focal-length 2.5 ...] > sensor.xml
 
 prints the sensor (with --altitude, --view-zenith, ... placing it, as strings, so that scene defines like $vz work).
-As a module, `two_mirror()` and `hubble()` return designs, and `sensor_xml()` writes them.
+As a module, `two_mirror()` and `hubble()` return designs, `coat()`, `roughen()` and `baffle()` modify them, and
+`sensor_xml()` writes them.
 """
 
 import argparse
@@ -51,8 +59,8 @@ import numpy as np
 
 @dataclasses.dataclass
 class Element:
-    """A mirror, stop or obscuration of the telescope sensor: its shape, clear aperture and placement (4×4, element
-    frame to telescope frame, metres)."""
+    """A mirror, stop, obscuration or tube of the telescope sensor: its shape, clear aperture and placement (4×4,
+    element frame to telescope frame, metres)."""
     kind: str
     id: str
     aperture_radius: float
@@ -63,6 +71,9 @@ class Element:
     hole_radius: float = 0.0
     aperture_centre: tuple[float, float] = (0.0, 0.0)
     coating: str = "ideal"
+    scatter: tuple[float, float, float] | None = None   # a mirror's ABg
+    length: float = 0.0                                 # a tube's
+    reflectance: float = 0.0                            # a stop's, obscuration's or tube's (Lambertian)
 
 
 @dataclasses.dataclass
@@ -185,6 +196,36 @@ def coat(design, coating):
                                                  for e in design.elements])
 
 
+def roughen(design, abg):
+    """The design with every mirror scattering by the ABg model, `abg` = (A, B, g)."""
+    return dataclasses.replace(design, elements=[dataclasses.replace(e, scatter=tuple(abg)) if e.kind == "mirror" else e
+                                                 for e in design.elements])
+
+
+def baffle(design, reflectance=0.0, margin=1e-3):
+    """An on-axis two-mirror design with baffles (see the module's doc): a tube in front of the secondary, and a vane
+    over the primary's shadowed zone."""
+    primary, secondary = design.elements[0], design.elements[1]
+    if any(primary.aperture_centre) or primary.kind != "mirror" or secondary.kind != "mirror":
+        raise ValueError("baffles are for on-axis two-mirror designs")
+    r_s, r_h = secondary.aperture_radius, primary.hole_radius
+    z_s = secondary.to_telescope[2, 3]
+    b = design.focal_plane[2, 3] if design.focal_plane[2, 2] < 0 else None
+    if b is None:
+        raise ValueError("baffles are for designs whose focal plane is behind the primary, facing it")
+    # the focal plane's centre sees past the secondary's edge at distance (b - z_s): a tube of radius 1.2 r_s meets
+    # those directions within (b - z_s)(1.2 - 1) beyond the secondary
+    radius = 1.2 * r_s
+    length = (b - z_s) * (radius / r_s - 1) * 1.5
+    elements = list(design.elements)
+    elements.append(Element("tube", "secondary baffle", radius, translation(z=z_s - length), length=length,
+                            reflectance=reflectance))
+    if r_h + margin < r_s - margin:
+        elements.append(Element("obscuration", "vane", r_s - margin, translation(z=-2 * margin),
+                                hole_radius=r_h + margin, reflectance=reflectance))
+    return dataclasses.replace(design, elements=elements)
+
+
 def _length(v):
     return f"{v:.12g}m"
 
@@ -218,8 +259,16 @@ def elements_xml(design, indent="    "):
             cx, cy = e.aperture_centre
             out.append(f'{i2}<vector name="aperture_centre" value="{_length(cx)}, {_length(cy)}"/>')
         out.append(_transform("to_telescope", e.to_telescope, i2))
+        if e.kind == "tube":
+            out.append(f'{i2}<quantity name="length" value="{_length(e.length)}"/>')
+        if e.reflectance:
+            out.append(f'{i2}<float name="reflectance" value="{e.reflectance:.6g}"/>')
         if e.kind == "mirror" and e.coating != "ideal":
             out.append(i2 + COATINGS[e.coating])
+        if e.kind == "mirror" and e.scatter:
+            a, b, g = e.scatter
+            out.append(f'{i2}<scatter type="abg"><float name="A" value="{a:.9g}"/><float name="B" value="{b:.9g}"/>'
+                       f'<float name="g" value="{g:.9g}"/></scatter>')
         out.append(f"{indent}</{e.kind}>")
     out.append(_transform("focal_plane", design.focal_plane, indent))
     return "\n".join(out)
@@ -266,6 +315,9 @@ def main():
     p.add_argument("--fold", type=float, help="m: a fold mirror this far before the focal plane")
     p.add_argument("--secondary-radius", type=float, help="m: the secondary's aperture radius (default: the field's)")
     p.add_argument("--coating", choices=list(COATINGS), default="ideal", help="every mirror's (default ideal)")
+    p.add_argument("--scatter", help="A,B,g: every mirror's ABg scatter (default: smooth)")
+    p.add_argument("--baffles", action="store_true", help="a secondary baffle tube and a vane (on-axis two-mirror)")
+    p.add_argument("--baffle-reflectance", type=float, default=0.0, help="the baffles' (Lambertian; default 0)")
     p.add_argument("--pixel-pitch", type=float, default=5e-6, help="m (default 5 µm)")
     p.add_argument("--pixels", type=int, default=256, help="film width and height (default 256)")
     p.add_argument("--altitude", default="500km")
@@ -286,6 +338,10 @@ def main():
                             field_radius=field, off_axis=args.off_axis, field_bias=math.radians(args.field_bias),
                             fold=args.fold, secondary_radius=args.secondary_radius)
     design = coat(design, args.coating)
+    if args.scatter:
+        design = roughen(design, [float(v) for v in args.scatter.split(",")])
+    if args.baffles:
+        design = baffle(design, args.baffle_reflectance)
     if args.elements_only:
         print(f"<!-- {design.name}: f = {design.focal_length:.6g} m, D = {design.entrance_pupil_diameter:.6g} m, "
               f"obscuration {design.obscuration:.3g}; for a {args.pixels}² film -->")

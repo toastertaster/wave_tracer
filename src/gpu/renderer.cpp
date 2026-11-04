@@ -862,6 +862,10 @@ sensor_spectral_t compile_telescope(const remote_sensing::telescope_t<polarimetr
     };
     if (elements.size()>k::telescope_max_elements)
         throw refuse(std::format("up to {} elements", k::telescope_max_elements));
+    if (tel.stray_light().enabled)
+        throw gpu_error_t(std::format(
+            "GPU rendering does not trace a telescope's stray light (non-sequentially) yet: render sensor <{}> on the CPU",
+            tel.get_id()));
 
     // (large: on the heap)
     auto desc = std::make_unique<k::telescope_desc>();
@@ -885,7 +889,14 @@ sensor_spectral_t compile_telescope(const remote_sensing::telescope_t<polarimetr
         auto& ke = T.elements[i];
         ke.kind = e.kind==ro::element_kind_e::mirror ? k::telescope_mirror :
                   e.kind==ro::element_kind_e::stop   ? k::telescope_stop :
+                  e.kind==ro::element_kind_e::tube   ? k::telescope_tube :
                                                            k::telescope_obscuration;
+        ke.length = real(e.length);
+        static_assert(ro::abg_scatter_t::tis_samples==k::telescope_tis_samples);
+        ke.rough = e.scatter ? 1 : 0;
+        if (e.scatter)
+            for (std::size_t j=0; j<k::telescope_tis_samples; ++j)
+                ke.tis[j] = real(e.scatter->tis_values()[j]);
         ke.curvature = real(e.shape.curvature);
         ke.conic = real(e.shape.conic);
         if (e.shape.aspheric.size()>k::telescope_max_aspheric)

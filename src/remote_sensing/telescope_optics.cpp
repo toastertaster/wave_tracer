@@ -13,6 +13,7 @@
 #include <stdexcept>
 
 #include <wt/remote_sensing/telescope_optics.hpp>
+#include <wt/sampler/sampler.hpp>
 
 using namespace wt::remote_sensing::optics;
 
@@ -120,10 +121,54 @@ std::optional<double> surface_shape_t::intersect(const ray_t& r, double tmin) co
 
 std::optional<element_t::hit_t> element_t::intersect(const ray_t& r, double tmin) const noexcept {
     const auto local = ray_t{ transform_point(to_local, r.o), transform_direction(to_local, r.d) };
+    if (kind==element_kind_e::tube) {
+        // x² + y² = R², the nearer root beyond tmin within the length
+        const auto& o = local.o;
+        const auto& d = local.d;
+        const auto A = d.x*d.x + d.y*d.y;
+        if (A==0)
+            return std::nullopt;
+        const auto B = o.x*d.x + o.y*d.y;
+        const auto C = o.x*o.x + o.y*o.y - aperture.radius*aperture.radius;
+        const auto D = B*B - A*C;
+        if (D<0)
+            return std::nullopt;
+        const auto q = -(B + std::copysign(std::sqrt(D), B));
+        auto t0 = q/A, t1 = q!=0 ? C/q : t0;
+        if (t0>t1)
+            std::swap(t0, t1);
+        for (const auto t : { t0, t1 }) {
+            const auto z = o.z + t*d.z;
+            if (t>tmin && z>=0 && z<=length)
+                return hit_t{ .t = t, .local = o + t*d };
+        }
+        return std::nullopt;
+    }
     const auto t = shape.intersect(local, tmin);
     if (!t)
         return std::nullopt;
     return hit_t{ .t = *t, .local = local.o + *t*local.d };
+}
+
+std::optional<element_t::hit_t> element_t::physical_hit(const ray_t& r, double tmin) const noexcept {
+    const auto hit = intersect(r, tmin);
+    if (!hit)
+        return std::nullopt;
+    const bool within = aperture.contains(hit->local.x, hit->local.y);
+    switch (kind) {
+    case element_kind_e::tube:  return hit;
+    case element_kind_e::stop:  return within ? std::nullopt : hit;
+    default:                    return within ? hit : std::nullopt;
+    }
+}
+
+glm::dvec3 element_t::normal_at(const glm::dvec3& local) const noexcept {
+    glm::dvec3 n = { 0,0,1 };
+    if (kind==element_kind_e::tube)
+        n = glm::dvec3{ local.x, local.y, 0 };
+    else if (kind==element_kind_e::mirror)
+        n = shape.normal(local.x, local.y).value_or(n);
+    return glm::normalize(transform_direction(to_telescope, n));
 }
 
 
@@ -149,11 +194,17 @@ telescope_optics_t::telescope_optics_t(std::vector<element_t> elements)
         if (!(e.aperture.hole_radius>=0) || !(e.aperture.hole_radius<e.aperture.radius))
             throw std::invalid_argument(std::format("element {}: the hole's radius must be in [0, aperture radius)", name));
         if (e.kind!=element_kind_e::mirror && (e.shape.curvature!=0 || !e.shape.aspheric.empty()))
-            throw std::invalid_argument(std::format("element {}: stops and obscurations are flat", name));
+            throw std::invalid_argument(std::format("element {}: stops, obscurations and tubes are flat", name));
+        if (e.kind==element_kind_e::tube && !(e.length>0))
+            throw std::invalid_argument(std::format("element {}: a tube's length must be positive", name));
+        if (!(e.reflectance>=0 && e.reflectance<=1))
+            throw std::invalid_argument(std::format("element {}: the reflectance must be in [0,1]", name));
+        if (e.kind!=element_kind_e::mirror && e.scatter)
+            throw std::invalid_argument(std::format("element {}: only mirrors scatter (ABg)", name));
         if (!e.shape.sag(glm::dot(e.aperture.centre, e.aperture.centre) +
                          e.aperture.radius*(e.aperture.radius + 2*glm::length(e.aperture.centre))))
             throw std::invalid_argument(std::format("element {}: the aperture extends beyond the conic", name));
-        if (e.kind!=element_kind_e::obscuration)
+        if (e.kind==element_kind_e::mirror || e.kind==element_kind_e::stop)
             seq.push_back(i);
     }
     const auto mirrors = std::ranges::count_if(elems, [](const auto& e) { return e.kind==element_kind_e::mirror; });
@@ -185,8 +236,8 @@ std::size_t telescope_optics_t::obstacle(const ray_t& r, double tmax,
         const auto& e = elems[i];
         if (i==from || i==to || e.kind==element_kind_e::stop)
             continue;
-        const auto hit = e.intersect(r, self_intersection_epsilon);
-        if (hit && hit->t<tmax-self_intersection_epsilon && e.aperture.contains(hit->local.x, hit->local.y))
+        const auto hit = e.physical_hit(r, self_intersection_epsilon);
+        if (hit && hit->t<tmax-self_intersection_epsilon)
             return i;
     }
     return npos;
@@ -222,6 +273,11 @@ telescope_optics_t::trace_t telescope_optics_t::trace_from_focal_plane(const ray
                 n = -n;
             d = glm::normalize(d - 2*glm::dot(d,n)*n);
             ret.reflections[ret.reflection_count++] = { .element = idx, .normal = n, .d_in = ray.d, .d_out = d };
+            // a rough mirror scatters some of the light out of the image: |β₀| = sin θᵢ
+            if (e.scatter) {
+                const auto c = glm::dot(d,n);
+                ret.weight *= 1 - e.scatter->tis(std::sqrt(std::max(0., 1 - c*c)));
+            }
         }
         ray = ray_t{ p,d };
         from = idx;
@@ -309,4 +365,139 @@ field_point_t telescope_optics_t::analyse(const glm::dvec3& p, const glm::dvec3&
     ret.passing_cone = { .axis = axis, .cos_half_angle = cos_half_angle };
 
     return ret;
+}
+
+
+void telescope_optics_t::orient(const trace_t& designed) noexcept {
+    for (std::uint32_t i=0; i<designed.reflection_count; ++i) {
+        const auto& r = designed.reflections[i];
+        auto& e = elems[r.element];
+        // the side `r.normal` (facing the ray) is on: the element's local +z side, or not (its surface's normals
+        // facing local +z are within 90° of local +z)
+        const auto lz = glm::normalize(transform_direction(e.to_telescope, { 0,0,1 }));
+        e.reflective_side = glm::dot(r.normal, lz)>=0 ? 1 : -1;
+    }
+}
+
+std::size_t telescope_optics_t::nearest(const ray_t& r, double tmin, const detector_t& det,
+                                        double& t, glm::dvec3& local) const noexcept {
+    auto found = npos;
+    t = std::numeric_limits<double>::infinity();
+    for (std::size_t i=0; i<elems.size(); ++i) {
+        const auto hit = elems[i].physical_hit(r, tmin);
+        if (hit && hit->t<t) {
+            t = hit->t;
+            local = hit->local;
+            found = i;
+        }
+    }
+    // the detector's plane
+    const auto o = transform_point(det.to_local, r.o);
+    const auto d = transform_direction(det.to_local, r.d);
+    if (d.z!=0) {
+        const auto td = -o.z/d.z;
+        const auto p = o + td*d;
+        if (td>tmin && td<t && std::abs(p.x)<=det.half_extent.x && std::abs(p.y)<=det.half_extent.y) {
+            t = td;
+            found = stopped_by_detector;
+        }
+    }
+    return found;
+}
+
+bool telescope_optics_t::escapes(const ray_t& r, double tmin, const detector_t& det) const noexcept {
+    double t;
+    glm::dvec3 local;
+    return nearest(r, tmin, det, t, local)==npos;
+}
+
+namespace {
+
+// an orthonormal tangent frame about unit n
+void tangent_frame(const glm::dvec3& n, glm::dvec3& t, glm::dvec3& b) noexcept {
+    const auto helper = std::abs(n.x)<.9 ? glm::dvec3{ 1,0,0 } : glm::dvec3{ 0,1,0 };
+    t = glm::normalize(glm::cross(helper, n));
+    b = glm::cross(n, t);
+}
+
+}
+
+telescope_optics_t::trace_t telescope_optics_t::trace_nonsequential(
+        const ray_t& r, const detector_t& det, double scatter_probability,
+        sampler::sampler_t& sampler,
+        const std::function<void(const scatter_point_t&)>* at_scatter) const {
+    trace_t ret;
+    auto ray = r;
+    while (true) {
+        double t;
+        glm::dvec3 local;
+        const auto idx = nearest(ray, self_intersection_epsilon, det, t, local);
+        if (idx==npos) {
+            ret.passed = true;
+            ret.exit = ray;
+            return ret;
+        }
+        ret.stopped_by = idx;
+        if (idx==stopped_by_detector || ret.reflection_count==max_events)
+            return ret;
+
+        const auto& e = elems[idx];
+        const auto p = ray.o + t*ray.d;
+        auto n = e.normal_at(local);
+        const bool against = glm::dot(ray.d, n)<0;     // the ray meets the side n faces
+        if (!against)
+            n = -n;
+        auto event = reflection_t{ .element = idx, .normal = n, .d_in = ray.d, .d_out = ray.d };
+
+        if (e.kind==element_kind_e::mirror) {
+            // the back of a mirror absorbs
+            if (e.reflective_side!=0 && (e.reflective_side>0)!=against)
+                return ret;
+            const auto spec = glm::normalize(ray.d - 2*glm::dot(ray.d,n)*n);
+            if (!e.scatter) {
+                event.d_out = spec;
+            } else {
+                if (at_scatter)
+                    (*at_scatter)({ .p = p, .d_in = ray.d, .element = idx, .normal = n, .so_far = ret });
+                const auto c = glm::dot(spec, n);
+                const auto beta0_len = std::sqrt(std::max(0., 1 - c*c));
+                const auto tis = e.scatter->tis(beta0_len);
+                const auto p_scatter = std::clamp(std::max(tis, scatter_probability), 0., 1.);
+                if (double(sampler.r())>=p_scatter) {
+                    event.d_out = spec;
+                    ret.weight *= (1-tis) / (1-p_scatter);
+                } else {
+                    // about the specular direction, in its projection on the tangent plane
+                    glm::dvec3 tt, bb;
+                    tangent_frame(n, tt, bb);
+                    const auto beta0 = glm::dvec2{ glm::dot(spec,tt), glm::dot(spec,bb) };
+                    const auto u = sampler.r2();
+                    const auto smp = e.scatter->sample(double(sampler.r()), double(u.x), double(u.y));
+                    const auto beta = beta0 + smp.offset;
+                    const auto b2 = glm::dot(beta, beta);
+                    if (!(b2<1) || smp.recp_pdf==0)
+                        return ret;         // evanescent: nothing scattered there
+                    event.d_out = glm::normalize(beta.x*tt + beta.y*bb + std::sqrt(1-b2)*n);
+                    event.kind = event_kind_e::scattered;
+                    ret.weight *= e.scatter->bsdf(glm::length(smp.offset)) * smp.recp_pdf / p_scatter;
+                }
+            }
+        } else {
+            // a Lambertian reflection, of its reflectance (sampled)
+            if (!(e.reflectance>0))
+                return ret;
+            if (at_scatter)
+                (*at_scatter)({ .p = p, .d_in = ray.d, .element = idx, .normal = n, .so_far = ret });
+            if (double(sampler.r())>=e.reflectance)
+                return ret;
+            const auto local_dir = sampler::sampler_t::cosine_hemisphere(sampler.r2());
+            glm::dvec3 tt, bb;
+            tangent_frame(n, tt, bb);
+            event.d_out = glm::normalize(double(local_dir.x)*tt + double(local_dir.y)*bb + double(local_dir.z)*n);
+            event.kind = event_kind_e::diffuse;
+        }
+
+        ret.reflections[ret.reflection_count++] = event;
+        ray = ray_t{ p, event.d_out };
+    }
 }
