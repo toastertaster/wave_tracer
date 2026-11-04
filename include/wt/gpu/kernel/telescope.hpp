@@ -15,8 +15,9 @@
 
 /*
  * The telescope sensor on the GPU: a port of `remote_sensing::telescope_t::sample` (src/remote_sensing/telescope.cpp),
- * of the ray tracing of its optics (`optics::telescope_optics_t::trace_from_focal_plane`, `surface_shape_t`,
- * src/remote_sensing/telescope_optics.cpp) and of its mirrors' coatings (`optics::coating_t::reflection`,
+ * of the ray tracing of its optics (`optics::telescope_optics_t::trace_from_focal_plane`, and, for stray light,
+ * `trace_nonsequential`; `surface_shape_t`, src/remote_sensing/telescope_optics.cpp), of its mirrors' scatter
+ * (`optics::abg_scatter_t`) and of its mirrors' coatings (`optics::coating_t::reflection`,
  * src/remote_sensing/telescope_coating.cpp). The host computes what the sensor computes when loading (its focal
  * lengths, the cones of passing directions; see `telescope_desc`).
  *
@@ -195,15 +196,118 @@ WT_GPU_FN bool telescope_intersect(const WT_GPU_GLOBAL telescope_element& e, vec
 }
 
 /** @brief `abg_scatter_t::tis`: a rough mirror's TIS at |β₀| = `beta0` (interpolated in its table). */
-WT_GPU_FN real telescope_tis(const WT_GPU_GLOBAL telescope_element& e, real beta0) {
+WT_GPU_FN real telescope_tis(const WT_GPU_GLOBAL telescope_scatter& sc, real beta0) {
     const real x = clamp(beta0, real(0), real(1)) * real(telescope_tis_samples-1);
     const u32 i = min(u32(x), telescope_tis_samples-2);
     const real f = x - real(i);
-    return (1-f)*e.tis[i] + f*e.tis[i+1];
+    return (1-f)*sc.tis[i] + f*sc.tis[i+1];
+}
+
+/** @brief `abg_scatter_t::bsdf` */
+WT_GPU_FN real telescope_bsdf(const WT_GPU_GLOBAL telescope_scatter& sc, real offset) {
+    return sc.A / (sc.B + pow(offset, sc.g));
+}
+
+/**
+ * @brief `abg_scatter_t::sample`: an offset β - β₀ from three uniform numbers, and one over its density (in d²β; 0
+ *        if none).
+ */
+WT_GPU_FN vec2 telescope_sample_scatter(const WT_GPU_GLOBAL telescope_scatter& sc, real u1, real u2, real u3,
+                                        WT_GPU_THREAD real& recp_pdf) {
+    // the bin whose CDF interval holds u1
+    u32 lo = 0, hi = telescope_scatter_bins-1;
+    while (lo<hi) {
+        const u32 mid = (lo+hi)/2;
+        if (u1<sc.cdf[mid+1]) hi = mid;
+        else lo = mid+1;
+    }
+    const real a = sc.edges[lo], b = sc.edges[lo+1];
+    const real r = sqrt(a*a + u2*(b*b - a*a));
+    const real phi = two_pi*u3;
+    const real mass = sc.cdf[lo+1] - sc.cdf[lo];
+    recp_pdf = mass>real(0) ? pi*(b*b - a*a) / mass : real(0);
+    return vec2{ cos(phi), sin(phi) } * r;
 }
 
 /** @brief No element. */
 WT_GPU_CONSTANT constexpr u32 telescope_none = 0xffffffffu;
+/** @brief The focal-plane array, as a ray's nearest obstacle (`telescope_optics_t::stopped_by_detector`). */
+WT_GPU_CONSTANT constexpr u32 telescope_detector = 0xfffffffeu;
+
+/** @brief A reflection's kind (`telescope_optics_t::event_kind_e`). */
+WT_GPU_CONSTANT constexpr u32 telescope_specular = 0;
+WT_GPU_CONSTANT constexpr u32 telescope_scattered = 1;
+WT_GPU_CONSTANT constexpr u32 telescope_diffuse = 2;
+
+/** @brief `element_t::physical_hit`: a mirror or obscuration within its aperture, a tube, or a stop's plate. */
+WT_GPU_FN bool telescope_physical_hit(const WT_GPU_GLOBAL telescope_element& e, vec3 o, vec3 d, real tmin,
+                                      WT_GPU_THREAD real& t, WT_GPU_THREAD vec3& local) {
+    if (!telescope_intersect(e, o, d, tmin, t, local))
+        return false;
+    if (e.kind==telescope_tube)
+        return true;
+    const bool within = telescope_aperture_contains(e, local);
+    return e.kind==telescope_stop ? !within : within;
+}
+
+/** @brief `element_t::normal_at`: the unit normal (telescope frame) at a hit's local point. */
+WT_GPU_FN vec3 telescope_normal_at(const WT_GPU_GLOBAL telescope_element& e, vec3 local) {
+    vec3 n = { 0,0,1 };
+    if (e.kind==telescope_tube) {
+        n = vec3{ local.x, local.y, 0 };
+    } else if (e.kind==telescope_mirror) {
+        vec3 nl;
+        if (telescope_normal(e, local.x, local.y, nl))
+            n = nl;
+    }
+    return normalize(affine_direction(e.to_telescope, n));
+}
+
+/**
+ * @brief `telescope_optics_t::nearest`: the nearest element, or the detector (telescope_detector), that the ray
+ *        (o,d) physically meets beyond `tmin`; telescope_none if none.
+ */
+WT_GPU_FN u32 telescope_nearest(const WT_GPU_GLOBAL telescope_desc& T, vec3 o, vec3 d, real tmin,
+                                WT_GPU_THREAD real& t, WT_GPU_THREAD vec3& local) {
+    u32 found = telescope_none;
+    t = inf();
+    for (u32 i=0; i<T.element_count; ++i) {
+        real ti;
+        vec3 li;
+        if (telescope_physical_hit(T.elements[i], o, d, tmin, ti, li) && ti<t) {
+            t = ti;
+            local = li;
+            found = i;
+        }
+    }
+    const vec3 lo = affine_point(T.fp_to_local, o);
+    const vec3 ld = affine_direction(T.fp_to_local, d);
+    if (ld.z!=real(0)) {
+        const real td = -lo.z/ld.z;
+        const vec3 q = lo + td*ld;
+        if (td>tmin && td<t && abs(q.x)<=T.fp_half_extent.x && abs(q.y)<=T.fp_half_extent.y) {
+            t = td;
+            found = telescope_detector;
+        }
+    }
+    return found;
+}
+
+/** @brief An orthonormal tangent frame (t, b) about unit `n` (as telescope_optics.cpp's `tangent_frame`). */
+WT_GPU_FN void telescope_tangent_frame(vec3 n, WT_GPU_THREAD vec3& t, WT_GPU_THREAD vec3& b) {
+    const vec3 helper = abs(n.x)<real(.9) ? vec3{ 1,0,0 } : vec3{ 0,1,0 };
+    t = normalize(cross(helper, n));
+    b = cross(n, t);
+}
+
+/** @brief A direction of the hemisphere about unit `axis`, cosine-distributed, from two uniform numbers. */
+WT_GPU_FN vec3 telescope_cosine_hemisphere(vec3 axis, vec2 u) {
+    const real r = sqrt(u.x);
+    const real phi = two_pi*u.y;
+    vec3 t, b;
+    telescope_tangent_frame(axis, t, b);
+    return normalize(r*cos(phi)*t + r*sin(phi)*b + sqrt(max(real(0), 1-u.x))*axis);
+}
 
 /**
  * @brief `telescope_optics_t::obstacle`: whether a mirror, obscuration or tube, other than elements `from` and
@@ -256,10 +360,10 @@ WT_GPU_FN bool telescope_trace(const WT_GPU_GLOBAL telescope_desc& T, WT_GPU_THR
             if (dot(d,n)>real(0))
                 n = -n;
             const vec3 dout = normalize(d - 2*dot(d,n)*n);
-            reflected(idx, n, d, dout);
-            if (e.rough!=0) {
+            reflected(idx, n, d, dout, telescope_specular);
+            if (e.scatter!=telescope_smooth) {
                 const real c = dot(dout, n);
-                weight *= 1 - telescope_tis(e, sqrt(max(real(0), 1 - c*c)));
+                weight *= 1 - telescope_tis(T.scatters[e.scatter], sqrt(max(real(0), 1 - c*c)));
             }
             d = dout;
         }
@@ -269,6 +373,80 @@ WT_GPU_FN bool telescope_trace(const WT_GPU_GLOBAL telescope_desc& T, WT_GPU_THR
 
     // out towards the scene
     return !telescope_obstructed(T, o, d, inf(), from, telescope_none);
+}
+
+/**
+ * @brief `telescope_optics_t::trace_nonsequential`: traces the ray (o,d), leaving the focal plane, backwards through
+ *        the optics non-sequentially (stray light): calls `reflected(element, n, d_in, d_out, kind)` at each
+ *        reflection, multiplies `weight` by the probabilities' weights. Returns whether the ray leaves the telescope,
+ *        towards the scene, from (o,d).
+ */
+template <typename Reflected>
+WT_GPU_FN bool telescope_trace_nonsequential(const WT_GPU_GLOBAL telescope_desc& T,
+                                             WT_GPU_THREAD vec3& o, WT_GPU_THREAD vec3& d,
+                                             WT_GPU_THREAD real& weight, WT_GPU_THREAD rng& rnd,
+                                             Reflected reflected) {
+    for (u32 events=0; ; ++events) {
+        real t;
+        vec3 local;
+        const u32 idx = telescope_nearest(T, o, d, telescope_epsilon(o), t, local);
+        if (idx==telescope_none)
+            return true;
+        if (idx==telescope_detector || events==telescope_max_events)
+            return false;
+
+        const WT_GPU_GLOBAL telescope_element& e = T.elements[idx];
+        const vec3 p = o + t*d;
+        vec3 n = telescope_normal_at(e, local);
+        const bool against = dot(d, n)<real(0);    // the ray meets the side n faces
+        if (!against)
+            n = -n;
+
+        vec3 dout;
+        u32 kind = telescope_specular;
+        if (e.kind==telescope_mirror) {
+            // the back of a mirror absorbs
+            if (e.reflective_side!=0 && (e.reflective_side>0)!=against)
+                return false;
+            const vec3 spec = normalize(d - 2*dot(d,n)*n);
+            dout = spec;
+            if (e.scatter!=telescope_smooth) {
+                const WT_GPU_GLOBAL telescope_scatter& sc = T.scatters[e.scatter];
+                const real c = dot(spec, n);
+                const real tis = telescope_tis(sc, sqrt(max(real(0), 1 - c*c)));
+                const real p_scatter = clamp(max(tis, T.scatter_probability), real(0), real(1));
+                if (!(rnd.r()<p_scatter)) {
+                    weight *= (1-tis) / (1-p_scatter);
+                } else {
+                    // about the specular direction, in its projection on the tangent plane
+                    vec3 tt, bb;
+                    telescope_tangent_frame(n, tt, bb);
+                    const vec2 beta0 = { dot(spec,tt), dot(spec,bb) };
+                    const real u1 = rnd.r();
+                    const vec2 u = rnd.r2();
+                    real recp_pdf;
+                    const vec2 offset = telescope_sample_scatter(sc, u1, u.x, u.y, recp_pdf);
+                    const vec2 beta = beta0 + offset;
+                    const real b2 = dot(beta, beta);
+                    if (!(b2<real(1)) || recp_pdf==real(0))
+                        return false;       // evanescent: nothing scattered there
+                    dout = normalize(beta.x*tt + beta.y*bb + sqrt(1-b2)*n);
+                    kind = telescope_scattered;
+                    weight *= telescope_bsdf(sc, length(offset)) * recp_pdf / p_scatter;
+                }
+            }
+        } else {
+            // a Lambertian reflection, of its reflectance (sampled)
+            if (!(e.reflectance>real(0)) || !(rnd.r()<e.reflectance))
+                return false;
+            dout = telescope_cosine_hemisphere(n, rnd.r2());
+            kind = telescope_diffuse;
+        }
+
+        reflected(idx, n, d, dout, kind);
+        o = p;
+        d = dout;
+    }
 }
 
 
@@ -453,14 +631,19 @@ WT_GPU_FN telescope_sample_t sample_telescope(const WT_GPU_GLOBAL telescope_desc
 
     // a direction towards the optics, from the mixture of the cone of passing directions and the cone bounding all
     // that can pass
+    // (with stray light, some from the hemisphere in front of the focal plane, cosine-distributed)
     const telescope_sampling_cone tight = telescope_passing_cone(T, film_pos, dims);
     const telescope_sampling_cone bound = telescope_aim(T, p);
+    const real h = T.stray_light!=0 ? T.hemisphere_fraction : real(0);
     const vec2 u = rnd.r2();
-    const bool from_tight = rnd.r()<T.aim_tight_fraction;
-    const vec3 d = from_tight ? tight.sample(u) : bound.sample(u);
+    const real choice = rnd.r();
+    const u32 component = choice<h ? 0 : choice<h + (1-h)*T.aim_tight_fraction ? 1 : 2;
+    const vec3 d = component==0 ? telescope_cosine_hemisphere(T.front, u) :
+                   component==1 ? tight.sample(u) : bound.sample(u);
     const real pdf =
-        (from_tight || tight.contains(d) ? T.aim_tight_fraction / tight.solid_angle() : real(0)) +
-        (!from_tight || bound.contains(d) ? (1-T.aim_tight_fraction) / bound.solid_angle() : real(0));
+        h * max(real(0), dot(d, T.front)) * inv_pi +
+        (1-h) * ((component==1 || tight.contains(d) ? T.aim_tight_fraction / tight.solid_angle() : real(0)) +
+                 (component==2 || bound.contains(d) ? (1-T.aim_tight_fraction) / bound.solid_angle() : real(0)));
 
     // the polarization: the mirrors' reflections, composed in s-p frames, from the detector's frame (Q along the
     // film's x) to the frame of the light arriving from the scene (the beam's operator's incident frame)
@@ -473,17 +656,25 @@ WT_GPU_FN telescope_sample_t sample_telescope(const WT_GPU_GLOBAL telescope_desc
     const WT_GPU_GLOBAL complex* iors = spec.telescope_iors;
     const real k = spec.k;
 
-    vec3 o = p, dir = d;
-    real trace_weight = 1;
-    const bool passed = telescope_trace(T, o, dir, trace_weight, [&](u32 element, vec3 n, vec3 din, vec3 dout) {
-        complex rs, rp;
-        telescope_coating(T, T.elements[element], k, iors, dot(dout, n), rs, rp);
-        const mueller_block M = mueller_fresnel(rs, rp);
+    // (scatter depolarizes: a rough mirror's, of its coating's reflectance; a baffle's, whose reflectance is sampled)
+    const auto reflected = [&](u32 element, vec3 n, vec3 din, vec3 dout, u32 kind) {
+        mueller_block M = mueller_block::depolarizer(1);
+        if (kind!=telescope_diffuse) {
+            complex rs, rp;
+            telescope_coating(T, T.elements[element], k, iors, dot(dout, n), rs, rp);
+            M = kind==telescope_specular ? mueller_fresnel(rs, rp) :
+                                           mueller_block::depolarizer((norm(rs) + norm(rp)) / 2);
+        }
         const frame out = telescope_sp_frame(din, n);
         S = row_compose(S, M, F, out);
         b.rows.compose(M, F, out);
         F = telescope_sp_frame(dout, n);
-    });
+    };
+    vec3 o = p, dir = d;
+    real trace_weight = 1;
+    const bool passed = T.stray_light!=0 ?
+        telescope_trace_nonsequential(T, o, dir, trace_weight, rnd, reflected) :
+        telescope_trace(T, o, dir, trace_weight, reflected);
 
     // projected solid angle over its sampling density, relative to the film centre's
     const real weight = passed && pdf>real(0) ?

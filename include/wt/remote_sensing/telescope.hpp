@@ -63,8 +63,8 @@ namespace wt::remote_sensing {
  *        given angles off the film centre's line of sight (`properties_t::point_source_transmittance`).
  *
  *        Only backward transport is supported (backward `plt_path`): the sensor cannot connect to scene points
- *        (`sample_direct`). The GPU kernels port `sample` (wt/gpu/kernel/telescope.hpp), in their precision, but not
- *        its stray light.
+ *        (`sample_direct`). The GPU kernels port `sample` (wt/gpu/kernel/telescope.hpp), stray light included, in
+ *        their precision.
  */
 template <bool polarimetric>
 class telescope_t final : public sensor::film_backed_sensor_t<2, polarimetric> {

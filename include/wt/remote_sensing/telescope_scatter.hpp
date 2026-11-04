@@ -59,6 +59,9 @@ public:
     /** @brief The TIS at incidence |β₀| (interpolated in its table). */
     [[nodiscard]] double tis(double beta0) const noexcept;
     [[nodiscard]] inline const auto& tis_values() const noexcept { return tis_table; }
+    /** @brief The sampling table: the bins' radii (`sampling_bins`+1), and the CDF of their masses at them. */
+    [[nodiscard]] inline const auto& sampling_edges() const noexcept { return edges; }
+    [[nodiscard]] inline const auto& sampling_cdf() const noexcept { return cdf; }
 
     /** @brief An offset β - β₀ from three uniform numbers in [0,1). */
     [[nodiscard]] sample_t sample(double u1, double u2, double u3) const noexcept;

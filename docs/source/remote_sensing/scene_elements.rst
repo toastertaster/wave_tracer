@@ -227,8 +227,8 @@ A render cannot find a point source by its rays (a ``directional`` emitter, the 
 **Limitations.**
 Only backward ``plt_path``: the sensor cannot connect to scene points, as ``plt_bdpt`` and forward ``plt_path`` need (scenes are refused).
 On the GPU, the kernels trace the optics in their precision: in single precision, directions leaving the telescope are accurate to ~10⁻⁷ rad, a twentieth of a pixel for the tests' designs (f = 2.5 m, 5 µm pixels), but more than one for Hubble's (f = 57.6 m; the GPU warns when it is more than a tenth): render long focal lengths on the CPU, or with ``GPU_DBL_PRECISION``.
-The GPU supports up to 32 elements, 8 aspheric terms per surface, and 16 coating layers and 16 refractive indices over all coatings.
-Stray light: on the CPU only (the GPU refuses it); a ray scattered off a mirror does not meet that mirror again; mirrors have no edges or substrates beyond their apertures; baffles are Lambertian; the PST counts the source's light where it shines directly on a scattering surface, not after specular reflections (e.g. the sun reflected by the primary onto a baffle), and only at the film's centre.
+The GPU supports up to 32 elements, 8 aspheric terms per surface, 16 coating layers and 16 refractive indices over all coatings, and 8 distinct mirror scatter models.
+Stray light: a ray scattered off a mirror does not meet that mirror again; mirrors have no edges or substrates beyond their apertures; baffles are Lambertian; the PST counts the source's light where it shines directly on a scattering surface, not after specular reflections (e.g. the sun reflected by the primary onto a baffle), and only at the film's centre.
 The focal plane is flat, and the scene loader reads transforms in single precision (their rotations are orthonormalized again; translations are good to ~0.1 µm per metre).
 
 

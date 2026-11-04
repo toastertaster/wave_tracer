@@ -862,10 +862,6 @@ sensor_spectral_t compile_telescope(const remote_sensing::telescope_t<polarimetr
     };
     if (elements.size()>k::telescope_max_elements)
         throw refuse(std::format("up to {} elements", k::telescope_max_elements));
-    if (tel.stray_light().enabled)
-        throw gpu_error_t(std::format(
-            "GPU rendering does not trace a telescope's stray light (non-sequentially) yet: render sensor <{}> on the CPU",
-            tel.get_id()));
 
     // (large: on the heap)
     auto desc = std::make_unique<k::telescope_desc>();
@@ -875,6 +871,7 @@ sensor_spectral_t compile_telescope(const remote_sensing::telescope_t<polarimetr
     std::vector<const spectrum::spectrum_t*> iors;
     std::map<const ro::coating_t*, std::pair<std::uint32_t, std::uint32_t>> coatings;     // substrate, first layer
     std::uint32_t layers = 0;
+    std::map<const ro::abg_scatter_t*, std::uint32_t> scatters;
     const auto add_ior = [&](const spectrum::spectrum_t* s) {
         if (iors.size()>=k::telescope_max_iors)
             throw refuse(std::format("coatings of up to {} refractive indices (of substrates and layers) in all",
@@ -892,11 +889,32 @@ sensor_spectral_t compile_telescope(const remote_sensing::telescope_t<polarimetr
                   e.kind==ro::element_kind_e::tube   ? k::telescope_tube :
                                                            k::telescope_obscuration;
         ke.length = real(e.length);
-        static_assert(ro::abg_scatter_t::tis_samples==k::telescope_tis_samples);
-        ke.rough = e.scatter ? 1 : 0;
-        if (e.scatter)
-            for (std::size_t j=0; j<k::telescope_tis_samples; ++j)
-                ke.tis[j] = real(e.scatter->tis_values()[j]);
+        ke.reflectance = real(e.reflectance);
+        ke.reflective_side = e.reflective_side;
+        ke.scatter = k::telescope_smooth;
+        if (e.scatter) {
+            // each distinct scatter model once
+            auto it = scatters.find(e.scatter.get());
+            if (it==scatters.end()) {
+                if (scatters.size()>=k::telescope_max_scatters)
+                    throw refuse(std::format("up to {} distinct mirror scatter models", k::telescope_max_scatters));
+                const auto& sc = *e.scatter;
+                auto& ks = T.scatters[scatters.size()];
+                static_assert(ro::abg_scatter_t::tis_samples==k::telescope_tis_samples &&
+                              ro::abg_scatter_t::sampling_bins==k::telescope_scatter_bins);
+                ks.A = real(sc.a());
+                ks.B = real(sc.b());
+                ks.g = real(sc.exponent());
+                for (std::size_t j=0; j<k::telescope_tis_samples; ++j)
+                    ks.tis[j] = real(sc.tis_values()[j]);
+                for (std::size_t j=0; j<=k::telescope_scatter_bins; ++j) {
+                    ks.edges[j] = real(sc.sampling_edges()[j]);
+                    ks.cdf[j] = real(sc.sampling_cdf()[j]);
+                }
+                it = scatters.emplace(e.scatter.get(), std::uint32_t(scatters.size())).first;
+            }
+            ke.scatter = it->second;
+        }
         ke.curvature = real(e.shape.curvature);
         ke.conic = real(e.shape.conic);
         if (e.shape.aspheric.size()>k::telescope_max_aspheric)
@@ -960,6 +978,15 @@ sensor_spectral_t compile_telescope(const remote_sensing::telescope_t<polarimetr
     T.world_line_of_sight = dvec_to_kernel(world_los);
     T.near_origin = dvec_to_kernel(place.position + place.near_clip*world_los);
     T.recp_projected_solid_angle = real(1 / centre.projected_solid_angle);
+
+    // stray light
+    const auto& stray = tel.stray_light();
+    T.stray_light = stray.enabled ? 1 : 0;
+    T.scatter_probability = real(stray.scatter_probability);
+    T.hemisphere_fraction = real(stray.hemisphere_fraction);
+    T.front = dvec_to_kernel(stray.front);
+    compile_rigid(stray.detector.to_local, T.fp_to_local);
+    T.fp_half_extent = { real(stray.detector.half_extent.x), real(stray.detector.half_extent.y) };
 
     // the kernels' precision: directions leaving the telescope are accurate to about its epsilon
     const auto pixel_angle = fp.pixel_pitch /

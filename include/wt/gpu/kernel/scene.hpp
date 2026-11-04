@@ -342,6 +342,13 @@ WT_GPU_CONSTANT constexpr u32 telescope_tube = 3;
 
 /** @brief A rough mirror's TIS table (`optics::abg_scatter_t::tis_samples`): at |β₀| = 0, 1/64, ..., 1. */
 WT_GPU_CONSTANT constexpr u32 telescope_tis_samples = 65;
+/** @brief The bins of a rough mirror's sampling table (`optics::abg_scatter_t::sampling_bins`). */
+WT_GPU_CONSTANT constexpr u32 telescope_scatter_bins = 256;
+WT_GPU_CONSTANT constexpr u32 telescope_max_scatters = 8;      // distinct mirror scatter models
+/** @brief A smooth mirror (`telescope_element::scatter`). */
+WT_GPU_CONSTANT constexpr u32 telescope_smooth = 0xffffffffu;
+/** @brief Most reflections a ray traced non-sequentially makes (`telescope_optics_t::max_events`). */
+WT_GPU_CONSTANT constexpr u32 telescope_max_events = 32;
 
 /** @brief An ideal coating's substrate (`telescope_element::substrate`). */
 WT_GPU_CONSTANT constexpr u32 telescope_ideal = 0xffffffffu;
@@ -356,9 +363,12 @@ struct telescope_element {
     vec2 aperture_centre;
     real aperture_radius2, hole_radius2;    // squared radii
     real length;                            // a tube's (along local z)
-    /** @brief A rough mirror (`optics::abg_scatter_t`): its total integrated scatter, which its reflection loses. */
-    u32 rough;
-    real tis[telescope_tis_samples];
+    /** @brief A rough mirror's scatter: `telescope_desc::scatters[scatter]`, or telescope_smooth. */
+    u32 scatter;
+    /** @brief Stops, obscurations and tubes: their Lambertian reflectance (stray light). */
+    real reflectance;
+    /** @brief A mirror's reflective side (`element_t::reflective_side`): +1 its local +z side, -1 the other, 0 both. */
+    i32 reflective_side;
     real to_telescope[12];                  // rigid, row-major 3x4: element frame to telescope frame
     real to_local[12];                      // ... and back
     /**
@@ -376,6 +386,17 @@ struct telescope_layer {
     real thickness;                         // metres
 };
 
+/**
+ * @brief `optics::abg_scatter_t`: a rough mirror's ABg scatter, its TIS table, and its sampling table (the bins'
+ *        radii, and the inclusive CDF of their masses).
+ */
+struct telescope_scatter {
+    real A, B, g;
+    real tis[telescope_tis_samples];
+    real edges[telescope_scatter_bins+1];
+    real cdf[telescope_scatter_bins+1];
+};
+
 /** @brief `optics::cone_t`, by its half-angle (radians). */
 struct telescope_cone {
     vec3 axis;
@@ -390,6 +411,7 @@ struct telescope_desc {
     u32 sequence[telescope_max_elements];
     u32 sequence_count;
     telescope_layer layers[telescope_max_layers];
+    telescope_scatter scatters[telescope_max_scatters];
 
     /** @brief The sphere bounding the clear aperture nearest the focal plane (`telescope_optics_t::aim`). */
     vec3 aim_centre;
@@ -417,6 +439,19 @@ struct telescope_desc {
     vec3 near_origin;
     /** @brief One over the film centre's projected solid angle (sr): samples' importance is relative to it. */
     real recp_projected_solid_angle;
+
+    /**
+     * @brief Stray light (`telescope_t::stray_light_t`): traced non-sequentially if nonzero; a rough mirror scatters
+     *        with probability at least `scatter_probability`; `hemisphere_fraction` of the directions are drawn from
+     *        the hemisphere about `front`; the focal-plane array (its plane z=0 in the frame `fp_to_local` maps to,
+     *        within `fp_half_extent`) absorbs.
+     */
+    u32 stray_light;
+    real scatter_probability;
+    real hemisphere_fraction;
+    vec3 front;
+    real fp_to_local[12];
+    vec2 fp_half_extent;
 };
 #endif
 
