@@ -12,6 +12,10 @@ and the sky, seen through the direct transmittance). This adds, per band (as 6S 
     reach is of kilometres; beyond the image the ground is taken to be as bright as the image's mean. Times the
     ratio of diffuse to direct upward transmittance, it is the radiance that the diffuse transmittance brings.
 The image is taken to be a grid on the ground of the nadir sampling distance; off nadir that is an approximation.
+A render through a telescope's mirrors (build_scene.py --telescope) has their reflectance in it: the path radiance is
+then multiplied by scene.json's telescope band_throughput (the mirrors' reflectance at normal incidence, averaged over
+the band), so that OUT is the radiance at the focal plane, as the render is. (Stray light from the atmosphere's own
+radiance outside the field is not added.)
 
     uv run tools/remote_sensing/toa.py SITE_DIR/scene.json RENDER.exr OUT.exr [--components]
 
@@ -92,6 +96,9 @@ def main():
     if missing:
         raise SystemExit(f"{args.render} has channels {sorted(channels)}, not bands {sorted(missing)}")
 
+    # a render through a telescope's mirrors (build_scene.py --telescope) has their reflectance in it, which the
+    # path radiance must pass too (the adjacency radiance, from the render, has it already)
+    throughput = (scene.get("telescope") or {}).get("band_throughput", {})
     out, path, adjacency = {}, {}, {}
     for band in scene["bands_nm"]:
         L = channels[band]
@@ -99,9 +106,10 @@ def main():
         mean = L.mean()
         averaged = mean + fftconvolve(L - mean, K, mode="same")
         adjacency[band] = atm["diffuse_to_direct_up"][band] * averaged
-        path[band] = np.full_like(L, atm["path_radiance"][band])
+        path[band] = np.full_like(L, atm["path_radiance"][band] * throughput.get(band, 1.0))
         out[band] = L + adjacency[band] + path[band]
-        print(f"{band}: render mean {mean:.4g}, + path {atm['path_radiance'][band]:.4g}, "
+        through = f" × telescope {throughput[band]:.4g}" if band in throughput else ""
+        print(f"{band}: render mean {mean:.4g}, + path {atm['path_radiance'][band]:.4g}{through}, "
               f"+ adjacency mean {adjacency[band].mean():.4g} = {out[band].mean():.4g} W/m²/sr/µm")
 
     def write(path_, images):

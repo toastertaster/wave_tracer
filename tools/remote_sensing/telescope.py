@@ -52,21 +52,26 @@ number of mirrors. Lengths in the scene are in metres.
 
 Stray light (the sensor's stray_light and pst_angles): --scatter A,B,g makes every mirror rough, scattering by the
 ABg model; --baffles adds, to an on-axis two-mirror design, the baffles that keep the focal plane from seeing the scene
-past the secondary: a tube in front of the secondary (20% wider than it, long enough that the directions from the
-focal plane's centre between the secondary's edge and the primary's hole's meet it) and a vane over the part of the
-primary in the secondary's shadow (where light would reflect between the mirrors); of --baffle-reflectance (default 0,
-black).
+past the secondary: a tube in front of the secondary (20% wider than it), a tube in front of the primary's hole (as
+wide as the converging beam there; for a wide film, long enough that the film sees no further past the secondary's edge
+than the secondary's tube), the secondary's tube long enough that the lines from the film past the secondary's edge
+meet it, and a vane over the part of the primary in the secondary's shadow (where light would reflect between the
+mirrors); --barrel encloses the telescope in a tube (from an aperture's diameter in front of the foremost mirror to
+behind the focal plane), without which the focal plane sees the scene around the primary's rim; of
+--baffle-reflectance (default 0, black).
 
     uv run tools/remote_sensing/telescope.py two-mirror --kind ritchey-chretien [--diameter 0.4 --focal-length 2.5 ...] > sensor.xml
 
 prints the sensor (with --altitude, --view-zenith, ... placing it, as strings, so that scene defines like $vz work).
-As a module, `two_mirror()`, `three_mirror()` and `hubble()` return designs, `coat()`, `roughen()`, `baffle()` and
-`curve_focal_plane()` modify them, and `sensor_xml()` writes them.
+As a module, `two_mirror()`, `three_mirror()` and `hubble()` return designs, `coat()`, `roughen()`, `baffle()`,
+`barrel()` and `curve_focal_plane()` modify them, `sensor_xml()` writes them, and `band_throughput()` gives the
+fraction of a band that their mirrors' coatings reflect (at normal incidence; for toa.py's path radiance).
 """
 
 import argparse
 import dataclasses
 import math
+import pathlib
 
 import numpy as np
 
@@ -472,16 +477,73 @@ def hubble():
     return Design("Hubble Space Telescope", elements, focal_plane, 57.6, 2.4, 177.80035 / 1200)
 
 
-# <coating> elements of the telescope sensor
-COATINGS = {
-    "ideal": '<coating type="ideal"/>',
-    "aluminium": '<coating type="multilayer"><spectrum name="substrate" material="Al"/></coating>',
-    "silver": '<coating type="multilayer"><spectrum name="substrate" material="Ag"/></coating>',
-    "gold": '<coating type="multilayer"><spectrum name="substrate" material="Au"/></coating>',
-    "protected-aluminium": ('<coating type="multilayer"><spectrum name="substrate" material="Al"/>'
-                            '<layer><spectrum name="IOR" constant="1.38"/>'
-                            '<quantity name="thickness" value="25nm"/></layer></coating>'),
+# the coatings: a substrate (a material of wave_tracer's data/ior) under layers (refractive index, thickness in
+# nm; outermost first), or None for the ideal coating
+COATING_STACKS = {
+    "ideal": None,
+    "aluminium": ("Al", []),
+    "silver": ("Ag", []),
+    "gold": ("Au", []),
+    "protected-aluminium": ("Al", [(1.38, 25)]),
 }
+
+
+def _coating_xml(stack):
+    if stack is None:
+        return '<coating type="ideal"/>'
+    substrate, layers = stack
+    return (f'<coating type="multilayer"><spectrum name="substrate" material="{substrate}"/>'
+            + "".join(f'<layer><spectrum name="IOR" constant="{n:g}"/><quantity name="thickness" value="{d:g}nm"/>'
+                      f'</layer>' for n, d in layers) + "</coating>")
+
+
+# <coating> elements of the telescope sensor
+COATINGS = {name: _coating_xml(stack) for name, stack in COATING_STACKS.items()}
+
+IOR_DIR = pathlib.Path(__file__).resolve().parents[2] / "data" / "ior"
+
+
+def _tabulated_nk(material):
+    """A refractiveindex.info file's tabulated n, k: wavelengths (nm), n + ik."""
+    text = (IOR_DIR / f"{material}.yml").read_text()
+    rows = text.split("type: tabulated nk", 1)[1].split("data: |", 1)[1]
+    data = []
+    for line in rows.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) != 3:
+            break
+        data.append([float(p) for p in parts])
+    data = np.array(data)
+    return data[:, 0] * 1e3, data[:, 1] + 1j * data[:, 2]
+
+
+def coating_reflectance(coating, wavelengths_nm):
+    """The coating's reflectance (unpolarized) at normal incidence, at each wavelength: the layers'
+    characteristic matrices (Macleod, Thin-Film Optical Filters, ch. 2), as the sensor computes it."""
+    wavelengths = np.asarray(wavelengths_nm, dtype=float)
+    stack = COATING_STACKS[coating]
+    if stack is None:
+        return np.ones_like(wavelengths)
+    substrate, layers = stack
+    table_nm, table_nk = _tabulated_nk(substrate)
+    nk = np.interp(wavelengths, table_nm, table_nk.real) + 1j * np.interp(wavelengths, table_nm, table_nk.imag)
+    # Macleod's admittances (N = n - ik, in free space's), from the substrate outwards
+    b, c = np.ones_like(nk), np.conj(nk)
+    for n, d in reversed(layers):
+        delta = 2 * np.pi * n * d / wavelengths
+        b, c = np.cos(delta) * b + 1j * np.sin(delta) / n * c, 1j * n * np.sin(delta) * b + np.cos(delta) * c
+    return np.abs((b - c) / (b + c)) ** 2
+
+
+def band_throughput(design, band_nm):
+    """The fraction of light that the design's mirrors reflect, at normal incidence, averaged over the band
+    (lo, hi nm; uniform in wavelength): the product of the mirrors' reflectances."""
+    wavelengths = np.linspace(band_nm[0], band_nm[1], 64)
+    t = np.ones_like(wavelengths)
+    for e in design.elements:
+        if e.kind == "mirror":
+            t = t * coating_reflectance(e.coating, wavelengths)
+    return float(t.mean())
 
 
 def coat(design, coating):
@@ -499,8 +561,9 @@ def roughen(design, abg):
 
 
 def baffle(design, reflectance=0.0, margin=1e-3):
-    """An on-axis two-mirror design with baffles (see the module's doc): a tube in front of the secondary, and a vane
-    over the primary's shadowed zone."""
+    """An on-axis two-mirror design with baffles (see the module's doc): a tube in front of the secondary, a tube in
+    front of the primary's hole (if the film is wide enough to need it), and a vane over the primary's shadowed
+    zone."""
     primary, secondary = design.elements[0], design.elements[1]
     if any(primary.aperture_centre) or primary.kind != "mirror" or secondary.kind != "mirror":
         raise ValueError("baffles are for on-axis two-mirror designs")
@@ -509,16 +572,53 @@ def baffle(design, reflectance=0.0, margin=1e-3):
     b = design.focal_plane[2, 3] if design.focal_plane[2, 2] < 0 else None
     if b is None:
         raise ValueError("baffles are for designs whose focal plane is behind the primary, facing it")
-    # the focal plane's centre sees past the secondary's edge at distance (b - z_s): a tube of radius 1.2 r_s meets
-    # those directions within (b - z_s)(1.2 - 1) beyond the secondary
-    radius = 1.2 * r_s
-    length = (b - z_s) * (radius / r_s - 1) * 1.5
+    h_s = b - z_s           # the secondary, from the focal plane
+    # the film's half-diagonal a, from the hole that passes its beams (two_mirror: r_s b/h_s + a + margin)
+    a = max(0.0, r_h - r_s * b / h_s - margin)
+
+    # the secondary's tube, of radius r_t = 1.2 r_s. The film sees past the secondary through the primary's hole: the
+    # steepest such line, from the film's edge (-a) through the far side of an opening of radius r at a height h
+    # above the focal plane, has the slope (r + a)/h, and crosses the secondary's plane (h_s) at (r + a) h_s/h - a.
+    # Through the hole alone (r_h at b) that may be beyond the secondary's tube: then a tube in front of the hole, of
+    # the converging beam's radius at its height, r_p(h) = r_s h/h_s + a + margin (it passes the beam), reaching h_p,
+    # brings it within r_t if h_p >= (2a + margin) h_s/(r_t - r_s + a)
+    r_t = 1.2 * r_s
+    h_p = (2 * a + margin) * h_s / (r_t - r_s + a)
     elements = list(design.elements)
-    elements.append(Element("tube", "secondary baffle", radius, translation(z=z_s - length), length=length,
+    if h_p > b + margin:
+        r_p = r_s * h_p / h_s + a + margin
+        steepest = (r_p + a) / h_p
+        elements.append(Element("tube", "primary baffle", r_p, translation(z=b - h_p), length=h_p - b,
+                                reflectance=reflectance))
+    else:
+        steepest = (r_h + a) / b
+    # long enough that the steepest line meets it: it reaches r_t at h = (r_t + a)/steepest (and, without a primary
+    # tube, at least as long as the centre's view past the edge needs, (b - z_s)(1.2 - 1) 1.5)
+    length = max(h_s * (r_t / r_s - 1) * 1.5, (r_t + a) / steepest - h_s + margin)
+    elements.append(Element("tube", "secondary baffle", r_t, translation(z=z_s - length), length=length,
                             reflectance=reflectance))
     if r_h + margin < r_s - margin:
         elements.append(Element("obscuration", "vane", r_s - margin, translation(z=-2 * margin),
                                 hole_radius=r_h + margin, reflectance=reflectance))
+    return dataclasses.replace(design, elements=elements)
+
+
+def barrel(design, reflectance=0.0, field_radius=math.radians(0.2), margin=0.01):
+    """The design (of mirrors about the telescope's z axis, light arriving towards +z) inside a barrel: a tube about
+    the axis enclosing the mirrors' apertures (and the field's beams, `field_radius` off the axis, plus `margin`), from
+    an aperture's diameter in front of the foremost mirror to behind the focal plane. Without it, the focal plane sees
+    the scene around the primary's rim."""
+    mirrors = [e for e in design.elements if e.kind == "mirror"]
+    if any(not np.allclose(e.to_telescope[:3, :3], np.eye(3)) or any(e.to_telescope[:2, 3]) for e in mirrors):
+        raise ValueError("a barrel is for designs of mirrors about the telescope's axis (no fold)")
+    D = 2 * mirrors[0].aperture_radius
+    zs = [float(e.to_telescope[2, 3]) for e in mirrors] + [float(design.focal_plane[2, 3])]
+    front, back = min(zs) - D, max(zs) + 0.05 * D
+    extent = max(math.hypot(*e.aperture_centre) + e.aperture_radius for e in mirrors)
+    radius = extent + (back - front) * math.tan(field_radius) + margin
+    elements = list(design.elements)
+    elements.append(Element("tube", "barrel", radius, translation(z=front), length=back - front,
+                            reflectance=reflectance))
     return dataclasses.replace(design, elements=elements)
 
 
@@ -618,8 +718,10 @@ def main():
                    help="the sphere on which the film's field images best (coaxial mirrors only)")
     p.add_argument("--coating", choices=list(COATINGS), default="ideal", help="every mirror's (default ideal)")
     p.add_argument("--scatter", help="A,B,g: every mirror's ABg scatter (default: smooth)")
-    p.add_argument("--baffles", action="store_true", help="a secondary baffle tube and a vane (on-axis two-mirror)")
-    p.add_argument("--baffle-reflectance", type=float, default=0.0, help="the baffles' (Lambertian; default 0)")
+    p.add_argument("--baffles", action="store_true", help="baffle tubes before the secondary and the primary's hole, and a vane (on-axis two-mirror)")
+    p.add_argument("--barrel", action="store_true", help="a tube enclosing the telescope (coaxial mirrors, unfolded)")
+    p.add_argument("--baffle-reflectance", type=float, default=0.0,
+                   help="the baffles' and barrel's (Lambertian; default 0)")
     p.add_argument("--pixel-pitch", type=float, default=5e-6, help="m (default 5 µm)")
     p.add_argument("--pixels", type=int, default=256, help="film width and height (default 256)")
     p.add_argument("--altitude", default="500km")
@@ -652,6 +754,9 @@ def main():
         design = roughen(design, [float(v) for v in args.scatter.split(",")])
     if args.baffles:
         design = baffle(design, args.baffle_reflectance)
+    if args.barrel:
+        field = math.atan(args.pixels * args.pixel_pitch / math.sqrt(2) / design.focal_length)
+        design = barrel(design, args.baffle_reflectance, field_radius=field + math.radians(args.field_bias))
     if args.elements_only:
         print(f"<!-- {design.name}: f = {design.focal_length:.6g} m, D = {design.entrance_pupil_diameter:.6g} m, "
               f"obscuration {design.obscuration:.3g}; for a {args.pixels}² film -->")

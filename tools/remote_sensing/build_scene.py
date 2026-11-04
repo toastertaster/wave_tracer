@@ -16,6 +16,7 @@ Writes into the site directory:
                    vegetation (walls) in terrain_wall.ply
   reflectance.png  without materials.json: a 16-bit linear reflectance map
   sky.ply          with an atmosphere: the sky, a hemisphere around the scene
+                   (sky_<name>.ply, larger, with --surroundings)
   <name>.xml       the scene: the terrain, the sun, the sky, and a
                    satellite_frame camera recording band radiance (needs a
                    wave_tracer built with REALISTIC_REMOTE_SENSING); with
@@ -23,10 +24,16 @@ Writes into the site directory:
                    rays through the mirrors of telescope.py's two-mirror
                    design (Cassegrain or Ritchey-Chretien) of the camera's
                    focal length, --telescope-aperture, --primary-f-number,
-                   --back-focus and mirrors' --coating
+                   --back-focus and mirrors' --coating, or its three-mirror
+                   anastigmat (its layout scaled to the focal length); an
+                   off-axis segment (--telescope-off-axis) with its field off
+                   the axis (--field-bias), on a --curved-focal-plane, with
+                   --baffles and a --barrel; traced non-sequentially with
+                   --stray-light, which sees the ground beyond the terrain
+                   with --surroundings
   <name>.json      what toa.py and detector.py need: the bands, the camera
-                   (and its telescope's aperture, with --telescope), and the
-                   atmosphere's own radiance
+                   (and its telescope's aperture and mirrors' reflectance per
+                   band, with --telescope), and the atmosphere's own radiance
 
 The scene's frame is local to the site: x east, y up, z south (north is -z),
 in metres, with the origin on the ground at the site's centre. The camera is
@@ -348,9 +355,31 @@ def main():
                         "metre-sized edges is negligible at these wavelengths)")
     p.add_argument("--no-atmosphere", action="store_true", help="ignore SITE_DIR/atmosphere.json")
     p.add_argument("--sky-radius", type=float, default=100e3, help="m (default 100 km)")
-    p.add_argument("--telescope", choices=["cassegrain", "ritchey-chretien"],
+    p.add_argument("--telescope", choices=["cassegrain", "ritchey-chretien", "three-mirror"],
                    help="image through a telescope's mirrors, traced (the telescope sensor, of telescope.py's two-mirror "
-                        "design at the camera's focal length) rather than a pinhole camera (satellite_frame)")
+                        "design, or its three-mirror anastigmat, at the camera's focal length) rather than a pinhole "
+                        "camera (satellite_frame)")
+    p.add_argument("--telescope-off-axis", type=float,
+                   help="m: an off-axis segment of the design, its aperture centred this far from the axis (two-mirror: "
+                        "default on axis; three-mirror: default the aperture's diameter)")
+    p.add_argument("--field-bias", type=float,
+                   help="degrees: the film's centre this far off the telescope's axis, towards north (two-mirror: "
+                        "default 0; three-mirror: default 1)")
+    p.add_argument("--curved-focal-plane", action="store_true",
+                   help="the telescope's focal plane curved: the sphere on which the film's field images best "
+                        "(telescope.py)")
+    p.add_argument("--baffles", action="store_true",
+                   help="an on-axis two-mirror telescope's baffles: a tube before the secondary, a vane on the primary "
+                        "(telescope.py)")
+    p.add_argument("--barrel", action="store_true",
+                   help="enclose the telescope in a tube (telescope.py): else its focal plane sees the scene around its "
+                        "primary's rim")
+    p.add_argument("--stray-light", action="store_true",
+                   help="trace the telescope non-sequentially (its stray light)")
+    p.add_argument("--surroundings", type=float,
+                   help="m: ground beyond the terrain, out to this distance from its centre, flat, of the terrain's mean "
+                        "reflectance (the stray light from outside the field sees it); the sky is made large enough to "
+                        "cover it, its hole for the sun to light it")
     p.add_argument("--telescope-aperture", type=float, default=0.4, help="the telescope's diameter, m (default 0.4)")
     p.add_argument("--primary-f-number", type=float, default=1.5,
                    help="the telescope's primary's focal length over the aperture (default 1.5)")
@@ -399,16 +428,44 @@ def main():
     to_sun = (math.sin(z) * math.sin(a), math.cos(z), -math.sin(z) * math.cos(a))
     focal_length = args.altitude * args.pixel_pitch / args.gsd
     telescope_design = None
+    if not args.telescope and (args.telescope_off_axis is not None or args.field_bias is not None
+                               or args.curved_focal_plane or args.baffles or args.barrel or args.stray_light):
+        raise SystemExit("--telescope-off-axis, --field-bias, --curved-focal-plane, --baffles, --barrel and "
+                         "--stray-light are options of --telescope")
     if args.telescope:
         D = args.telescope_aperture
         field = math.atan(args.pixels * args.pixel_pitch / math.sqrt(2) / focal_length)
-        telescope_design = telescope.coat(telescope.two_mirror(
-            args.telescope, D, focal_length, args.primary_f_number * D,
-            args.back_focus if args.back_focus is not None else 0.375 * D, field_radius=field), args.coating)
+        if args.telescope == "three-mirror":
+            # telescope.py's layout (for f = 2.5 m: f1 0.6 m, separations 0.45 and 1.15 m), scaled to the focal length
+            f = focal_length
+            design = telescope.three_mirror(
+                D, f, 0.24 * f, (0.18 * f, 0.46 * f),
+                off_axis=args.telescope_off_axis if args.telescope_off_axis is not None else D,
+                field_bias=math.radians(args.field_bias if args.field_bias is not None else 1.0), field_radius=field)
+        else:
+            design = telescope.two_mirror(
+                args.telescope, D, focal_length, args.primary_f_number * D,
+                args.back_focus if args.back_focus is not None else 0.375 * D, field_radius=field,
+                off_axis=args.telescope_off_axis or 0.0, field_bias=math.radians(args.field_bias or 0.0))
+        if args.curved_focal_plane:
+            design = telescope.curve_focal_plane(design, field)
+        if args.baffles:
+            design = telescope.baffle(design)
+        if args.barrel:
+            design = telescope.barrel(design, field_radius=field + math.radians(abs(args.field_bias or 0.0)))
+        telescope_design = telescope.coat(design, args.coating)
         print(f"telescope: {telescope_design.name}, D {D:g} m, obscuration {telescope_design.obscuration:.3f}, "
-              f"{args.coating} mirrors")
-    # the telescope sensor's optics (telescope.py)
+              f"{args.coating} mirrors" + (f", focal plane radius {design.focal_plane_radius:.4g} m"
+                                            if design.focal_plane_radius else "")
+              + (", baffles" if args.baffles else "") + (", barrel" if args.barrel else "")
+              + (", stray light" if args.stray_light else ""))
+    # the telescope sensor's optics (telescope.py); the focal length it checks them against: the image's scale about
+    # the film's centre (a biased field's differs from the design's focal length)
     telescope_xml = "" if telescope_design is None else "\n" + telescope.elements_xml(telescope_design, indent="\t\t")
+    if args.stray_light:
+        telescope_xml = '\n\t\t<boolean name="stray_light" value="true"/>' + telescope_xml
+    sensor_focal_length = focal_length if telescope_design is None else \
+        telescope_design.film_centre_scale or telescope_design.focal_length
 
     band_xml = "\n".join(
         f'''				<spectrum type="piecewise_linear" id="{name}">
@@ -449,7 +506,10 @@ def main():
         D, eps = telescope_design.entrance_pupil_diameter, telescope_design.obscuration
         sidecar["telescope"] = {
             "design": telescope_design.name, "coating": args.coating, "aperture_diameter_m": D, "obscuration": eps,
-            "projected_solid_angle_sr": math.pi * (D / 2 / focal_length) ** 2 * (1 - eps**2)}
+            "projected_solid_angle_sr": math.pi * (D / 2 / focal_length) ** 2 * (1 - eps**2),
+            "stray_light": args.stray_light,
+            # the mirrors' reflectance per band: toa.py's path radiance, added to the render, must pass them too
+            "band_throughput": {band: telescope.band_throughput(telescope_design, nm) for band, nm in BANDS.items()}}
     if atm is None:
         print("no atmosphere" + ("" if args.no_atmosphere else f" ({atm_path} not found)"))
         sun_irradiance = E0
@@ -462,17 +522,25 @@ def main():
         # the sky: diffuse light, and light reflected between the ground and the atmosphere
         rho_e, S = mean_reflectance, atm["spherical_albedo"]
         sky_irradiance = E0 * mus * atm["Tg_down"] * (atm["T_down_total"] / (1 - rho_e * S) - atm["T_down_direct"])
-        # a hole wide enough for the sun to reach every point of the scene
+        # a hole wide enough for the sun to reach every point of the scene (its surroundings too: the sky 20 times as
+        # far, so that the hole stays small)
         half_diagonal = np.hypot(np.abs(vertices[:, 0]).max(), np.abs(vertices[:, 2]).max())
-        hole_deg = math.degrees(math.atan2(half_diagonal, args.sky_radius)) + 0.5
-        sky_projected_solid_angle, sky_triangles = sky_dome(args.site_dir / "sky.ply", args.sky_radius, to_sun, hole_deg)
+        sky_radius = args.sky_radius
+        if args.surroundings:
+            half_diagonal = max(half_diagonal, args.surroundings * math.sqrt(2))
+            sky_radius = max(sky_radius, 20 * half_diagonal)
+        hole_deg = math.degrees(math.atan2(half_diagonal, sky_radius)) + 0.5
+        # (a larger sky is the scene's own: other scenes of the site share sky.ply)
+        sky_file = f"sky_{args.name}.ply" if sky_radius != args.sky_radius else "sky.ply"
+        sky_projected_solid_angle, sky_triangles = sky_dome(args.site_dir / sky_file, sky_radius, to_sun, hole_deg)
         sky_radiance = sky_irradiance / sky_projected_solid_angle
-        print(f"atmosphere: {atm_info['source']}; sky: {sky_triangles} triangles, hole {hole_deg:.2f}°, "
+        print(f"atmosphere: {atm_info['source']}; sky: {sky_triangles} triangles, radius {sky_radius / 1e3:g} km, "
+              f"hole {hole_deg:.2f}°, "
               f"projected solid angle π - {math.pi - sky_projected_solid_angle:.2e} sr")
         sky_xml = f'''
 	<!-- the sky, of uniform radiance (W/m²/sr/µm) -->
 	<shape type="ply">
-		<path value="sky.ply"/>
+		<path value="{sky_file}"/>
 		<quantity name="scale" value="1m"/>
 		<bsdf type="diffuse">
 			<spectrum name="reflectance" constant="0"/>
@@ -507,6 +575,25 @@ def main():
                                   for b, m in in_band.items()},
         }
 
+    surroundings_xml = ""
+    if args.surroundings:
+        # a square beneath the terrain's lowest point (which hides it within the terrain), of its mean reflectance
+        R, y = args.surroundings, float(vertices[:, 1].min()) - 0.5
+        surroundings_xml = f'''
+	<!-- the surroundings: flat ground, {R / 1e3:g} km about the centre, of the terrain's mean reflectance -->
+	<shape type="rectangle">
+		<point name="p" value="{-R:g}m, {y:.3f}m, {R:g}m"/>
+		<point name="x" value="{2 * R:g}m, 0m, 0m"/>
+		<point name="y" value="0m, 0m, {-2 * R:g}m"/>
+		<bsdf type="diffuse">
+			<spectrum name="reflectance" type="piecewise_linear">
+{spectrum_xml(nm, mean_reflectance, 4)}
+			</spectrum>
+		</bsdf>
+	</shape>
+'''
+        print(f"surroundings: {2 * R / 1e3:g} km square at {y:.2f} m")
+
     lidar_note = f"; surface: 3DEP lidar, {site['lidar']['collection']}" if surface == "dsm" else ""
     xml = f'''<?xml version="1.0" encoding="utf-8"?>
 <!-- Generated by tools/remote_sensing/build_scene.py from {args.site_dir.name}: {site["size_m"]:g} m around
@@ -529,7 +616,7 @@ def main():
 		                <quantity name="altitude" value="{args.altitude:g}m"/>
 		                <quantity name="view_zenith" value="{args.view_zenith:g}°"/>
 		                <quantity name="view_azimuth" value="{args.view_azimuth:g}°"/>
-		                <quantity name="focal_length" value="{focal_length:.12g}m"/>
+		                <quantity name="focal_length" value="{sensor_focal_length:.12g}m"/>
 		                <quantity name="pixel_pitch" value="{args.pixel_pitch:.12g}m"/>
 		                <boolean name="ray_trace_only" value="$ray_tracing"/>{telescope_xml}
 		<integer name="samples" value="$spp"/>
@@ -553,11 +640,11 @@ def main():
 {spectrum_xml(nm, sun_irradiance, 3)}
 		</spectrum>
 	</emitter>
-{sky_xml}{terrain_xml}</scene>
+{sky_xml}{terrain_xml}{surroundings_xml}</scene>
 '''
     (args.site_dir / f"{args.name}.xml").write_text(xml)
     (args.site_dir / f"{args.name}.json").write_text(json.dumps(sidecar, indent=1) + "\n")
-    print(f"wrote {args.site_dir}/{', '.join(path for path, _ in shapes)}, {'sky.ply, ' if atm is not None else ''}"
+    print(f"wrote {args.site_dir}/{', '.join(path for path, _ in shapes)}, {sky_file + ', ' if atm is not None else ''}"
           f"{args.name}.xml, "
           f"{args.name}.json; camera focal length {focal_length:g} m")
 

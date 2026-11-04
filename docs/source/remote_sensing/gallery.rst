@@ -361,3 +361,123 @@ The input data limit the detail: the surface model is a 1 m grid and NAIP 0.6 m,
       :img-top: ../_static/remote_sensing/city_manhattan_4k_crop.jpg
 
       Bryant Park's lawn and plane trees, with the New York Public Library at the lower right (``--crop 3776,3776,640,640``).
+
+Telescopes
+----------
+
+Reno's scene seen through ``telescope`` cameras instead of a ``satellite_frame`` camera: the same 1920² film of 5 µm pixels at 2.5 m focal length (1 m GSD at nadir from 500 km), its rays traced through mirrors of ``telescope.py``'s designs, coated with protected aluminium (:doc:`tools`).
+The renders thus have the designs' aberrations, field curvature and vignetting, and the mirrors' reflectance, in them; ``toa.py`` dims the path radiance by the same reflectance (``band_throughput``).
+Rendered on the GPU (NVIDIA GB10, CUDA + OptiX) at ``65b53e6``, 1024 samples per pixel, by ray tracing (``-D ray_tracing=true``): each scene is the town's 8.44 M triangles, the sun and the sky, and the telescope's mirrors (and baffles).
+Peak memory was 7.6–8.0 GB.
+
+.. code-block:: sh
+
+   # a Ritchey-Chrétien (the default: 0.4 m, f/6.25, obscuration 0.25), with the ground around the site for stray light
+   uv run tools/remote_sensing/build_scene.py sites/reno --time 2022-06-15T18:39:19Z --coating protected-aluminium \
+       --name tel_rc_design --telescope ritchey-chretien --surroundings 80e3
+   #   tel_rc_stray: the same, + --barrel --stray-light; tel_rc_baffled: + --barrel --baffles --stray-light
+   # an off-axis segment of a Ritchey-Chrétien (0.2 m, unobscured), its field 0.3° off the axis
+   uv run tools/remote_sensing/build_scene.py sites/reno --time 2022-06-15T18:39:19Z --coating protected-aluminium \
+       --name tel_oab_flat --telescope ritchey-chretien --telescope-aperture 0.2 --primary-f-number 3 \
+       --back-focus 0.15 --telescope-off-axis 0.2 --field-bias 0.3
+   #   tel_oab_curved: the same, + --curved-focal-plane
+   # a three-mirror anastigmat (0.2 m, unobscured)
+   uv run tools/remote_sensing/build_scene.py sites/reno --time 2022-06-15T18:39:19Z --coating protected-aluminium \
+       --name tel_tma --telescope three-mirror --telescope-aperture 0.2
+   ./build/wave_tracer render --gpu sites/reno/tel_rc_design.xml -o out_tel_rc_design -D spp=1024 -D ray_tracing=true
+   uv run tools/remote_sensing/toa.py sites/reno/tel_rc_design.json out_tel_rc_design/camera.exr out_tel_rc_design/toa.exr
+
+.. list-table:: Renders (radiances in W/m²/sr/µm: blue, green, red, nir)
+   :header-rows: 1
+   :widths: 14 30 10 23 23
+
+   * - Scene
+     - Telescope
+     - Time (``rendered in``)
+     - Mean render
+     - Mean top-of-atmosphere radiance (through the telescope)
+   * - ``tel_rc_design``
+     - Ritchey-Chrétien, 0.4 m, f/6.25, obscuration 0.25
+     - 83.0 s
+     - 42.7, 48.6, 46.3, 43.0
+     - 73.6, 65.1, 54.0, 45.7
+   * - ``tel_rc_stray``
+     - the same, with a barrel, traced for stray light
+     - 85.8 s
+     - 161.5, 183.6, 176.5, 176.9
+     - 205.5, 209.5, 189.9, 183.0
+   * - ``tel_rc_baffled``
+     - the same, with the barrel and baffles
+     - 72.2 s
+     - 43.7, 49.3, 46.7, 43.3
+     - 74.7, 65.9, 54.4, 46.0
+   * - ``tel_oab_flat``
+     - off-axis Ritchey-Chrétien, 0.2 m, f/12.5, field 0.3° off the axis, flat focal plane
+     - 85.6 s
+     - 42.8, 48.7, 46.4, 43.1
+     - 73.7, 65.2, 54.0, 45.8
+   * - ``tel_oab_curved``
+     - the same, on a curved focal plane (radius 0.153 m)
+     - 82.3 s
+     - 42.8, 48.6, 46.3, 43.0
+     - 73.6, 65.1, 54.0, 45.7
+   * - ``tel_tma``
+     - three-mirror anastigmat, 0.2 m, f/12.5, field 1° off the axis
+     - 83.2 s
+     - 38.8, 44.0, 41.5, 37.3
+     - 66.7, 58.9, 48.4, 39.6
+
+The mirrors dim the scene: Reno's ``satellite_frame`` render has means of 52.4, 59.9, 58.1 and 57.8, so two protected-aluminium mirrors pass 0.815, 0.811, 0.797 and 0.744 of it, and three 0.740, 0.735, 0.714 and 0.645 (``band_throughput``, the mirrors' reflectance at normal incidence, is within 0.5% of these).
+The off-axis Ritchey-Chrétien's means equal the on-axis one's although its aperture is half as wide: renders are of radiance, whatever the aperture (``detector.py`` turns them into signal by the film centre's projected solid angle: 0.0050 sr at f/12.5, against the on-axis design's 0.0188).
+The three-mirror anastigmat's odd number of mirrors mirrors the image (north at the bottom).
+
+The previews are of ``toa.py``'s output with one range for every image, the Ritchey-Chrétien's 0.1–99.9th percentiles per band (``--range 7.671,132.3,16.46,149.9,30.85,168.2``; the three-mirror anastigmat its own, ``--range 6.859,118.8,14.86,135.5,27.9,152.4``), so that their brightness compares.
+
+.. grid:: 1 2 2 2
+   :gutter: 2
+
+   .. grid-item-card:: Off-axis Ritchey-Chrétien, flat focal plane
+      :img-top: ../_static/remote_sensing/tel_oab_flat_zoom.jpg
+
+      160 m around a domed roof downtown, zoomed 4 × (``--crop 760,1160,160,160 --zoom 4``): the design's field curvature puts the field's best focus off the flat focal plane, which blurs it.
+
+   .. grid-item-card:: The same on a curved focal plane
+      :img-top: ../_static/remote_sensing/tel_oab_curved_zoom.jpg
+
+      The same window, the film tangent to the sphere of best focus: the dome's rim and the roofs' edges are sharp (in blue, the window's mean difference between neighbouring pixels is 7.75, against the flat focal plane's 4.65; the whole image's standard deviation 28.2, against 24.3).
+
+   .. grid-item-card:: Off-axis Ritchey-Chrétien, curved focal plane
+      :img-top: ../_static/remote_sensing/tel_oab_curved.jpg
+
+      1920 m, binned 3 × 3. `Full resolution (1920², 1.3 MB) <../_static/remote_sensing/full/tel_oab_curved.jpg>`__.
+
+   .. grid-item-card:: Three-mirror anastigmat
+      :img-top: ../_static/remote_sensing/tel_tma.jpg
+
+      1920 m, binned 3 × 3, mirrored north to south by the third mirror. `Full resolution (1920², 1.6 MB) <../_static/remote_sensing/full/tel_tma.jpg>`__.
+
+Stray light
+~~~~~~~~~~~
+
+With ``--stray-light`` the camera's rays may also miss the mirrors, scatter, or reach the film past them, and ``--surroundings 80e3`` gives them ground to see beyond the 2048 m of terrain (a flat square of the terrain's mean reflectance, 160 km on a side; the sky then 2263 km away).
+Without baffles the film sees that ground directly, past the secondary and through the primary's hole: the render is 3.78, 3.78, 3.81 and 4.11 times the design's, and the scene washes out.
+These paths are rare and bright, so their noise converges slowly: the image below is of a render at 4096 samples per pixel (724 s), whose means are those of the 1024-sample render to 0.1%.
+``--baffles`` (a tube in front of the secondary, another in front of the primary's hole, a vane over the primary's obscured zone) leaves 2.3, 1.4, 1.1 and 0.7% more light than the design's own.
+
+.. grid:: 1 3 3 3
+   :gutter: 2
+
+   .. grid-item-card:: Ritchey-Chrétien, as designed
+      :img-top: ../_static/remote_sensing/tel_rc_design_crop.jpg
+
+      Downtown's casino blocks, 640 m (``--crop 560,1000,640,640``), traced through the mirrors only.
+
+   .. grid-item-card:: With a barrel, no baffles
+      :img-top: ../_static/remote_sensing/tel_rc_stray4k_crop.jpg
+
+      Stray light from the ground around the site, 4096 samples per pixel: about 3.8 times the scene's own light.
+
+   .. grid-item-card:: With a barrel and baffles
+      :img-top: ../_static/remote_sensing/tel_rc_baffled_crop.jpg
+
+      Within 2.3% of the design.
