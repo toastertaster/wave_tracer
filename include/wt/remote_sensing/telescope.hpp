@@ -47,8 +47,13 @@ namespace wt::remote_sensing {
  *        passing directions, and without wasting samples on an aperture larger than its beam (a tilted fold
  *        mirror's).
  *
+ *        Each reflection applies its mirror's coating (`optics::coating_t`) as a Mueller matrix of its Fresnel
+ *        coefficients, at the sample's wavelength and the ray's angle of incidence, composed in s-p frames as
+ *        wave_tracer's surfaces compose theirs: from the detector's frame (`detector_frame`: polarimetric films
+ *        record Stokes parameters about the film's axes) to the frame of the light arriving from the scene.
+ *
  *        Pixels record radiance relative to the film centre's throughput: the samples' importance is the projected
- *        solid angle of the rays that pass, over the film centre's. A uniform scene renders as its radiance at
+ *        solid angle of the rays that pass, over the film centre's, and the coatings' Mueller matrices. A uniform scene renders as its radiance at
  *        the film's centre, and dimmer where the optics vignette; as a `satellite_frame` camera's, the render is the
  *        radiance at the entrance pupil, for a detector model to scale by the aperture.
  *
@@ -137,6 +142,12 @@ private:
     [[nodiscard]] inline glm::dvec3 focal_plane_normal() const noexcept {
         return glm::normalize(glm::dvec3{ fp.to_telescope * glm::dvec4{ 0,0,1,0 } });
     }
+    /**
+     * @brief The frame of the Stokes parameters that the film records, of light arriving at the focal plane along
+     *        -d (telescope frame): the film's x and y, perpendicular to d. Q is light polarized along the film's x
+     *        less along its y; U along x+y less along x-y.
+     */
+    [[nodiscard]] frame_t detector_frame(const glm::dvec3& d) const noexcept;
 
 public:
     telescope_t(const wt_context_t &ctx,

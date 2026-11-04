@@ -151,12 +151,13 @@ To image the scene onto a detector, render it on a grid finer than the detector'
    Values map linearly to black and white from ``--range LO,HI`` (one range, or one per channel: ``LO1,HI1,LO2,HI2,LO3,HI3``), or by default from the ``--percentiles P0,P1`` (0.5,99.5) of all the chosen channels together, which keeps their balance (``--per-band``: each channel's own), then are sRGB-encoded (unless ``--linear``). It prints the range used.
    The :doc:`gallery`'s images (but the events') are its previews.
 
-``telescope.py {two-mirror,hubble} [--kind --diameter --focal-length --primary-focal-length --back-focus --off-axis --field-bias --fold --secondary-radius --pixel-pitch --pixels --altitude --view-zenith --view-azimuth --samples --elements-only]``
+``telescope.py {two-mirror,hubble} [--kind --diameter --focal-length --primary-focal-length --back-focus --off-axis --field-bias --fold --secondary-radius --coating --pixel-pitch --pixels --altitude --view-zenith --view-azimuth --samples --elements-only]``
    Writes a ``telescope`` sensor (:doc:`scene_elements`) of a design: its mirrors, their clear apertures and placement, and the focal plane's frame.
    ``two-mirror`` is a Cassegrain telescope from its first-order layout (default the example instrument's: 0.4 m aperture, 2.5 m focal length, a 0.6 m primary focal length, 0.15 m back focus): the secondary's magnification *m* = *f*/*f*\ :sub:`1`, its distance *f*\ :sub:`1` (1 − *k*) from the primary, *k* = (1 + *b*/*f*\ :sub:`1`)/(1 + *m*), its radius 2 *k f*\ :sub:`1` *m*/(*m* − 1) (Schroeder, *Astronomical Optics*), with ``--kind cassegrain`` (a paraboloid and a hyperboloid) or ``ritchey-chretien`` (aplanatic conics; the default).
    The secondary's aperture and the primary's hole pass the film's field.
    ``--off-axis Y`` takes an unobscured off-axis segment of the design, its primary's aperture centred Y from the axis; ``--field-bias`` puts the film's centre off the axis; ``--fold`` adds a flat mirror at 45° in the converging beam.
    ``hubble`` is the Hubble Space Telescope (Laikin, as in Optiland's sample).
+   ``--coating`` coats every mirror: ``ideal`` (the default), ``aluminium``, ``silver`` or ``gold`` (bare, from wave_tracer's data), or ``protected-aluminium`` (under 25 nm of magnesium fluoride, as Hubble's).
    It prints the sensor, placed by its ``--altitude`` and view angles (strings, so that a scene's defines such as ``$vz`` pass through), or with ``--elements-only`` only the optics, to paste into a sensor.
    As a module, ``two_mirror()`` and ``hubble()`` return designs and ``sensor_xml()`` writes them (e.g. for ``build_scene.py``).
 
@@ -175,6 +176,8 @@ The ``telescope`` sensor, checked by the Rust bindings' tests (``tests/telescope
 * The film centre's throughput, π (sin²U − sin²u) of the outer and inner marginal rays: to 0.01% with Abbe's sine condition for the aplanatic designs, sin U = h/f, and with a paraboloid's, h = 2f tan(U/2), for the Cassegrain; entrance pupils and obscurations to 10⁻⁵.
 * Vignetting by an undersized secondary, 0.51° off axis: a relative throughput of 0.944546 against Optiland's 0.944555 (5.31% of the pupil's rays blocked, and the distortion's 0.24%).
 * Radiometry: a uniformly lit plane renders as with a ``satellite_frame`` camera, to 0.2% over the film and 2% in its corners (Monte Carlo noise), tracing rays or beams.
+* Coatings, against Fresnel's equations and Airy's summation for thin films (Born & Wolf), written independently in the tests: normal reflectances to 10⁻⁵ (2·10⁻⁴ for aluminium from wave_tracer's data, interpolated differently), including an absentee half-wave overcoat; two aluminium mirrors dim a uniform plane to 0.84798 of ideal ones (R² = 0.84845, at normal incidence).
+* Polarization, averaged over the beam converging on the film: a 45° aluminium fold polarizes an unpolarized scene to Q/I = 0.02900 along its s, the film's x (0.02900 expected); under a quarter-wave overcoat, to −0.00566 (−0.00569: p now reflects more); a periscope's second fold, its plane of incidence turned 45°, turns it circular, |V|/I = 0.006027 (0.006027) bare and 0.005816 (0.005824) overcoated, with the same sign under 0.1 nm of overcoat as bare.
 * Geometry: a marker images where a pinhole camera of the focal length would, to 0.15 pixels, at nadir and 30–45° off it, through the centred Ritchey-Chrétien, its off-axis segment (whose pupil, 0.2 m off the axis, sees the ground from there) and the folded one (mirrored); the off-axis segment with its field 0.3° off the axis points it at the target.
 
 ``detector.py``, checked against independent calculations:

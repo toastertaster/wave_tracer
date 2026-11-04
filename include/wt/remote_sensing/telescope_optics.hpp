@@ -9,14 +9,17 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <numbers>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include <wt/math/common.hpp>
+#include <wt/remote_sensing/telescope_coating.hpp>
 
 /**
  * @brief A telescope's optics, traced as rays in double precision in the telescope's own frame (metres): the
@@ -96,14 +99,6 @@ enum class element_kind_e : std::uint8_t {
 };
 
 /**
- * @brief A mirror's reflectance.
- */
-enum class coating_e : std::uint8_t {
-    /** @brief Reflects all light, without changing its polarization. */
-    ideal,
-};
-
-/**
  * @brief An element of a telescope's optics.
  */
 struct element_t {
@@ -112,7 +107,8 @@ struct element_t {
     /** @brief Stops and obscurations are flat. */
     surface_shape_t shape;
     aperture_t aperture;
-    coating_e coating = coating_e::ideal;
+    /** @brief A mirror's coating (`coating_t`; ideal if none). */
+    std::shared_ptr<const coating_t> coating;
     /** @brief Element frame to telescope frame (rigid), and its inverse. */
     glm::dmat4 to_telescope = glm::dmat4(1), to_local = glm::dmat4(1);
 
@@ -168,6 +164,19 @@ struct field_point_t {
 class telescope_optics_t {
 public:
     static constexpr auto npos = std::numeric_limits<std::size_t>::max();
+    /** @brief Most mirrors a telescope may have. */
+    static constexpr std::size_t max_mirrors = 16;
+
+    /**
+     * @brief A reflection off a mirror, of a ray traced from the focal plane (telescope frame).
+     */
+    struct reflection_t {
+        std::size_t element;
+        /** @brief The mirror's unit normal there, facing the ray. */
+        glm::dvec3 normal;
+        /** @brief The ray's direction before and after the reflection. */
+        glm::dvec3 d_in, d_out;
+    };
 
     struct trace_t {
         bool passed = false;
@@ -175,6 +184,9 @@ public:
         ray_t exit;
         /** @brief Not passed: the element that stopped the ray (missed, outside its aperture, or in its way). */
         std::size_t stopped_by = npos;
+        /** @brief The ray's reflections, in the order traced (from the focal plane). */
+        std::array<reflection_t, max_mirrors> reflections;
+        std::uint32_t reflection_count = 0;
     };
 
 private:
@@ -189,7 +201,7 @@ private:
 
 public:
     /**
-     * @brief Throws `std::invalid_argument` unless there is at least one mirror and every aperture is valid.
+     * @brief Throws `std::invalid_argument` unless there are 1 to `max_mirrors` mirrors and every aperture is valid.
      */
     explicit telescope_optics_t(std::vector<element_t> elements);
 

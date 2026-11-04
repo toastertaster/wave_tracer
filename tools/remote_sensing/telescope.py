@@ -32,6 +32,10 @@ The telescope's frame follows optical design software's convention: light arrive
 at the origin. The film's x is east and its y south at nadir (as a satellite_frame camera's) for designs with an even
 number of mirrors. Lengths in the scene are in metres.
 
+--coating coats every mirror (default ideal: a perfect conductor, reflecting all light):
+  aluminium, silver, gold   the bare metals (wave_tracer's refractive-index data)
+  protected-aluminium       aluminium under 25 nm of magnesium fluoride (n = 1.38), as Hubble's mirrors
+
     uv run tools/remote_sensing/telescope.py two-mirror --kind ritchey-chretien [--diameter 0.4 --focal-length 2.5 ...] > sensor.xml
 
 prints the sensor (with --altitude, --view-zenith, ... placing it, as strings, so that scene defines like $vz work).
@@ -58,6 +62,7 @@ class Element:
     aspheric: list[float] = dataclasses.field(default_factory=list)
     hole_radius: float = 0.0
     aperture_centre: tuple[float, float] = (0.0, 0.0)
+    coating: str = "ideal"
 
 
 @dataclasses.dataclass
@@ -160,6 +165,26 @@ def hubble():
     return Design("Hubble Space Telescope", elements, focal_plane, 57.6, 2.4, 177.80035 / 1200)
 
 
+# <coating> elements of the telescope sensor
+COATINGS = {
+    "ideal": '<coating type="ideal"/>',
+    "aluminium": '<coating type="multilayer"><spectrum name="substrate" material="Al"/></coating>',
+    "silver": '<coating type="multilayer"><spectrum name="substrate" material="Ag"/></coating>',
+    "gold": '<coating type="multilayer"><spectrum name="substrate" material="Au"/></coating>',
+    "protected-aluminium": ('<coating type="multilayer"><spectrum name="substrate" material="Al"/>'
+                            '<layer><spectrum name="IOR" constant="1.38"/>'
+                            '<quantity name="thickness" value="25nm"/></layer></coating>'),
+}
+
+
+def coat(design, coating):
+    """The design with every mirror coated with `coating` (a name of COATINGS)."""
+    if coating not in COATINGS:
+        raise ValueError(f"unknown coating {coating}: one of {', '.join(COATINGS)}")
+    return dataclasses.replace(design, elements=[dataclasses.replace(e, coating=coating) if e.kind == "mirror" else e
+                                                 for e in design.elements])
+
+
 def _length(v):
     return f"{v:.12g}m"
 
@@ -193,6 +218,8 @@ def elements_xml(design, indent="    "):
             cx, cy = e.aperture_centre
             out.append(f'{i2}<vector name="aperture_centre" value="{_length(cx)}, {_length(cy)}"/>')
         out.append(_transform("to_telescope", e.to_telescope, i2))
+        if e.kind == "mirror" and e.coating != "ideal":
+            out.append(i2 + COATINGS[e.coating])
         out.append(f"{indent}</{e.kind}>")
     out.append(_transform("focal_plane", design.focal_plane, indent))
     return "\n".join(out)
@@ -238,6 +265,7 @@ def main():
     p.add_argument("--field-bias", type=float, default=0.0, help="degrees: the film's centre at this field angle")
     p.add_argument("--fold", type=float, help="m: a fold mirror this far before the focal plane")
     p.add_argument("--secondary-radius", type=float, help="m: the secondary's aperture radius (default: the field's)")
+    p.add_argument("--coating", choices=list(COATINGS), default="ideal", help="every mirror's (default ideal)")
     p.add_argument("--pixel-pitch", type=float, default=5e-6, help="m (default 5 µm)")
     p.add_argument("--pixels", type=int, default=256, help="film width and height (default 256)")
     p.add_argument("--altitude", default="500km")
@@ -257,6 +285,7 @@ def main():
         design = two_mirror(args.kind, args.diameter, args.focal_length, args.primary_focal_length, args.back_focus,
                             field_radius=field, off_axis=args.off_axis, field_bias=math.radians(args.field_bias),
                             fold=args.fold, secondary_radius=args.secondary_radius)
+    design = coat(design, args.coating)
     if args.elements_only:
         print(f"<!-- {design.name}: f = {design.focal_length:.6g} m, D = {design.entrance_pupil_diameter:.6g} m, "
               f"obscuration {design.obscuration:.3g}; for a {args.pixels}² film -->")

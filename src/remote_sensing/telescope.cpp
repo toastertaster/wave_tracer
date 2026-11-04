@@ -18,6 +18,7 @@
 
 #include <wt/remote_sensing/telescope.hpp>
 #include <wt/remote_sensing/satellite_placement.hpp>
+#include "prescription.hpp"
 
 #include <wt/scene/element/attributes.hpp>
 #include <wt/scene/loader/node_readers.hpp>
@@ -29,6 +30,36 @@
 using namespace wt;
 using namespace wt::remote_sensing;
 
+
+namespace {
+
+inline dir3_t to_dir(const glm::dvec3& v) noexcept {
+    return dir3_t{ vec3_t{ glm::normalize(v) } };
+}
+
+// the s-p frame of direction w at a surface of unit normal n, as wave_tracer's surfaces' (intersection_surface_t::
+// sp_frame): s perpendicular to the plane of incidence, the same for w towards the surface and away from it
+frame_t sp_frame(const dir3_t& w, const dir3_t& n) noexcept {
+    const auto crs = m::cross(w, n);
+    const auto l2 = m::length2(crs);
+    auto s = l2<f_t(1e-14) ? frame_t::build_orthogonal_frame(n).t : dir3_t{ crs/m::sqrt(l2) };
+    const bool inwards = m::dot(w,n)<0;
+    if (inwards)
+        s = -s;
+    const auto p = dir3_t{ m::cross(s, w) };
+    return frame_t{ .t = s, .b = inwards ? -p : p, .n = w };
+}
+
+}
+
+
+template <bool polarimetric>
+frame_t telescope_t<polarimetric>::detector_frame(const glm::dvec3& d) const noexcept {
+    const auto x = glm::dvec3{ fp.to_telescope[0] }, y = glm::dvec3{ fp.to_telescope[1] };
+    const auto t = glm::normalize(x - glm::dot(x,d)*d);
+    const auto b = glm::normalize(y - glm::dot(y,d)*d - glm::dot(y,t)*t);
+    return frame_t{ .t = to_dir(t), .b = to_dir(b), .n = to_dir(d) };
+}
 
 template <bool polarimetric>
 sensor_sample_t telescope_t<polarimetric>::sample(sampler::sampler_t& sampler,
@@ -60,8 +91,26 @@ sensor_sample_t telescope_t<polarimetric>::sample(sampler::sampler_t& sampler,
     const auto wo = place.position + place.rotation * exit.o;
     const auto dir = dir3_t{ vec3_t{ wd } };
 
+    // the polarization: the mirrors' reflections, composed as wave_tracer's surfaces compose theirs (in s-p frames),
+    // from the detector's frame (Q along the film's x) to the frame of the light arriving from the scene
+    auto M = mueller_operator_t::identity();
+    auto F = detector_frame(d);
+    for (std::uint32_t i=0; i<traced.reflection_count && traced.passed; ++i) {
+        const auto& r = traced.reflections[i];
+        const auto n = to_dir(r.normal);
+        const auto c = optics->elements()[r.element].coating->reflection(k, glm::dot(r.d_out, r.normal));
+        M = compose(M, mueller_operator_t::fresnel(c.rs, c.rp), F, sp_frame(F.n, n));
+        F = sp_frame(to_dir(r.d_out), n);
+    }
+    // ... in world coordinates
+    const auto Fw = frame_t{
+        .t = to_dir(place.rotation * glm::dvec3{ vec3_t{ F.t } }),
+        .b = to_dir(place.rotation * glm::dvec3{ vec3_t{ F.b } }),
+        .n = dir,
+    };
+
     const QE_flux_t W = f_t(weight) * u::ang::sr * square(u::m);
-    auto beam = importance_flux_beam_t{ ray_t{ pqvec3_t{ vec3_t{ wo } * u::m }, dir }, W, k, sourcing_geometry(k) };
+    auto beam = importance_flux_beam_t{ ray_t{ pqvec3_t{ vec3_t{ wo } * u::m }, dir }, M, W, Fw, k, sourcing_geometry(k) };
     // start near the scene: the beam as propagated through vacuum to there
     if (place.near_clip>0)
         beam.transform_restart(pqvec3_t{ vec3_t{ wo + place.near_clip*wd } * u::m }, f_t(place.near_clip) * u::m);
@@ -106,7 +155,7 @@ scene::element::info_t telescope_t<polarimetric>::description() const {
     const auto& c = props.centre;
     const auto los = place.rotation * c.line_of_sight;
 
-    return info_for_scene_element(*this, "telescope", {
+    auto info = info_for_scene_element(*this, "telescope", {
         { "position (m)",               attributes::make_vector(vec3_t{ place.position }) },
         { "line of sight",              attributes::make_vector(vec3_t{ los }) },
         { "elements",                   attributes::make_scalar(optics->elements().size()) },
@@ -120,6 +169,20 @@ scene::element::info_t telescope_t<polarimetric>::description() const {
         { "corner relative throughput", attributes::make_scalar(props.corner_relative_throughput) },
         { "film",                       attributes::make_map(std::move(film_desc)) },
     });
+
+    // the mirrors' coatings, and their reflectance at normal incidence at the film's mean wavelength
+    const auto k = this->sensitivity_spectrum().mean_wavenumber();
+    info.attribs.emplace("reflectance wavelength (nm)",
+                         attributes::make_scalar(double(u::to_m(wavenum_to_wavelen(k))) * 1e9));
+    for (std::size_t i=0; i<optics->elements().size(); ++i) {
+        const auto& e = optics->elements()[i];
+        if (e.kind!=optics::element_kind_e::mirror)
+            continue;
+        const auto name = e.id.empty() ? std::format("#{}", i) : e.id;
+        info.attribs.emplace("coating " + name, attributes::make_string(e.coating->description()));
+        info.attribs.emplace("normal reflectance " + name, attributes::make_scalar(e.coating->normal_reflectance(k)));
+    }
+    return info;
 }
 
 template class wt::remote_sensing::telescope_t<false>;
@@ -128,56 +191,9 @@ template class wt::remote_sensing::telescope_t<true>;
 
 namespace {
 
-// lengths of the prescription in double precision (the scene loader's quantities are f_t): a number and a unit
-double parse_length(const std::string& str) {
-    // (strtod, not from_chars: older libc++ lacks floating-point from_chars)
-    const char* first = str.c_str();
-    char* end = nullptr;
-    const double value = std::strtod(first, &end);
-    if (end==first || !std::isfinite(value))
-        throw std::format_error("malformed length \"" + str + "\"");
-    auto unit = std::string{ end };
-    while (!unit.empty() && unit.front()==' ') unit.erase(unit.begin());
-    while (!unit.empty() && unit.back()==' ') unit.pop_back();
-    if (unit=="m")                  return value;
-    if (unit=="km")                 return value*1e3;
-    if (unit=="cm")                 return value*1e-2;
-    if (unit=="mm")                 return value*1e-3;
-    if (unit=="um" || unit=="µm")  return value*1e-6;
-    if (unit=="nm")                 return value*1e-9;
-    throw std::format_error("length \"" + str + "\" needs a unit (m, km, cm, mm, um or nm)");
-}
-
-bool read_length(const scene::loader::node_t& item, const std::string& name, std::optional<double>& out) {
-    if (item.name()!="quantity" || item["name"]!=name)
-        return false;
-    if (out)
-        throw std::format_error("Node \"" + name + "\" already provided");
-    out = parse_length(item["value"]);
-    return true;
-}
-
-bool read_number(const scene::loader::node_t& item, const std::string& name, std::optional<double>& out) {
-    if (item.name()!="float" || item["name"]!=name)
-        return false;
-    if (out)
-        throw std::format_error("Node \"" + name + "\" already provided");
-    out = stofd_strict(item["value"]);
-    return true;
-}
-
-bool read_length_vec2(const scene::loader::node_t& item, const std::string& name, std::optional<glm::dvec2>& out) {
-    if (item.name()!="vector" || item["name"]!=name)
-        return false;
-    if (out)
-        throw std::format_error("Node \"" + name + "\" already provided");
-    const auto& v = item["value"];
-    const auto comma = v.find(',');
-    if (comma==std::string::npos || v.find(',', comma+1)!=std::string::npos)
-        throw std::format_error("\"" + name + "\" needs two lengths, e.g. \"0m, 0.3m\"");
-    out = glm::dvec2{ parse_length(v.substr(0, comma)), parse_length(v.substr(comma+1)) };
-    return true;
-}
+using prescription::read_length;
+using prescription::read_number;
+using prescription::read_length_vec2;
 
 // a rigid transform. The scene loader reads transforms' numbers in single precision (matrices' entries, rotations'
 // angles): their rotation is orthonormalized again, in double precision
@@ -200,7 +216,8 @@ glm::dmat4 rigid_matrix(const transform_d_t& t, const std::string& what, const s
     return m;
 }
 
-optics::element_t load_element(scene::loader::loader_t* loader, const scene::loader::node_t& node) {
+optics::element_t load_element(scene::loader::loader_t* loader, const scene::loader::node_t& node,
+                               const wt::wt_context_t &context) {
     optics::element_t e;
     e.id = node["id"];
     if      (node.name()=="mirror")      e.kind = optics::element_kind_e::mirror;
@@ -212,7 +229,7 @@ optics::element_t load_element(scene::loader::loader_t* loader, const scene::loa
     std::optional<glm::dvec2> aperture_centre;
     std::optional<transform_d_t> to_telescope;
     std::vector<std::optional<double>> aspheric;
-    std::string coating = "ideal";
+    std::shared_ptr<const optics::coating_t> coating;
 
     for (auto& item : node.children_view()) {
     try {
@@ -234,12 +251,16 @@ optics::element_t load_element(scene::loader::loader_t* loader, const scene::loa
                 throw std::format_error("Node \"to_telescope\" already provided");
             to_telescope = t;
         }
+        else if (item.name()=="coating") {
+            if (coating)
+                throw std::format_error("Node \"coating\" already provided");
+            coating = optics::coating_t::load(loader, item, context);
+        }
         else if (!read_length(item, "radius", radius) &&
                  !read_number(item, "conic", conic) &&
                  !read_length(item, "aperture_radius", aperture_radius) &&
                  !read_length(item, "hole_radius", hole_radius) &&
-                 !read_length_vec2(item, "aperture_centre", aperture_centre) &&
-                 !scene::loader::read_attribute(item, "coating", coating))
+                 !read_length_vec2(item, "aperture_centre", aperture_centre))
             logger::cwarn()
                 << loader->node_description(item)
                 << "(telescope sensor loader) " << what << ": unqueried node type " << item.name() << " (\"" << item["name"] << "\")" << '\n';
@@ -257,12 +278,10 @@ optics::element_t load_element(scene::loader::loader_t* loader, const scene::loa
         throw error("the 'to_telescope' transform must be provided");
     if (e.kind!=optics::element_kind_e::mirror && (radius || conic || !aspheric.empty()))
         throw error("stops and obscurations are flat: no 'radius', 'conic' or aspheric terms");
-    if (e.kind!=optics::element_kind_e::mirror && coating!="ideal")
+    if (e.kind!=optics::element_kind_e::mirror && coating)
         throw error("only mirrors have a coating");
     if (radius && *radius==0)
         throw error("'radius' must not be 0 (omit it for a flat mirror)");
-    if (coating!="ideal")
-        throw error("unsupported coating \"" + coating + "\" (supported: \"ideal\", a perfect, non-polarizing reflector)");
 
     e.shape.curvature = radius ? 1 / *radius : 0;
     e.shape.conic = conic.value_or(0);
@@ -273,7 +292,7 @@ optics::element_t load_element(scene::loader::loader_t* loader, const scene::loa
         .hole_radius = hole_radius.value_or(0),
         .centre = aperture_centre.value_or(glm::dvec2{ 0,0 }),
     };
-    e.coating = optics::coating_e::ideal;
+    e.coating = coating ? std::move(coating) : std::make_shared<optics::coating_t>();
     e.to_telescope = rigid_matrix(*to_telescope, "to_telescope", node);
     e.to_local = glm::inverse(e.to_telescope);
     return e;
@@ -322,7 +341,7 @@ std::shared_ptr<sensor::sensor_t> load(std::string id,
         if (item.name() == "film")
             film.emplace(telescope_t::film_t::load(loader, item, telescope_t::beam_source_spatial_stddev, context));
         else if (item.name()=="mirror" || item.name()=="stop" || item.name()=="obscuration")
-            elements.emplace_back(load_element(loader, item));
+            elements.emplace_back(load_element(loader, item, context));
         else if (scene::loader::load_transform(item, "focal_plane", t, loader)) {
             if (focal_plane)
                 throw std::format_error("Node \"focal_plane\" already provided");

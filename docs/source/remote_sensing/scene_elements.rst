@@ -61,7 +61,7 @@ Its beams start at ``near_clip`` as if propagated there from the camera (their e
 A satellite's camera that images the scene through a telescope's mirrors: a focal-plane array behind optics described by their surfaces, placed as a ``satellite_frame`` camera.
 Each sample takes a point in its pixel and a direction towards the optics, and traces the ray backwards through the mirrors, in double precision, out towards the scene.
 Rays that miss a clear aperture, or meet an obstacle (the secondary mirror's shadow, the primary's central hole), are vignetted.
-The render then has the telescope's geometric optics in it: its distortion, its field-dependent geometric blur (aberrations, the focal plane's defocus off a curved field), vignetting, and the parallax of an off-axis aperture.
+The render then has the telescope's geometric optics in it: its distortion, its field-dependent geometric blur (aberrations, the focal plane's defocus off a curved field), vignetting, and the parallax of an off-axis aperture; and its mirrors' coatings: their reflectance, per wavelength and angle of incidence, and the polarization they cause.
 Diffraction by the aperture is not traced: it is the detector model's (``detector.py``).
 
 The telescope's optics are configured, not built in: a list of elements, in the order light meets them.
@@ -141,8 +141,8 @@ Every mirror is also an obstacle to the rays' other segments, within its clear a
      - The clear aperture's centre in the element's x and y (default the vertex): an off-axis segment of its surface, e.g. ``<vector name="aperture_centre" value="0m, 0.2m"/>``.
    * - ``to_telescope``
      - The element's frame in the telescope's (required).
-   * - ``coating``
-     - ``ideal`` (the default and, so far, only coating): reflects all light, without changing its polarization.
+   * - ``<coating>``
+     - The mirror's coating (below). Default ideal.
 
 .. list-table:: Sensor parameters
    :header-rows: 1
@@ -161,10 +161,34 @@ Every mirror is also an obstacle to the rays' other segments, within its clear a
    * - ``samples``, ``ray_trace_only``, ``alpha``, ``phase_space_extent_scale``, ``polarimetric``
      - As for the ``perspective`` sensor. Beams start at the last mirror, of the pixel's angular extent (pitch over focal length, or ``alpha``) and the narrowest cross section it allows (a minimum-uncertainty beam: ~0.2 m at 550 nm for 2 µrad), then start again at ``near_clip``.
 
+**Coatings.**
+Each mirror's coating reflects light as the complex Fresnel coefficients r\ :sub:`s` and r\ :sub:`p` of its materials give, at the sample's wavelength and the ray's angle of incidence:
+
+.. code-block:: xml
+
+   <coating type="ideal"/>                       <!-- the default: a perfect conductor, rs = -1, rp = 1 -->
+   <coating type="multilayer">
+       <spectrum name="substrate" material="Al"/> <!-- a metal (wave_tracer's data), or any refractive index -->
+       <layer>                                  <!-- thin films, from the outermost; none: the bare substrate -->
+           <spectrum name="IOR" constant="1.38"/>
+           <quantity name="thickness" value="25nm"/>
+       </layer>
+   </coating>
+
+Refractive indices are wave_tracer's spectra (complex, *n* + *ik*: ``material`` from its data, ``constant="(0.958,6.69i)"``, or any other).
+A bare substrate reflects as wave_tracer's own ``fresnel_reflection``; layers by their characteristic matrices (Macleod, *Thin-Film Optical Filters*), in double precision, in the same convention.
+The sensor describes each mirror's coating and its reflectance at normal incidence at the film's mean wavelength.
+
+**Polarization.**
+Each reflection applies its coating's Mueller matrix, composed in s-p frames as wave_tracer's surfaces compose theirs, from the detector's frame to the frame of the light arriving from the scene.
+An unpolarized scene through metal mirrors at oblique incidence (a fold mirror's) renders partially polarized, along the mirror's s-polarization; mirrors whose planes of incidence are turned from each other turn it partly circular (retardance).
+A polarimetric film (``polarimetric="true"``) records the Stokes parameters about the film's axes: Q is light polarized along the film's x, less along its y; U along x + y, less along x − y.
+With a scalar film, pixels record the intensity, which the coatings' diattenuation makes depend on the scene's polarization.
+
 **Radiometry.**
-Pixels record radiance relative to the film centre's throughput (the projected solid angle, on the focal plane, of the rays that pass).
-A uniform scene renders as its radiance at the film's centre, as a ``satellite_frame`` camera's does, and dimmer where the optics vignette or distort the image (by the conservation of étendue).
-The render is still the radiance at the entrance pupil, for ``detector.py`` to scale by the aperture: give its instrument the aperture's diameter and obscuration that the sensor reports, and a wavefront error without the design's own aberrations, which the render has.
+Pixels record radiance relative to the film centre's throughput (the projected solid angle, on the focal plane, of the rays that pass), times the coatings' reflectances.
+With ideal mirrors, a uniform scene renders as its radiance at the film's centre, as a ``satellite_frame`` camera's does, and dimmer where the optics vignette or distort the image (by the conservation of étendue); coated mirrors dim it by their reflectance, e.g. two bare aluminium mirrors to ~0.85 at 550 nm.
+The render is still the radiance at the entrance pupil, for ``detector.py`` to scale by the aperture: give its instrument the aperture's diameter and obscuration that the sensor reports, a wavefront error without the design's own aberrations, which the render has, and a transmittance without the coated mirrors' reflectances, which the render has too.
 
 **When loading**, the sensor traces its optics from the film's centre (2\ :sup:`18` rays), near it and from its corners, and refuses designs through which no ray passes from the film's centre, or whose film centre does not look towards the scene.
 It logs and describes (the scene's description, e.g. ``Scene::info`` in the Rust bindings) what it found: the focal lengths along the film's x and y (from the lines of sight 10 pixels either side of the centre: the image's centroid's scale, which a telescope's coma lengthens), the entrance pupil's diameter and obscuration, the film centre's projected solid angle and geometric blur (RMS, warning beyond 10 pixels), and the corners' throughput relative to the centre's.
@@ -175,7 +199,7 @@ Directions are mostly drawn from the cone of those that pass (found on a 5 × 5 
 
 **Limitations.**
 Only backward ``plt_path``: the sensor cannot connect to scene points, as ``plt_bdpt`` and forward ``plt_path`` need (scenes are refused), and it has no GPU implementation yet.
-Mirrors are ideal reflectors, the focal plane is flat, and the scene loader reads transforms in single precision (their rotations are orthonormalized again; translations are good to ~0.1 µm per metre).
+Coatings are smooth: their roughness's scatter is stray light's (to come). The focal plane is flat, and the scene loader reads transforms in single precision (their rotations are orthonormalized again; translations are good to ~0.1 µm per metre).
 
 
 ``band_radiance`` response

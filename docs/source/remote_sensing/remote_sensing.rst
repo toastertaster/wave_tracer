@@ -3,7 +3,7 @@ Realistic remote sensing
 
 The fork's ``remote-sensing`` branch extends **wave_tracer** to render realistic Earth-observation imagery: a satellite camera hundreds of kilometres above a terrain scene, lit by the sun through an atmosphere, recorded by a modelled detector.
 It is developed for simulating several kinds of cameras (frame, and later TDI/pushbroom, event and Geiger-mode APD cameras), from the visible and near infrared first, and later the shortwave, longwave and thermal infrared.
-The telescope enters as a point-spread function (``detector.py``), or, with the ``telescope`` sensor, as its mirrors, traced: the render then has the telescope's geometric optics in it (distortion, aberrations, vignetting), and is to have its coatings' polarization, and stray light, as the plan below goes on.
+The telescope enters as a point-spread function (``detector.py``), or, with the ``telescope`` sensor, as its mirrors, traced: the render then has the telescope's geometric optics in it (distortion, aberrations, vignetting) and its coatings (reflectance, polarization), and is to have stray light, as the plan below goes on.
 Tolerancing is left to optical design software.
 
 These features are unlikely to be merged upstream, so they are compiled only with the CMake option ``REALISTIC_REMOTE_SENSING``:
@@ -60,7 +60,8 @@ The first goal is stage one of the simulation: the radiance that reaches the tel
 
    a. *Done.* Configured optics (conic and aspheric mirrors, stops and obscurations, decentred apertures, tilted elements), vignetting, a flat focal-plane array; on the CPU, with backward ``plt_path``.
       Matches Optiland's focal lengths (to 5·10⁻⁵) and vignetting (relative throughput to 10⁻⁵), first-order optics' throughput and obscuration, a ``satellite_frame`` camera's radiometry, and a pinhole camera's projection (centred, off-axis and folded designs).
-   b. Coatings and polarization: the mirrors' metals (Fresnel reflection of complex refractive indices) and multilayer coatings, as Mueller matrices, per wavelength and angle of incidence.
+   b. *Done.* Coatings and polarization: the mirrors' metals (Fresnel reflection of complex refractive indices) and multilayer coatings (characteristic matrices), as Mueller matrices, per wavelength and angle of incidence; polarimetric films about the detector's axes.
+      Matches Fresnel's equations and Airy's summation: reflectances to 10⁻⁵, a fold's polarization (Q/I to 0.4%) and a periscope's retardance (V/I to 0.2%).
    c. ``detector.py`` with the traced telescope: the diffraction PSF without the design's own aberrations, and distortion in the platform's motion.
    d. The sensor on the GPUs.
    e. Stray light: the same elements traced in any order, baffles, scatter from the mirrors' roughness, the sun out of the field; validated by the point-source transmittance against off-axis angle.
@@ -74,5 +75,5 @@ Known issues
 * Materials: the default playa spectrum is an analogue's (Stonewall Playa), not Railroad Valley's own (RadCalNet's, which needs registration); NAIP is uncalibrated and 8-bit, so abundances are only as good as the assumption that its values are proportional to radiance; at most four materials per ``spectral_mix``.
 * Detector: the telescope's PSF is the same over the field (diffraction and a statistical wavefront error; no aberrations of a design, nor PSFs from optical design software, yet); the pixels have no MTF beyond their area (no diffusion or crosstalk); time is modelled over a single render: footprints move over it along its columns (north–south), without parallax or changes of view, so pushbroom scans of whole scenes with relief, and other headings, need renders per frame (not yet). Event cameras are sampled at fine time steps: seconds of a large array take hours. Renders must be oversampled (``k`` ≥ 2–4, so that the optics' cut-off is within the render's Nyquist frequency; ``detector.py`` warns otherwise), and their Monte Carlo noise kept below the detector's.
 * Bands share wavelength samples (see ``band_radiance``): images of several disjoint bands are noisier per band than images of one.
-* ``telescope`` sensor: CPU and backward ``plt_path`` only; ideal mirrors; a flat focal plane; one film per sensor (several line arrays at their field positions need a sensor each). The samples its optics vignette cost noise. Off its axis, a flat focal plane behind a curved field defocuses and stretches the image: with the off-axis segment of the tests, 0.3° off axis, by ~1% north-south and 3 pixels of blur.
+* ``telescope`` sensor: CPU and backward ``plt_path`` only; smooth coatings; a flat focal plane; one film per sensor (several line arrays at their field positions need a sensor each). The samples its optics vignette cost noise. Off its axis, a flat focal plane behind a curved field defocuses and stretches the image: with the off-axis segment of the tests, 0.3° off axis, by ~1% north-south and 3 pixels of blur.
 * From a camera hundreds of kilometres away, ~10⁻⁴ of oblique views' samples still shadow themselves with ``near_clip``'s default margin (2 km); nearer margins leave fewer.

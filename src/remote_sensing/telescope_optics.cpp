@@ -156,8 +156,11 @@ telescope_optics_t::telescope_optics_t(std::vector<element_t> elements)
         if (e.kind!=element_kind_e::obscuration)
             seq.push_back(i);
     }
-    if (std::ranges::none_of(elems, [](const auto& e) { return e.kind==element_kind_e::mirror; }))
+    const auto mirrors = std::ranges::count_if(elems, [](const auto& e) { return e.kind==element_kind_e::mirror; });
+    if (mirrors==0)
         throw std::invalid_argument("at least one mirror is needed");
+    if (std::size_t(mirrors)>max_mirrors)
+        throw std::invalid_argument(std::format("at most {} mirrors are supported", max_mirrors));
 
     // bound the clear aperture nearest the focal plane by a sphere about its centre
     const auto& last = elems[seq.back()];
@@ -190,6 +193,12 @@ std::size_t telescope_optics_t::obstacle(const ray_t& r, double tmax,
 }
 
 telescope_optics_t::trace_t telescope_optics_t::trace_from_focal_plane(const ray_t& r) const noexcept {
+    trace_t ret;
+    const auto stopped = [&ret](std::size_t by) {
+        ret.stopped_by = by;
+        return ret;
+    };
+
     auto ray = r;
     auto from = npos;
     for (auto it = seq.rbegin(); it!=seq.rend(); ++it) {
@@ -198,18 +207,21 @@ telescope_optics_t::trace_t telescope_optics_t::trace_from_focal_plane(const ray
 
         const auto hit = e.intersect(ray, from==npos ? 0 : self_intersection_epsilon);
         if (!hit || !e.aperture.contains(hit->local.x, hit->local.y))
-            return { .stopped_by = idx };
+            return stopped(idx);
         if (const auto o = obstacle(ray, hit->t, from, idx); o!=npos)
-            return { .stopped_by = o };
+            return stopped(o);
 
         const auto p = ray.o + hit->t*ray.d;
         auto d = ray.d;
         if (e.kind==element_kind_e::mirror) {
             const auto n_local = e.shape.normal(hit->local.x, hit->local.y);
             if (!n_local)
-                return { .stopped_by = idx };
-            const auto n = glm::normalize(transform_direction(e.to_telescope, *n_local));
+                return stopped(idx);
+            auto n = glm::normalize(transform_direction(e.to_telescope, *n_local));
+            if (glm::dot(d,n)>0)
+                n = -n;
             d = glm::normalize(d - 2*glm::dot(d,n)*n);
+            ret.reflections[ret.reflection_count++] = { .element = idx, .normal = n, .d_in = ray.d, .d_out = d };
         }
         ray = ray_t{ p,d };
         from = idx;
@@ -217,8 +229,10 @@ telescope_optics_t::trace_t telescope_optics_t::trace_from_focal_plane(const ray
 
     // out towards the scene
     if (const auto o = obstacle(ray, std::numeric_limits<double>::infinity(), from, npos); o!=npos)
-        return { .stopped_by = o };
-    return { .passed = true, .exit = ray };
+        return stopped(o);
+    ret.passed = true;
+    ret.exit = ray;
+    return ret;
 }
 
 cone_t telescope_optics_t::aim(const glm::dvec3& p) const noexcept {
