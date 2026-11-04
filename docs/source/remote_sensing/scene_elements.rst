@@ -198,7 +198,9 @@ The rays that the optics vignette are samples of no importance: they cost noise 
 Directions are mostly drawn from the cone of those that pass (found on a 5 × 5 grid over the film when loading), and some from the cone bounding the clear aperture nearest the focal plane, which every passing direction is in: weighted by the mixture's density, the render is unbiased.
 
 **Limitations.**
-Only backward ``plt_path``: the sensor cannot connect to scene points, as ``plt_bdpt`` and forward ``plt_path`` need (scenes are refused), and it has no GPU implementation yet.
+Only backward ``plt_path``: the sensor cannot connect to scene points, as ``plt_bdpt`` and forward ``plt_path`` need (scenes are refused).
+On the GPU, the kernels trace the optics in their precision: in single precision, directions leaving the telescope are accurate to ~10⁻⁷ rad, a twentieth of a pixel for the tests' designs (f = 2.5 m, 5 µm pixels), but more than one for Hubble's (f = 57.6 m; the GPU warns when it is more than a tenth): render long focal lengths on the CPU, or with ``GPU_DBL_PRECISION``.
+The GPU supports up to 32 elements, 8 aspheric terms per surface, and 16 coating layers and 16 refractive indices over all coatings.
 Coatings are smooth: their roughness's scatter is stray light's (to come). The focal plane is flat, and the scene loader reads transforms in single precision (their rotations are orthonormalized again; translations are good to ~0.1 µm per metre).
 
 

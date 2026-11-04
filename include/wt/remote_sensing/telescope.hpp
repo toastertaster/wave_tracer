@@ -58,7 +58,7 @@ namespace wt::remote_sensing {
  *        radiance at the entrance pupil, for a detector model to scale by the aperture.
  *
  *        Only backward transport is supported (backward `plt_path`): the sensor cannot connect to scene points
- *        (`sample_direct`), and has no GPU implementation yet.
+ *        (`sample_direct`). The GPU kernels port `sample` (wt/gpu/kernel/telescope.hpp), in their precision.
  */
 template <bool polarimetric>
 class telescope_t final : public sensor::film_backed_sensor_t<2, polarimetric> {
@@ -180,6 +180,10 @@ public:
 
     [[nodiscard]] inline const auto& telescope_optics() const noexcept { return *optics; }
     [[nodiscard]] inline const auto& properties() const noexcept { return props; }
+    [[nodiscard]] inline const auto& focal_plane() const noexcept { return fp; }
+    [[nodiscard]] inline const auto& placement() const noexcept { return place; }
+    /** @brief The cones of passing directions, row major on aim_grid_size² points spanning the film. */
+    [[nodiscard]] inline const auto& aim_cones() const noexcept { return aim_grid; }
 
     [[nodiscard]] bool is_delta_position() const noexcept override  { return false; }
     [[nodiscard]] bool is_delta_direction() const noexcept override { return false; }

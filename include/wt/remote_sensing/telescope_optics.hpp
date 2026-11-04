@@ -206,6 +206,11 @@ public:
     explicit telescope_optics_t(std::vector<element_t> elements);
 
     [[nodiscard]] inline const auto& elements() const noexcept { return elems; }
+    /** @brief The elements a ray passes in turn (mirrors and stops), in the order light meets them. */
+    [[nodiscard]] inline const auto& sequence() const noexcept { return seq; }
+    /** @brief The sphere bounding the clear aperture of the sequential element nearest the focal plane (see `aim`). */
+    [[nodiscard]] inline const auto& aim_sphere_centre() const noexcept { return aim_centre; }
+    [[nodiscard]] inline double aim_sphere_radius() const noexcept { return aim_radius; }
 
     /**
      * @brief Traces a ray that leaves the focal plane backwards through the optics: through the sequential

@@ -60,6 +60,9 @@ struct plt_scene_t {
     std::vector<std::uint32_t> texels;         // `compute_kernel::bitmap`s' texels
     std::vector<compute_kernel::real> texel_luts;
     std::vector<compute_kernel::real> fsd_lut;         // plt_bdpt's free-space diffraction, or empty (see `compute_kernel::plt_scene`)
+#if defined(REALISTIC_REMOTE_SENSING)
+    std::vector<compute_kernel::telescope_desc> telescope;     // a telescope sensor's, or empty
+#endif
     std::uint32_t emitter_count;
     std::uint32_t material_count;
     std::uint32_t samples_per_emitter;         // in each spectral table

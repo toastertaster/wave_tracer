@@ -627,6 +627,9 @@ public:
         texels.upload(scene.texels.data(), scene.texels.size());
         texel_luts.upload(scene.texel_luts.data(), scene.texel_luts.size());
         fsd_lut.upload(scene.fsd_lut.data(), scene.fsd_lut.size());
+#if defined(REALISTIC_REMOTE_SENSING)
+        telescope.upload(scene.telescope.data(), scene.telescope.size());
+#endif
 
         // a polarimetric film's components have four values (Stokes parameters), and one weight
         weights_size = std::size_t(scene.film.width) * scene.film.height * scene.film.components;
@@ -661,6 +664,9 @@ public:
         params.texels = texels.get();
         params.texel_luts = texel_luts.get();
         params.fsd_lut = fsd_lut.get();
+#if defined(REALISTIC_REMOTE_SENSING)
+        params.telescope = telescope.get();
+#endif
         params.emitter_count = scene.emitter_count;
         params.material_count = scene.material_count;
         params.samples_per_emitter = scene.samples_per_emitter;
@@ -1186,6 +1192,9 @@ private:
         h.texels = host(host_arrays.texels);
         h.texel_luts = host(host_arrays.texel_luts);
         h.fsd_lut = host(host_arrays.fsd_lut);
+#if defined(REALISTIC_REMOTE_SENSING)
+        h.telescope = host(host_arrays.telescope);
+#endif
         const spectral_table_t& t = loaded[0].table;
         h.spectra = host(t.samples);
         h.emissions = host(t.emissions);
@@ -1221,6 +1230,9 @@ private:
     device_buffer_t<k::u32>           texels;
     device_buffer_t<k::real>          texel_luts;
     device_buffer_t<k::real>          fsd_lut;
+#if defined(REALISTIC_REMOTE_SENSING)
+    device_buffer_t<k::telescope_desc> telescope;
+#endif
     device_buffer_t<double>           film;
     device_buffer_t<double>           film_weights;     // block splats
     device_buffer_t<double>           light_film;       // plt_bdpt's direct splats

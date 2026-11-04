@@ -48,6 +48,7 @@
 #include <wt/texture/transform.hpp>
 #if defined(REALISTIC_REMOTE_SENSING)
 #include <wt/remote_sensing/spectral_mix.hpp>
+#include <wt/remote_sensing/telescope.hpp>
 #endif
 #include <wt/spectrum/colourspace/RGB/RGB_to_spectral.hpp>
 #include <wt/sensor/sensor/perspective.hpp>
@@ -786,11 +787,15 @@ std::vector<const bsdf::bsdf_t*> compile_geometry(const scene_t& scene, const ad
     return bsdfs;
 }
 
-/** @brief A sensor's film, and the beams it sources at a wavenumber (`sourcing_geometry`). */
+/**
+ * @brief A sensor's film, the beams it sources at a wavenumber (`sourcing_geometry`), and what else of it depends
+ *        on the wavenumber (`compile`, if any: compiles into the spectral sample).
+ */
 struct sensor_spectral_t {
     const sensor::response::response_t* response;
     std::uint32_t components;
     std::function<beam::sourcing_geometry_t(wavenumber_t)> sourcing;
+    std::function<void(wavenumber_t, compute_kernel::spectral_sample&)> compile = {};
 };
 
 template <std::size_t Dims, bool polarimetric>
@@ -823,9 +828,167 @@ void compile_matrix(const transform_t& t, real (&out)[16]) {
         out[4*r+c] = real(m[c][r]);
 }
 
+#if defined(REALISTIC_REMOTE_SENSING)
+/** @brief A rigid transform's row-major 3x4 matrix (glm matrices are column-major). */
+void compile_rigid(const glm::dmat4& m, real (&out)[12]) {
+    for (int r=0; r<3; ++r)
+    for (int c=0; c<4; ++c)
+        out[4*r+c] = real(m[c][r]);
+}
+
+/** @brief A double-precision vector (of `remote_sensing::optics`), in the kernels' precision. */
+compute_kernel::vec3 dvec_to_kernel(const glm::dvec3& v) noexcept {
+    return { real(v.x), real(v.y), real(v.z) };
+}
+
+/**
+ * @brief A `remote_sensing::telescope_t`: its optics, focal plane and placement, as `compute_kernel::telescope_desc`;
+ *        and, per wavenumber, its coatings' refractive indices. Backward plt_path only, as on the CPU.
+ */
+template <bool polarimetric>
+sensor_spectral_t compile_telescope(const remote_sensing::telescope_t<polarimetric>& tel,
+                                    const compute_kernel::plt_params& params, plt_scene_t& out) {
+    namespace k = compute_kernel;
+    namespace ro = remote_sensing::optics;
+    if (params.backward==0 || params.bdpt!=0)
+        throw gpu_error_t(std::format(
+            "GPU rendering supports telescope sensors only with backward plt_path (direction=\"backward\"); sensor <{}>",
+            tel.get_id()));
+
+    const auto& optics = tel.telescope_optics();
+    const auto& elements = optics.elements();
+    const auto refuse = [&](std::string_view what) {
+        return gpu_error_t(std::format("GPU rendering supports telescopes of {}; sensor <{}> is not", what, tel.get_id()));
+    };
+    if (elements.size()>k::telescope_max_elements)
+        throw refuse(std::format("up to {} elements", k::telescope_max_elements));
+
+    // (large: on the heap)
+    auto desc = std::make_unique<k::telescope_desc>();
+    auto& T = *desc;
+
+    // the coatings' refractive indices, compiled per wavenumber: of each coating (once), its substrate's and layers'
+    std::vector<const spectrum::spectrum_t*> iors;
+    std::map<const ro::coating_t*, std::pair<std::uint32_t, std::uint32_t>> coatings;     // substrate, first layer
+    std::uint32_t layers = 0;
+    const auto add_ior = [&](const spectrum::spectrum_t* s) {
+        if (iors.size()>=k::telescope_max_iors)
+            throw refuse(std::format("coatings of up to {} refractive indices (of substrates and layers) in all",
+                                     k::telescope_max_iors));
+        iors.push_back(s);
+        return std::uint32_t(iors.size()-1);
+    };
+
+    T.element_count = std::uint32_t(elements.size());
+    for (std::size_t i=0; i<elements.size(); ++i) {
+        const auto& e = elements[i];
+        auto& ke = T.elements[i];
+        ke.kind = e.kind==ro::element_kind_e::mirror ? k::telescope_mirror :
+                  e.kind==ro::element_kind_e::stop   ? k::telescope_stop :
+                                                           k::telescope_obscuration;
+        ke.curvature = real(e.shape.curvature);
+        ke.conic = real(e.shape.conic);
+        if (e.shape.aspheric.size()>k::telescope_max_aspheric)
+            throw refuse(std::format("surfaces of up to {} aspheric terms", k::telescope_max_aspheric));
+        ke.aspheric_count = std::uint32_t(e.shape.aspheric.size());
+        for (std::size_t j=0; j<e.shape.aspheric.size(); ++j)
+            ke.aspheric[j] = real(e.shape.aspheric[j]);
+        ke.aperture_centre = { real(e.aperture.centre.x), real(e.aperture.centre.y) };
+        ke.aperture_radius2 = real(e.aperture.radius*e.aperture.radius);
+        ke.hole_radius2 = real(e.aperture.hole_radius*e.aperture.hole_radius);
+        compile_rigid(e.to_telescope, ke.to_telescope);
+        compile_rigid(e.to_local, ke.to_local);
+
+        ke.substrate = k::telescope_ideal;
+        const auto* coating = e.coating.get();
+        if (e.kind!=ro::element_kind_e::mirror || !coating || coating->is_ideal())
+            continue;
+        auto it = coatings.find(coating);
+        if (it==coatings.end()) {
+            const auto substrate = add_ior(coating->substrate().get());
+            const auto first = layers;
+            for (const auto& l : coating->layers()) {
+                if (layers>=k::telescope_max_layers)
+                    throw refuse(std::format("coatings of up to {} layers in all", k::telescope_max_layers));
+                T.layers[layers++] = { add_ior(l.ior.get()), real(l.thickness) };
+            }
+            it = coatings.emplace(coating, std::pair{ substrate, first }).first;
+        }
+        ke.substrate = it->second.first;
+        ke.first_layer = it->second.second;
+        ke.layer_count = std::uint32_t(coating->layers().size());
+    }
+    T.sequence_count = std::uint32_t(optics.sequence().size());
+    for (std::size_t i=0; i<optics.sequence().size(); ++i)
+        T.sequence[i] = std::uint32_t(optics.sequence()[i]);
+
+    // where samples aim
+    T.aim_centre = dvec_to_kernel(optics.aim_sphere_centre());
+    T.aim_radius = real(optics.aim_sphere_radius());
+    using telescope_t = remote_sensing::telescope_t<polarimetric>;
+    static_assert(telescope_t::aim_grid_size==k::telescope_aim_grid_size);
+    const auto& grid = tel.aim_cones();
+    for (std::size_t i=0; i<grid.size(); ++i)
+        T.aim_grid[i] = { dvec_to_kernel(grid[i].axis), real(std::acos(std::clamp(grid[i].cos_half_angle, -1., 1.))) };
+    T.aim_margin = real(telescope_t::aim_margin);
+    T.aim_tight_fraction = real(telescope_t::aim_tight_fraction);
+
+    // the focal plane, and the telescope's placement
+    const auto& fp = tel.focal_plane();
+    compile_rigid(fp.to_telescope, T.fp_to_telescope);
+    T.fp_normal = dvec_to_kernel(glm::normalize(glm::dvec3{ fp.to_telescope * glm::dvec4{ 0,0,1,0 } }));
+    T.pixel_pitch = real(fp.pixel_pitch);
+    const auto& place = tel.placement();
+    for (int r=0; r<3; ++r)
+    for (int c=0; c<3; ++c)
+        T.rotation[3*r+c] = real(place.rotation[c][r]);
+    T.near_clip = real(place.near_clip);
+    const auto& centre = tel.properties().centre;
+    const auto world_los = glm::normalize(place.rotation * centre.line_of_sight);
+    T.line_of_sight = dvec_to_kernel(centre.line_of_sight);
+    T.world_line_of_sight = dvec_to_kernel(world_los);
+    T.near_origin = dvec_to_kernel(place.position + place.near_clip*world_los);
+    T.recp_projected_solid_angle = real(1 / centre.projected_solid_angle);
+
+    // the kernels' precision: directions leaving the telescope are accurate to about its epsilon
+    const auto pixel_angle = fp.pixel_pitch /
+        ((tel.properties().focal_length_x + tel.properties().focal_length_y) / 2);
+    const auto precision = double(std::numeric_limits<real>::epsilon()) / pixel_angle;
+    if (precision>.1)
+        logger::cwarn()
+            << std::format("(gpu) telescope <{}>: the GPU traces its optics in {} precision, whose directions are "
+                           "accurate to about {:.2g} pixels: render on the CPU for a sharper image",
+                           tel.get_id(), sizeof(real)==4 ? "single" : "double", precision)
+            << '\n';
+
+    out.sensor = {};
+    out.sensor.type = k::sensor_telescope;
+    out.telescope.assign(1, T);
+    compile_film(tel.film(), out);
+
+    return sensor_spectral_t{
+        tel.film().response(), tel.film().pixel_layout().components,
+        [p = &tel](wavenumber_t k) { return p->sourcing_geometry(k); },
+        [iors = std::move(iors)](wavenumber_t k, compute_kernel::spectral_sample& s) {
+            for (std::size_t i=0; i<iors.size(); ++i) {
+                const auto n = iors[i]->value(k);
+                s.telescope_iors[i] = { real(n.real()), real(n.imag()) };
+            }
+        },
+    };
+}
+#endif
+
 sensor_spectral_t compile_sensor(const sensor::sensor_t& sensor, const compute_kernel::plt_params& params,
                                  plt_scene_t& out) {
     auto& s = out.sensor;
+
+#if defined(REALISTIC_REMOTE_SENSING)
+    if (const auto* t = dynamic_cast<const remote_sensing::telescope_t<false>*>(&sensor); t)
+        return compile_telescope(*t, params, out);
+    if (const auto* t = dynamic_cast<const remote_sensing::telescope_t<true>*>(&sensor); t)
+        return compile_telescope(*t, params, out);
+#endif
 
     if (const auto* plane = dynamic_cast<const sensor::virtual_plane_sensor_t*>(&sensor); plane) {
         // virtual_plane_sensor_t::Si, sample_direct (forward) and sample (backward)
@@ -990,6 +1153,8 @@ private:
             s.sensor_tan_alpha = real(sourcing.tan_alpha);
             s.sensor_x0 = real(u::to_m(sourcing.initial_spatial_lengths.x));
         }
+        if (sensor_spectral.compile)
+            sensor_spectral.compile(k, s);
         for (std::uint32_t c=0; c<4; ++c)
             s.response.c[c] = c<sensor_spectral.components ? real(sensor_spectral.response->f(c, k)) : real(0);
         // RGB uplift: the white, cyan, magenta, yellow, red, green and blue bases

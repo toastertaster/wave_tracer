@@ -256,10 +256,15 @@ struct emission {
 
 WT_GPU_CONSTANT constexpr u32 sensor_virtual_plane = 0;
 WT_GPU_CONSTANT constexpr u32 sensor_perspective = 1;
+#if defined(REALISTIC_REMOTE_SENSING)
+/** @brief `remote_sensing::telescope_t`: see `telescope_desc` (backward plt_path only). */
+WT_GPU_CONSTANT constexpr u32 sensor_telescope = 2;
+#endif
 
 /**
  * @brief A `sensor::virtual_plane_sensor_t` (`type` sensor_virtual_plane), or
- *        a `sensor::perspective_t` (sensor_perspective; not for forward plt_path).
+ *        a `sensor::perspective_t` (sensor_perspective; not for forward plt_path),
+ *        or a telescope (sensor_telescope, described by `plt_scene::telescope`).
  *        The beams it sources depend on the wavenumber: see `spectral_sample`.
  */
 struct sensor_desc {
@@ -316,6 +321,97 @@ struct film_response {
     real c[4];
 };
 
+#if defined(REALISTIC_REMOTE_SENSING)
+/*
+ * The telescope sensor (`remote_sensing::telescope_t`, of src/remote_sensing/telescope.cpp, and its optics,
+ * `remote_sensing::optics::telescope_optics_t`): its elements, focal plane and placement, as the host computed them
+ * when loading, in the telescope's frame (metres). The coatings' refractive indices depend on the wavenumber: see
+ * `spectral_sample::telescope_iors`. See telescope.hpp.
+ */
+
+WT_GPU_CONSTANT constexpr u32 telescope_max_elements = 32;
+WT_GPU_CONSTANT constexpr u32 telescope_max_aspheric = 8;      // r⁴ to r¹⁸
+WT_GPU_CONSTANT constexpr u32 telescope_max_layers = 16;        // of all coatings
+WT_GPU_CONSTANT constexpr u32 telescope_max_iors = 16;          // of all coatings, substrates and layers
+WT_GPU_CONSTANT constexpr u32 telescope_aim_grid_size = 5;      // `telescope_t::aim_grid_size`
+
+WT_GPU_CONSTANT constexpr u32 telescope_mirror = 0;             // `optics::element_kind_e`
+WT_GPU_CONSTANT constexpr u32 telescope_stop = 1;
+WT_GPU_CONSTANT constexpr u32 telescope_obscuration = 2;
+
+/** @brief An ideal coating's substrate (`telescope_element::substrate`). */
+WT_GPU_CONSTANT constexpr u32 telescope_ideal = 0xffffffffu;
+
+/** @brief `optics::element_t`. */
+struct telescope_element {
+    u32 kind;
+    // its surface (`optics::surface_shape_t`), and clear aperture (`optics::aperture_t`)
+    real curvature, conic;
+    u32 aspheric_count;
+    real aspheric[telescope_max_aspheric];
+    vec2 aperture_centre;
+    real aperture_radius2, hole_radius2;    // squared radii
+    real to_telescope[12];                  // rigid, row-major 3x4: element frame to telescope frame
+    real to_local[12];                      // ... and back
+    /**
+     * @brief A mirror's coating (`optics::coating_t`): ideal (`substrate` telescope_ideal), or a substrate of
+     *        refractive index `spectral_sample::telescope_iors[substrate]` under `telescope_desc::layers`
+     *        `first_layer` to `first_layer+layer_count-1`, the outermost first.
+     */
+    u32 substrate;
+    u32 first_layer, layer_count;
+};
+
+/** @brief A thin film of a coating (`optics::coating_t::layer_t`). */
+struct telescope_layer {
+    u32 ior;                                // `spectral_sample::telescope_iors[ior]`
+    real thickness;                         // metres
+};
+
+/** @brief `optics::cone_t`, by its half-angle (radians). */
+struct telescope_cone {
+    vec3 axis;
+    real half_angle;
+};
+
+/** @brief A `remote_sensing::telescope_t`. */
+struct telescope_desc {
+    telescope_element elements[telescope_max_elements];
+    u32 element_count;
+    /** @brief The elements rays pass in turn (mirrors and stops), in the order light meets them. */
+    u32 sequence[telescope_max_elements];
+    u32 sequence_count;
+    telescope_layer layers[telescope_max_layers];
+
+    /** @brief The sphere bounding the clear aperture nearest the focal plane (`telescope_optics_t::aim`). */
+    vec3 aim_centre;
+    real aim_radius;
+    /** @brief The cones of passing directions, row-major on a grid spanning the film (`telescope_t::aim_grid`). */
+    telescope_cone aim_grid[telescope_aim_grid_size*telescope_aim_grid_size];
+    real aim_margin;                        // `telescope_t::aim_margin`
+    real aim_tight_fraction;                // `telescope_t::aim_tight_fraction`
+
+    // the focal plane (`telescope_t::focal_plane_t`)
+    real fp_to_telescope[12];               // rigid, row-major 3x4
+    vec3 fp_normal;
+    real pixel_pitch;                       // metres
+
+    // its placement (`telescope_t::placement_t`)
+    real rotation[9];                       // row-major: telescope frame to world
+    real near_clip;                         // metres
+    /**
+     * @brief The film centre's line of sight (`telescope_t::properties_t`), in the telescope's frame and in the
+     *        world; and the world point `near_clip` along it from the telescope's origin, which rays that start
+     *        near the scene start about (in the kernels' precision, the telescope's position is too far).
+     */
+    vec3 line_of_sight;
+    vec3 world_line_of_sight;
+    vec3 near_origin;
+    /** @brief One over the film centre's projected solid angle (sr): samples' importance is relative to it. */
+    real recp_projected_solid_angle;
+};
+#endif
+
 /**
  * @brief A wavenumber drawn for paths of an emitter (`scene_t::sample_spectrum`),
  *        and what depends on it, other than emitters and materials.
@@ -334,9 +430,14 @@ struct spectral_sample {
     /**
      * @brief plt_bdpt without MIS: the spectral weight of a contribution
      *        (`1/((s+t+1)*k_density)`, without the 1/(s+t+1)), over the one
+     *        the one
      *        the emissions include (see `emission`).
      */
     real no_mis_scale;
+#if defined(REALISTIC_REMOTE_SENSING)
+    /** @brief A telescope sensor's coatings' refractive indices (n + ik) at the wavenumber (see `telescope_element`). */
+    complex telescope_iors[telescope_max_iors];
+#endif
 };
 
 /**
@@ -396,6 +497,11 @@ struct plt_scene {
 
     // plt_bdpt's free-space diffraction: the sampler's lookup tables (see fraunhofer.hpp), or null
     const WT_GPU_GLOBAL real* fsd_lut;
+
+#if defined(REALISTIC_REMOTE_SENSING)
+    // a telescope sensor (sensor_telescope), or null
+    const WT_GPU_GLOBAL telescope_desc* telescope;
+#endif
 
     sensor_desc sensor;
     film_desc film;

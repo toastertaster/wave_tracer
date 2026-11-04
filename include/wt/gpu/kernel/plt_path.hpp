@@ -13,6 +13,7 @@
 #include "fsd.hpp"
 #include "rng.hpp"
 #include "scene.hpp"
+#include "telescope.hpp"
 #include "texture.hpp"
 
 /*
@@ -23,7 +24,7 @@
  * (free-space diffraction), and reflect and refract at specular and diffuse
  * surfaces. Forward transport sources beams at point emitters and splats
  * where they cross a virtual plane sensor; backward transport sources beams
- * at a virtual plane or perspective sensor and connects diffuse surfaces to
+ * at a virtual plane, perspective or telescope sensor and connects diffuse surfaces to
  * point emitters (next-event estimation). The host refuses other scenes
  * (src/gpu/renderer.cpp).
  *
@@ -1212,6 +1213,12 @@ WT_GPU_FN path_state_t<P> start_path(const WT_GPU_THREAD plt_scene& scene, rng r
         const u32 element = u32(path % (u64(scene.film.width)*scene.film.height));
         p.ex = element % scene.film.width;
         p.ey = element / scene.film.width;
+#if defined(REALISTIC_REMOTE_SENSING)
+        if (scene.sensor.type==sensor_telescope)
+            p.offset = sample_telescope(*scene.telescope, scene.spectra[p.spectral], p.ex, p.ey,
+                                        vec2{ real(scene.film.width), real(scene.film.height) }, rnd, p.b).offset;
+        else
+#endif
         p.offset = sample_sensor(scene.sensor, spec, p.ex, p.ey, rnd, p.b).offset;
         p.prev_geo = { p.b.origin(), geo_point, 0 };
         p.L = {};
@@ -1455,7 +1462,9 @@ WT_GPU_FN bool trace_step(const WT_GPU_THREAD plt_scene& scene,
                           WT_GPU_THREAD traversal_t& tr,
                           WT_GPU_THREAD u32& status) {
     const plt_params opts = scene.params;
-    if (opts.max_depth==0)
+    // nothing to trace: no depth, or a beam that carries nothing (the end `interact` gives such beams; and a
+    // telescope sensor's vignetted samples, which only weigh the film's reconstruction)
+    if (opts.max_depth==0 || p.b.S.s0==real(0))
         return false;
     if (p.iteration==max_path_iterations) {
         status |= status_iteration_limit;

@@ -82,6 +82,9 @@ public:
         params.texels = upload(texels, scene.texels);
         params.texel_luts = upload(texel_luts, scene.texel_luts);
         params.fsd_lut = upload(fsd_lut, scene.fsd_lut);
+#if defined(REALISTIC_REMOTE_SENSING)
+        params.telescope = upload(telescope, scene.telescope);
+#endif
         params.emitter_count = scene.emitter_count;
         params.material_count = scene.material_count;
         params.samples_per_emitter = scene.samples_per_emitter;
@@ -338,6 +341,9 @@ private:
         h.texels = host(texels, params.texels);
         h.texel_luts = host(texel_luts, params.texel_luts);
         h.fsd_lut = host(fsd_lut, params.fsd_lut);
+#if defined(REALISTIC_REMOTE_SENSING)
+        h.telescope = host(telescope, params.telescope);
+#endif
         return h;
     }
 
@@ -493,6 +499,9 @@ private:
         add(tris.get()); add(edges.get()); add(emitters.get()); add(emitter_cdf.get());
         add(area_tris.get()); add(area_cdf.get()); add(tri_uvs.get()); add(material_shadings.get());
         add(textures.get()); add(bitmaps.get()); add(texels.get()); add(texel_luts.get()); add(fsd_lut.get());
+#if defined(REALISTIC_REMOTE_SENSING)
+        add(telescope.get());
+#endif
         add(film.get()); add(film_weights.get()); add(light_film.get());
         add(status_word.get()); add(counters.get());
         add(spectra.get()); add(sample_emissions.get()); add(sample_materials.get()); add(table_paths.get());
@@ -726,6 +735,9 @@ private:
     buffer_t<k::u32>           texels{device};
     buffer_t<k::real>          texel_luts{device};
     buffer_t<k::real>          fsd_lut{device};
+#if defined(REALISTIC_REMOTE_SENSING)
+    buffer_t<k::telescope_desc> telescope{device};
+#endif
 
     // the GPU's float films (see `flush_film`), and the host's double-precision sums of them
     buffer_t<float>            film{device};

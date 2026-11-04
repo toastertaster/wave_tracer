@@ -21,8 +21,15 @@
 #include <wt/gpu/kernel/queries.hpp>
 #include "plt_shared.hpp"
 
+#if defined(REALISTIC_REMOTE_SENSING)
+#define WT_METAL_REMOTE_SENSING_STRUCTS(X) X(compute_kernel::telescope_desc)
+#else
+#define WT_METAL_REMOTE_SENSING_STRUCTS(X)
+#endif
+
 // X(struct) for each shared struct, in wt::gpu
 #define WT_METAL_SHARED_STRUCTS(X) \
+    WT_METAL_REMOTE_SENSING_STRUCTS(X) \
     X(compute_kernel::bvh_node) X(compute_kernel::bvh_tri) \
     X(compute_kernel::ray_query) X(compute_kernel::ray_hit) X(compute_kernel::cone_query) \
     X(compute_kernel::cone_hit) X(compute_kernel::ball) X(compute_kernel::ball_hit) \
