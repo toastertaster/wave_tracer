@@ -62,7 +62,8 @@ The first goal is stage one of the simulation: the radiance that reaches the tel
       Matches Optiland's focal lengths (to 5·10⁻⁵) and vignetting (relative throughput to 10⁻⁵), first-order optics' throughput and obscuration, a ``satellite_frame`` camera's radiometry, and a pinhole camera's projection (centred, off-axis and folded designs).
    b. *Done.* Coatings and polarization: the mirrors' metals (Fresnel reflection of complex refractive indices) and multilayer coatings (characteristic matrices), as Mueller matrices, per wavelength and angle of incidence; polarimetric films about the detector's axes.
       Matches Fresnel's equations and Airy's summation: reflectances to 10⁻⁵, a fold's polarization (Q/I to 0.4%) and a periscope's retardance (V/I to 0.2%).
-   c. ``detector.py`` with the traced telescope: the diffraction PSF without the design's own aberrations, and distortion in the platform's motion.
+   c. *Done.* ``build_scene.py --telescope``, and ``detector.py`` with the traced telescope: the render's aperture, obscuration and throughput; the instrument's wavefront error and transmittance without what the render has.
+      Not yet: distortion in the platform's motion (0.06% at 0.5° for the Ritchey-Chrétien).
    d. The sensor on the GPUs.
    e. Stray light: the same elements traced in any order, baffles, scatter from the mirrors' roughness, the sun out of the field; validated by the point-source transmittance against off-axis angle.
    f. Published three-mirror anastigmats (Korsch's, an off-axis one), against Optiland; curved and tilted focal planes.

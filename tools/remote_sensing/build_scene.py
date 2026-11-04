@@ -18,9 +18,15 @@ Writes into the site directory:
   sky.ply          with an atmosphere: the sky, a hemisphere around the scene
   <name>.xml       the scene: the terrain, the sun, the sky, and a
                    satellite_frame camera recording band radiance (needs a
-                   wave_tracer built with REALISTIC_REMOTE_SENSING)
-  <name>.json      what toa.py and detector.py need: the bands, the camera,
-                   and the atmosphere's own radiance
+                   wave_tracer built with REALISTIC_REMOTE_SENSING); with
+                   --telescope, a telescope camera instead, which traces its
+                   rays through the mirrors of telescope.py's two-mirror
+                   design (Cassegrain or Ritchey-Chretien) of the camera's
+                   focal length, --telescope-aperture, --primary-f-number,
+                   --back-focus and mirrors' --coating
+  <name>.json      what toa.py and detector.py need: the bands, the camera
+                   (and its telescope's aperture, with --telescope), and the
+                   atmosphere's own radiance
 
 The scene's frame is local to the site: x east, y up, z south (north is -z),
 in metres, with the origin on the ground at the site's centre. The camera is
@@ -72,6 +78,7 @@ import numpy as np
 import rasterio
 from PIL import Image
 
+import telescope
 from sun import earth_sun_distance, solar_position
 
 # placeholder multispectral bands (nm), as boxes: those of typical very-high-resolution imagers
@@ -341,6 +348,16 @@ def main():
                         "metre-sized edges is negligible at these wavelengths)")
     p.add_argument("--no-atmosphere", action="store_true", help="ignore SITE_DIR/atmosphere.json")
     p.add_argument("--sky-radius", type=float, default=100e3, help="m (default 100 km)")
+    p.add_argument("--telescope", choices=["cassegrain", "ritchey-chretien"],
+                   help="image through a telescope's mirrors, traced (the telescope sensor, of telescope.py's two-mirror "
+                        "design at the camera's focal length) rather than a pinhole camera (satellite_frame)")
+    p.add_argument("--telescope-aperture", type=float, default=0.4, help="the telescope's diameter, m (default 0.4)")
+    p.add_argument("--primary-f-number", type=float, default=1.5,
+                   help="the telescope's primary's focal length over the aperture (default 1.5)")
+    p.add_argument("--back-focus", type=float,
+                   help="the telescope's focal plane behind its primary, m (default 0.375 times the aperture)")
+    p.add_argument("--coating", choices=list(telescope.COATINGS), default="ideal",
+                   help="the telescope's mirrors' (default ideal)")
     args = p.parse_args()
 
     site = json.loads((args.site_dir / "site.json").read_text())
@@ -381,6 +398,17 @@ def main():
     z, a = math.radians(zen), math.radians(az)
     to_sun = (math.sin(z) * math.sin(a), math.cos(z), -math.sin(z) * math.cos(a))
     focal_length = args.altitude * args.pixel_pitch / args.gsd
+    telescope_design = None
+    if args.telescope:
+        D = args.telescope_aperture
+        field = math.atan(args.pixels * args.pixel_pitch / math.sqrt(2) / focal_length)
+        telescope_design = telescope.coat(telescope.two_mirror(
+            args.telescope, D, focal_length, args.primary_f_number * D,
+            args.back_focus if args.back_focus is not None else 0.375 * D, field_radius=field), args.coating)
+        print(f"telescope: {telescope_design.name}, D {D:g} m, obscuration {telescope_design.obscuration:.3f}, "
+              f"{args.coating} mirrors")
+    # the telescope sensor's optics (telescope.py)
+    telescope_xml = "" if telescope_design is None else "\n" + telescope.elements_xml(telescope_design, indent="\t\t")
 
     band_xml = "\n".join(
         f'''				<spectrum type="piecewise_linear" id="{name}">
@@ -415,6 +443,13 @@ def main():
     sidecar = {"bands_nm": BANDS, "gsd_m": args.gsd, "pixels": args.pixels, "view_zenith_deg": args.view_zenith,
                "view_azimuth_deg": args.view_azimuth, "altitude_m": args.altitude, "focal_length_m": focal_length,
                "pixel_pitch_m": args.pixel_pitch, "time": args.time.isoformat(), "atmosphere": None}
+    if telescope_design is not None:
+        # what detector.py needs of the render's telescope: its aperture, and the film centre's projected solid angle,
+        # π (sin²U - sin²u) of the pupil's outer and inner radii h, sin U = h/f (Abbe's sine condition)
+        D, eps = telescope_design.entrance_pupil_diameter, telescope_design.obscuration
+        sidecar["telescope"] = {
+            "design": telescope_design.name, "coating": args.coating, "aperture_diameter_m": D, "obscuration": eps,
+            "projected_solid_angle_sr": math.pi * (D / 2 / focal_length) ** 2 * (1 - eps**2)}
     if atm is None:
         print("no atmosphere" + ("" if args.no_atmosphere else f" ({atm_path} not found)"))
         sun_irradiance = E0
@@ -477,7 +512,7 @@ def main():
 <!-- Generated by tools/remote_sensing/build_scene.py from {args.site_dir.name}: {site["size_m"]:g} m around
      {site["centre"]["lat"]}, {site["centre"]["lon"]} ({site["dem"]["source"]}, {site["dem"]["project"]}{lidar_note}; NAIP {", ".join(site["naip"]["dates"])}).
      Frame: x east, y up, z south, metres, origin on the ground at the centre ({centre_h:.2f} m NAVD88).
-     Camera: {args.altitude / 1e3:g} km, view zenith {args.view_zenith:g}°, azimuth {args.view_azimuth:g}°, {args.gsd:g} m GSD at nadir.
+     Camera: {args.altitude / 1e3:g} km, view zenith {args.view_zenith:g}°, azimuth {args.view_azimuth:g}°, {args.gsd:g} m GSD at nadir{'' if telescope_design is None else f', through a {telescope_design.name} telescope ({args.coating} mirrors)'}.
      Pixels record band-averaged radiance, W/m²/sr/µm, {radiance_where}.
      Needs wave_tracer built with REALISTIC_REMOTE_SENSING. -->
 <scene version="0.1.0">
@@ -490,13 +525,13 @@ def main():
 		<boolean name="FSD" value="{str(fsd).lower()}"/>
 	</integrator>
 
-	<sensor type="satellite_frame" id="camera">
-		<quantity name="altitude" value="{args.altitude:g}m"/>
-		<quantity name="view_zenith" value="{args.view_zenith:g}°"/>
-		<quantity name="view_azimuth" value="{args.view_azimuth:g}°"/>
-		<quantity name="focal_length" value="{focal_length:g}m"/>
-		<quantity name="pixel_pitch" value="{args.pixel_pitch:g}m"/>
-		<boolean name="ray_trace_only" value="$ray_tracing"/>
+	        <sensor type="{'satellite_frame' if telescope_design is None else 'telescope'}" id="camera">
+		                <quantity name="altitude" value="{args.altitude:g}m"/>
+		                <quantity name="view_zenith" value="{args.view_zenith:g}°"/>
+		                <quantity name="view_azimuth" value="{args.view_azimuth:g}°"/>
+		                <quantity name="focal_length" value="{focal_length:.12g}m"/>
+		                <quantity name="pixel_pitch" value="{args.pixel_pitch:.12g}m"/>
+		                <boolean name="ray_trace_only" value="$ray_tracing"/>{telescope_xml}
 		<integer name="samples" value="$spp"/>
 		<film type="array">
 			<integer name="width" value="{args.pixels}"/>

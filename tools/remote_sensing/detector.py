@@ -57,6 +57,15 @@ an object of numbers:
   camera, platform (optional): as above; without them, a frame camera, and no motion
 The focal length and altitude are the render's (SITE_DIR/scene.json).
 
+A render through the telescope's mirrors (build_scene.py --telescope: the telescope sensor) already has the telescope's
+geometric optics in it (aberrations, distortion, vignetting) and its mirrors' reflectance and polarization: its aperture
+diameter and obscuration are the scene's (the instrument's, if given, are checked against them), and so is Ω (the
+film centre's projected solid angle, which the render's vignetting is relative to); the instrument's
+wavefront_error_nm_rms is to exclude the design's own aberrations (manufacturing and alignment errors only), and its
+transmittance the mirrors' reflectance, unless they are ideal. Distortion moves the footprints at slightly different
+speeds over the field, which the time model's rigid motion over the render ignores (0.06% at 0.5° for the
+Ritchey-Chretien of the tests).
+
     uv run tools/remote_sensing/detector.py SITE_DIR/scene.json RADIANCE.exr INSTRUMENT.json OUT.exr
         [--electrons ELECTRONS.exr] [--seed N]
 
@@ -169,15 +178,31 @@ class Optics:
         if self.k < 1 or abs(self.k * self.render_pitch - self.pitch) > 1e-6 * self.pitch:
             raise SystemExit(f"the detector's pixel pitch, {self.pitch * 1e6:g} µm, is not a multiple of the "
                              f"render's, {self.render_pitch * 1e6:g} µm")
-        self.diameter, self.eps = self.tel["aperture_diameter_m"], self.tel.get("obscuration", 0)
+        self.traced = scene.get("telescope")
+        if self.traced:
+            # the render traced the telescope's mirrors (build_scene.py --telescope): its aperture is the render's
+            self.diameter, self.eps = self.traced["aperture_diameter_m"], self.traced["obscuration"]
+            for name, value in (("aperture_diameter_m", self.diameter), ("obscuration", self.eps)):
+                if name in self.tel and abs(self.tel[name] - value) > 1e-6:
+                    print(f"  warning: the instrument's telescope {name} is {self.tel[name]:g}, the render's telescope's "
+                          f"{value:g}: using the render's")
+            self.omega = self.traced["projected_solid_angle_sr"]
+        else:
+            self.diameter, self.eps = self.tel["aperture_diameter_m"], self.tel.get("obscuration", 0)
+            self.omega = projected_solid_angle(self.diameter, self.focal_length, self.eps)
         self.f_number = self.focal_length / self.diameter
-        self.omega = projected_solid_angle(self.diameter, self.focal_length, self.eps)
         self.fast_jitter = inst.get("jitter_urad_rms", 0) * 1e-6 * self.focal_length / self.render_pitch  # σ, render px
 
     def __str__(self):
+        traced = ""
+        if self.traced:
+            traced = (f" (traced in the render: {self.traced['design']}, {self.traced['coating']} mirrors; the "
+                      "wavefront error is to exclude the design's aberrations"
+                      + ("" if self.traced["coating"] == "ideal" else ", the transmittance its mirrors' reflectance")
+                      + ")")
         return (f"telescope: f {self.focal_length:g} m, D {self.diameter:g} m (f/{self.f_number:.2f}), obscuration "
-                f"{self.eps:g}, Ω {self.omega:.5g} sr; detector pixels {self.pitch * 1e6:g} µm, {self.k}×{self.k} "
-                f"render pixels each; fast jitter σ {self.fast_jitter / self.k:.3f} pixels")
+                f"{self.eps:g}, Ω {self.omega:.5g} sr{traced}; detector pixels {self.pitch * 1e6:g} µm, "
+                f"{self.k}×{self.k} render pixels each; fast jitter σ {self.fast_jitter / self.k:.3f} pixels")
 
     def value(self, section, name, band, default=None):
         """The telescope's or detector's (`section`) value `name` for `band`."""
