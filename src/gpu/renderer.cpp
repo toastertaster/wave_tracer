@@ -155,8 +155,11 @@ void compile_direction_transform(const transform_t& t, real (&out)[9]) {
 }
 
 /**
- * @brief The emitters the sensor samples (in the order of the emitter CDF,
- *        which this compiles), but for what depends on the wavenumber.
+ * @brief The emitters, but for what depends on the wavenumber: first those the
+ *        sensor samples (`out.sampled_emitter_count`, in the order of the
+ *        emitter CDF, which this compiles), then the area emitters it never
+ *        samples, which paths still hit (their sampling probability is zero,
+ *        e.g. rounded to zero in the CDF: stars by the sun).
  *        `shape_emitter[i]` is the emitter of scene shape i, or no_emitter.
  */
 std::vector<const emitter::emitter_t*> compile_emitters(const scene_t& scene, const sensor::sensor_t& sensor,
@@ -165,18 +168,26 @@ std::vector<const emitter::emitter_t*> compile_emitters(const scene_t& scene, co
     shape_emitter.assign(scene.shapes().size(), compute_kernel::no_emitter);
     std::vector<const emitter::emitter_t*> emitters;
     std::vector<double> pdfs;
-    for (const auto& e : scene.emitters()) {
-        // emitters that are never sampled for this sensor do not matter
-        const auto pdf = scene.pdf_emitter(&sensor, e.get());
-        if (!(pdf>0))
-            continue;
 
+    std::vector<const emitter::emitter_t*> ordered, unsampled;
+    for (const auto& e : scene.emitters()) {
+        if (scene.pdf_emitter(&sensor, e.get())>0)
+            ordered.push_back(e.get());
+        else if (dynamic_cast<const emitter::area_t*>(e.get()))
+            unsampled.push_back(e.get());
+        // other emitters that are never sampled for this sensor do not matter: paths cannot hit them
+    }
+    const auto sampled_count = ordered.size();
+    ordered.insert(ordered.end(), unsampled.begin(), unsampled.end());
+
+    for (const auto* e : ordered) {
+        const auto pdf = emitters.size()<sampled_count ? scene.pdf_emitter(&sensor, e) : f_t(0);
         compute_kernel::emitter k{};
         k.pmf = real(pdf);
-        if (const auto* point = dynamic_cast<const emitter::point_t*>(e.get()); point) {
+        if (const auto* point = dynamic_cast<const emitter::point_t*>(e); point) {
             k.type = compute_kernel::emitter_point;
             k.position = to_kernel(point->get_position());
-        } else if (const auto* spot = dynamic_cast<const emitter::spot_t*>(e.get()); spot) {
+        } else if (const auto* spot = dynamic_cast<const emitter::spot_t*>(e); spot) {
             k.type = compute_kernel::emitter_spot;
             k.position = to_kernel(spot->position());
             compile_direction_transform(spot->to_world_transform(), k.dir_to_world);
@@ -188,13 +199,13 @@ std::vector<const emitter::emitter_t*> compile_emitters(const scene_t& scene, co
             k.cutoff = real(cutoff);
             k.recp_cutoff_range = real(f_t(1) / (cutoff-falloff));
             k.cutoff_solid_angle = real(m::two_pi * (1-std::cos(cutoff)));
-        } else if (const auto* directional = dynamic_cast<const emitter::directional_t*>(e.get()); directional) {
+        } else if (const auto* directional = dynamic_cast<const emitter::directional_t*>(e); directional) {
             k.type = compute_kernel::emitter_directional;
             k.target = to_kernel(directional->target_frame());
             k.target_centre = to_kernel(directional->target_centre());
             k.target_radius = real(u::to_m(directional->target_disc_radius()));
             k.far = real(u::to_m(directional->distance_to_outside()));
-        } else if (const auto* area = dynamic_cast<const emitter::area_t*>(e.get()); area) {
+        } else if (const auto* area = dynamic_cast<const emitter::area_t*>(e); area) {
             if (area->radiance_texture())
                 throw gpu_error_t(std::format(
                     "GPU rendering supports only area emitters of a constant radiance so far; "
@@ -232,14 +243,15 @@ std::vector<const emitter::emitter_t*> compile_emitters(const scene_t& scene, co
                 "GPU rendering does not support '{}' emitters yet (emitter <{}>)", type_of(*e), e->get_id()));
         }
         out.emitters.push_back(k);
-        emitters.push_back(e.get());
-        pdfs.push_back(pdf);
+        emitters.push_back(e);
+        if (pdf>0)
+            pdfs.push_back(pdf);
     }
-    if (emitters.empty())
+    if (pdfs.empty())
         throw gpu_error_t(std::format(
             "GPU rendering found no emitter emitting in the spectrum of sensor <{}>", sensor.get_id()));
 
-    // inclusive CDF
+    // inclusive CDF of the sampled emitters
     double total = 0;
     for (const auto p : pdfs) total += p;
     double cdf = 0;
@@ -249,6 +261,7 @@ std::vector<const emitter::emitter_t*> compile_emitters(const scene_t& scene, co
     }
     out.emitter_cdf.back() = 1;
     out.emitter_count = std::uint32_t(emitters.size());
+    out.sampled_emitter_count = std::uint32_t(pdfs.size());
     return emitters;
 }
 
@@ -1097,7 +1110,8 @@ std::uint64_t mix_seed(std::uint64_t z) noexcept {
 
 /**
  * @brief The paths' wavenumbers: for each pass, `samples_per_emitter`
- *        wavenumbers drawn for each emitter, as the CPU draws them
+ *        wavenumbers drawn for each sampled emitter (the first
+ *        `sampled_emitters` of `emitters`), as the CPU draws them
  *        (`scene_t::sample_spectrum`), with what depends on them compiled
  *        (see wt/gpu/kernel/scene.hpp). A path takes one of its emitter's
  *        draws at random, so it has the wavenumber, and weight, of a CPU path.
@@ -1117,15 +1131,17 @@ public:
     spectral_tables_t(const scene_t& scene, const sensor::sensor_t& sensor, const compute_kernel::plt_params& params,
                       sensor_spectral_t sensor_spectral,
                       std::vector<const emitter::emitter_t*> emitters,
+                      std::uint32_t sampled_emitters,
                       std::vector<const bsdf::bsdf_t*> bsdfs,
                       textures_t textures)
         : scene(scene), sensor(sensor), params(params),
           sensor_spectral(std::move(sensor_spectral)),
-          emitters(std::move(emitters)), bsdfs(std::move(bsdfs)), textures(std::move(textures))
+          emitters(std::move(emitters)), sampled_emitters(sampled_emitters),
+          bsdfs(std::move(bsdfs)), textures(std::move(textures))
     {
         const bool single_wavelength = sensor.sensitivity_spectrum().wavenumber_range().length()==zero;
         per_emitter = single_wavelength ? 1 :
-            std::max<std::uint32_t>(1, samples_per_table / std::uint32_t(this->emitters.size()));
+            std::max<std::uint32_t>(1, samples_per_table / sampled_emitters);
         fixed = single_wavelength;
         build(0);
     }
@@ -1145,10 +1161,10 @@ private:
         current.emissions.clear();
         current.materials.clear();
         seeded_sampler_t sampler{ mix_seed(pass) };
-        for (const auto* emitter : emitters)
+        for (std::uint32_t e=0; e<sampled_emitters; ++e)
         for (std::uint32_t j=0; j<per_emitter; ++j) {
             sampler.stratify(j, per_emitter);
-            compile(scene.sample_spectrum(&sensor, emitter, sampler), scene.pdf_emitter(&sensor, emitter));
+            compile(scene.sample_spectrum(&sensor, emitters[e], sampler), scene.pdf_emitter(&sensor, emitters[e]));
         }
         built_for = pass;
     }
@@ -1253,6 +1269,7 @@ private:
     compute_kernel::plt_params params;
     sensor_spectral_t sensor_spectral;
     std::vector<const emitter::emitter_t*> emitters;
+    std::uint32_t sampled_emitters;
     std::vector<const bsdf::bsdf_t*> bsdfs;
     textures_t textures;
 
@@ -1296,7 +1313,8 @@ void renderer_t::create(const scene_t& scene, const sensor::sensor_t& sensor, co
     auto bsdfs = compile_geometry(scene, *bvh, shape_emitter, textures, compiled);
     // the first pass's table: compiles the BSDFs, refusing those the GPU does not support
     spectra = std::make_unique<spectral_tables_t>(scene, sensor, params, std::move(sensor_spectral),
-                                                  std::move(emitters), std::move(bsdfs), std::move(textures));
+                                                  std::move(emitters), compiled.sampled_emitter_count,
+                                                  std::move(bsdfs), std::move(textures));
     compiled.samples_per_emitter = spectra->samples_per_emitter();
 
     paths_per_spe = std::uint64_t(compiled.film.width) * compiled.film.height;

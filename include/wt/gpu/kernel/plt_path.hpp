@@ -1158,7 +1158,7 @@ WT_GPU_FN real mis_power(real pd1, real pd2) {
 /** @brief `scene_t::sample_emitter` for a uniform random number `u`: an index into the emitter CDF. */
 WT_GPU_FN u32 sample_emitter(const WT_GPU_THREAD plt_scene& scene, real u) {
     u32 ei = 0;
-    while (ei+1<scene.emitter_count && !(u<scene.emitter_cdf[ei]))
+    while (ei+1<scene.sampled_emitter_count && !(u<scene.emitter_cdf[ei]))
         ++ei;
     return ei;
 }

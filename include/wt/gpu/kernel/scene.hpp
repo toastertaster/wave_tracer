@@ -509,9 +509,12 @@ struct plt_params {
  * @brief Everything a plt_path or plt_bdpt kernel reads.
  *
  * Spectral samples come in tables: a table holds `samples_per_emitter`
- * samples of each emitter, emitter `e`'s from `base + e*samples_per_emitter`
- * (`base` the table's first). A path samples an emitter, then takes one of
- * the emitter's samples (see `start_path`).
+ * samples of each sampled emitter, emitter `e`'s from
+ * `base + e*samples_per_emitter` (`base` the table's first). A path samples
+ * an emitter, then takes one of the emitter's samples (see `start_path`).
+ * The first `sampled_emitter_count` emitters are sampled, by `emitter_cdf`;
+ * the rest are area emitters of no sampling probability (e.g. rounded to
+ * zero beside far brighter ones: stars by the sun), which paths only hit.
  */
 struct plt_scene {
     bvh_view bvh;
@@ -522,11 +525,12 @@ struct plt_scene {
     const WT_GPU_GLOBAL emission* emissions;        // emitter e at spectral sample s: [s*emitter_count + e]
     const WT_GPU_GLOBAL material* materials;        // material m at spectral sample s: [s*material_count + m]
     u32 emitter_count;
+    u32 sampled_emitter_count;
     u32 material_count;
     u32 samples_per_emitter;
 
     const WT_GPU_GLOBAL emitter* emitters;
-    const WT_GPU_GLOBAL real* emitter_cdf;          // inclusive CDF of the emitter sampling distribution
+    const WT_GPU_GLOBAL real* emitter_cdf;          // inclusive CDF of the emitter sampling distribution (sampled emitters')
     // area emitters' triangles (BVH triangles), and each emitter's inclusive CDF of them by area
     const WT_GPU_GLOBAL u32* area_tris;
     const WT_GPU_GLOBAL real* area_cdf;

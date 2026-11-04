@@ -59,7 +59,7 @@ public:
     metal_plt_renderer_t(std::shared_ptr<context_t> context_, bvh_buffers_t bvh, const plt_scene_t& scene)
         : context(std::move(context_)), device(context->device), bvh(bvh),
           polarimetric(scene.film.polarimetric!=0),
-          table_size(scene.emitter_count*scene.samples_per_emitter)
+          table_size(scene.sampled_emitter_count*scene.samples_per_emitter)
     {
         if (whole_paths(scene.params)) {
             const unsigned cores = context->gpu_cores();
@@ -86,6 +86,7 @@ public:
         params.telescope = upload(telescope, scene.telescope);
 #endif
         params.emitter_count = scene.emitter_count;
+        params.sampled_emitter_count = scene.sampled_emitter_count;
         params.material_count = scene.material_count;
         params.samples_per_emitter = scene.samples_per_emitter;
         params.sensor = scene.sensor;

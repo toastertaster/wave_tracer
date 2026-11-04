@@ -64,8 +64,9 @@ struct plt_scene_t {
     std::vector<compute_kernel::telescope_desc> telescope;     // a telescope sensor's, or empty
 #endif
     std::uint32_t emitter_count;
+    std::uint32_t sampled_emitter_count;       // the first emitters, which the CDF samples; the rest are only hit
     std::uint32_t material_count;
-    std::uint32_t samples_per_emitter;         // in each spectral table
+    std::uint32_t samples_per_emitter;         // of each sampled emitter, in each spectral table
     compute_kernel::sensor_desc sensor;
     compute_kernel::film_desc film;
     compute_kernel::plt_params params;
@@ -75,7 +76,7 @@ struct plt_scene_t {
  * @brief Spectral samples (see `compute_kernel::plt_scene`): `samples[s]`, with
  *        emitter e at `emissions[s*emitter_count + e]` and material m at
  *        `materials[s*material_count + m]`. A table for `trace` holds
- *        `samples_per_emitter` samples of each emitter, emitter by emitter.
+ *        `samples_per_emitter` samples of each sampled emitter, emitter by emitter.
  */
 struct spectral_table_t {
     std::vector<compute_kernel::spectral_sample> samples;

@@ -586,7 +586,7 @@ public:
 #if defined(WT_GPU_USE_OPTIX)
           optix_rays(optix_rays),
 #endif
-          table_size(scene.emitter_count*scene.samples_per_emitter)
+          table_size(scene.sampled_emitter_count*scene.samples_per_emitter)
     {
         set_device(ordinal);
         if (scene.params.bdpt!=0 || scene.params.ray_tracing_only!=0) {
@@ -668,6 +668,7 @@ public:
         params.telescope = telescope.get();
 #endif
         params.emitter_count = scene.emitter_count;
+        params.sampled_emitter_count = scene.sampled_emitter_count;
         params.material_count = scene.material_count;
         params.samples_per_emitter = scene.samples_per_emitter;
         params.sensor = scene.sensor;
