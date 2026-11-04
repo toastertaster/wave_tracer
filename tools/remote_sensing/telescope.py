@@ -25,8 +25,22 @@ written by hand:
                centre off the axis, at that field angle (towards north). --fold adds a flat mirror at 45° in the
                converging beam, that far before the focal plane, folding it towards north (+y): with three mirrors,
                the image is mirrored (east to the film's left).
+  three-mirror an unobscured three-mirror anastigmat (as Cook's): an off-axis segment of a coaxial parent of a concave
+               primary, a convex secondary and a concave tertiary behind the primary, with an intermediate image
+               between the secondary and the tertiary. The parent's radii are solved for the focal length f and a
+               flat field (zero Petzval sum, 1/R1 - 1/R2 + 1/R3 = 0) from the primary's focal length f1 and the
+               mirrors' separations (--separations d1,d2: primary to secondary, secondary to tertiary); its conic
+               constants, and the focal plane's distance, by tracing rays through the segment (diameter D, centred
+               --off-axis Y from the axis) over the field (--field-bias off the axis, towards north) and making
+               their images as small as they go (Levenberg-Marquardt: a third-order anastigmat, to the rays'
+               precision). The secondary's and tertiary's apertures cover the traced beams' footprints.
   hubble       the Hubble Space Telescope's Ritchey-Chrétien (Laikin, Lens Design, 4th ed., p. 200, as in
                Optiland's sample), with a flat focal plane at its image surface's vertex.
+
+--curved-focal-plane replaces the flat focal plane of a design of coaxial mirrors (unfolded) by the sphere, centred on
+the axis, on which the film's field images the smallest (its vertex and radius by Levenberg-Marquardt, on rays traced
+through the aperture): the film is tangent to it at the field that images at the flat focal plane's centre, tilted to
+it off the axis (the sensor's focal_plane_radius).
 
 The telescope's frame follows optical design software's convention: light arrives travelling towards +z, the primary
 at the origin. The film's x is east and its y south at nadir (as a satellite_frame camera's) for designs with an even
@@ -46,8 +60,8 @@ black).
     uv run tools/remote_sensing/telescope.py two-mirror --kind ritchey-chretien [--diameter 0.4 --focal-length 2.5 ...] > sensor.xml
 
 prints the sensor (with --altitude, --view-zenith, ... placing it, as strings, so that scene defines like $vz work).
-As a module, `two_mirror()` and `hubble()` return designs, `coat()`, `roughen()` and `baffle()` modify them, and
-`sensor_xml()` writes them.
+As a module, `two_mirror()`, `three_mirror()` and `hubble()` return designs, `coat()`, `roughen()`, `baffle()` and
+`curve_focal_plane()` modify them, and `sensor_xml()` writes them.
 """
 
 import argparse
@@ -86,6 +100,12 @@ class Design:
     focal_length: float
     entrance_pupil_diameter: float
     obscuration: float
+    # the image's scale about the film's centre (m/rad), as the sensor finds its focal lengths, if it is not the
+    # focal length (a biased field's)
+    film_centre_scale: float | None = None
+    # a curved focal plane's radius of curvature (m; its centre on the focal plane frame's +z side if positive), or
+    # None for a flat one
+    focal_plane_radius: float | None = None
 
 
 def translation(x=0.0, y=0.0, z=0.0):
@@ -160,6 +180,282 @@ def two_mirror(kind="ritchey-chretien", diameter=0.4, focal_length=2.5, primary_
         focal_plane = folded
     obscuration = 0.0 if off_axis else max(r2, hole) / (D / 2)
     return Design(f"{kind} f/{f / D:.3g}", elements, focal_plane, f, D, obscuration)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# three-mirror anastigmats: exact ray tracing of coaxial conic mirrors (numpy)
+
+def _paraxial(curvatures, zs):
+    """A marginal ray (height 1, parallel to the axis) through coaxial mirrors: its heights on them, and the
+    system's focal length and paraxial image's z."""
+    y, u, heights = 1.0, 0.0, []
+    for j, c in enumerate(curvatures):
+        if j:
+            y += (zs[j] - zs[j - 1]) * u
+        heights.append(y)
+        u = -u - 2 * y * c
+    return heights, -1.0 / u, zs[-1] - y / u
+
+
+def _intersect(c, k, zv, o, d):
+    """The rays (o, d) (N×3) with the conic of curvature c and conic constant k, vertex at z = zv: the nearest root
+    beyond 0 on the branch through the vertex ((1+k) c z <= 1), NaN if none (as the telescope sensor)."""
+    o = o - np.array([0.0, 0.0, zv])
+    k1 = 1 + k
+    A = c * (d[:, 0] ** 2 + d[:, 1] ** 2 + k1 * d[:, 2] ** 2)
+    B = c * (o[:, 0] * d[:, 0] + o[:, 1] * d[:, 1] + k1 * o[:, 2] * d[:, 2]) - d[:, 2]
+    C = c * (o[:, 0] ** 2 + o[:, 1] ** 2 + k1 * o[:, 2] ** 2) - 2 * o[:, 2]
+    D = B * B - A * C
+    with np.errstate(divide="ignore", invalid="ignore"):
+        q = -(B + np.copysign(np.sqrt(np.maximum(D, 0)), B))
+        r1 = np.where(A != 0, q / A, -C / (2 * B))
+        r2 = np.where(q != 0, C / q, r1)
+    t = np.full(len(o), np.nan)
+    for roots in (np.minimum(r1, r2), np.maximum(r1, r2)):
+        ok = np.isnan(t) & (D >= 0) & (roots > 1e-9) & (k1 * c * (o[:, 2] + roots * d[:, 2]) <= 1 + 1e-12)
+        t = np.where(ok, roots, t)
+    return t
+
+
+def _trace(curvatures, conics, zs, field, pupil, z_image=None, c_image=0.0):
+    """Rays from the field direction `field` = (θx, θy) (radians; light travelling +z) through the points `pupil`
+    (M×2) of the plane z = 0, reflected by the mirrors in turn: their points on each mirror, and on the image surface
+    (if `z_image` is given): the plane z = z_image, or the sphere of curvature `c_image` whose vertex is there."""
+    d = np.array([math.tan(field[0]), math.tan(field[1]), 1.0])
+    d /= np.linalg.norm(d)
+    o = np.zeros((len(pupil), 3))
+    o[:, :2] = pupil
+    o -= 10 * d
+    dd = np.tile(d, (len(pupil), 1))
+    points = []
+    for c, k, z in zip(curvatures, conics, zs):
+        t = _intersect(c, k, z, o, dd)
+        p = o + t[:, None] * dd
+        r2 = p[:, 0] ** 2 + p[:, 1] ** 2
+        g = c / np.sqrt(1 - (1 + k) * c * c * r2)
+        n = np.stack([-p[:, 0] * g, -p[:, 1] * g, np.ones(len(p))], axis=1)
+        n /= np.linalg.norm(n, axis=1, keepdims=True)
+        dd = dd - 2 * np.sum(dd * n, axis=1, keepdims=True) * n
+        o = p
+        points.append(p)
+    if z_image is not None:
+        t = _intersect(c_image, 0.0, z_image, o, dd) if c_image else (z_image - o[:, 2]) / dd[:, 2]
+        points.append(o + t[:, None] * dd)
+    return points
+
+
+def _disc(centre_y, radius, n=11):
+    g = np.linspace(-1, 1, n)
+    x, y = np.meshgrid(g, g)
+    inside = x * x + y * y <= 1
+    return np.stack([radius * x[inside], centre_y + radius * y[inside]], axis=1)
+
+
+def three_mirror(diameter=0.2, focal_length=2.5, primary_focal_length=0.6, separations=(0.45, 1.15), off_axis=0.2,
+                 field_bias=math.radians(1.0), field_radius=math.radians(0.2), margin=1e-3):
+    """An unobscured three-mirror anastigmat (see the module's doc). Angles in radians, lengths in metres; the
+    conic constants are made anastigmatic over `field_radius` about `field_bias` (no less than 0.2°, so that they
+    are well determined), the secondary's and tertiary's apertures cover the beams of `field_radius`."""
+    f, f1, (d1, d2), D, Y = focal_length, primary_focal_length, separations, diameter, off_axis
+    c1 = -1 / (2 * f1)
+    zs = [0.0, -d1, -d1 + d2]
+
+    # the secondary's curvature (and the tertiary's, for a flat field: c1 - c2 + c3 = 0) for the focal length: the
+    # root whose marginal ray crosses the axis between the secondary and the tertiary (an intermediate image), and
+    # whose image is between them
+    def residual(c2):
+        heights, efl, z_image = _paraxial([c1, c2, c2 - c1], zs)
+        return abs(efl) - f
+    grid = np.linspace(-1 / (0.02 * f1), c1, 20001)[:-1]
+    values = np.array([residual(c) for c in grid])
+    c2 = None
+    for i in np.nonzero(np.sign(values[:-1]) != np.sign(values[1:]))[0]:
+        a, b = grid[i], grid[i + 1]
+        for _ in range(80):
+            m = (a + b) / 2
+            if np.sign(residual(m)) == np.sign(residual(a)):
+                a = m
+            else:
+                b = m
+        heights, efl, z_image = _paraxial([c1, a, a - c1], zs)
+        if heights[2] < 0 and zs[1] < z_image < zs[2]:
+            c2 = a
+            break
+    if c2 is None:
+        raise ValueError("no three-mirror anastigmat of this focal length with an intermediate image between the "
+                         "secondary and the tertiary: change the separations")
+    curvatures = [c1, c2, c2 - c1]
+    heights, efl, z_image = _paraxial(curvatures, zs)
+
+    # conic constants and focus: the smallest images, over the segment and field (Levenberg-Marquardt)
+    pupil = _disc(Y, D / 2)
+    df = max(field_radius, math.radians(0.2))
+    fields = [(0, field_bias), (df, field_bias), (-df, field_bias), (0, field_bias + df), (0, field_bias - df)]
+
+    def residuals(x):
+        out = []
+        for field in fields:
+            p = _trace(curvatures, x[:3], zs, field, pupil, z_image=x[3])[-1][:, :2]
+            out.append((p - p.mean(axis=0)).ravel())
+        return np.concatenate(out)
+
+    x = np.array([-1.0, -2.0, -0.5, z_image])
+    r = residuals(x)
+    lam = 1e-3
+    for _ in range(100):
+        J = np.empty((len(r), len(x)))
+        for j in range(len(x)):
+            h = 1e-6 * max(1.0, abs(x[j]))
+            xp = x.copy()
+            xp[j] += h
+            J[:, j] = (residuals(xp) - r) / h
+        improved = False
+        while lam < 1e12:
+            H = J.T @ J
+            step = np.linalg.solve(H + lam * np.diag(np.diag(H)), -J.T @ r)
+            rn = residuals(x + step)
+            if np.all(np.isfinite(rn)) and rn @ rn < r @ r:
+                x, r, lam, improved = x + step, rn, lam * 0.3, True
+                break
+            lam *= 10
+        if not improved or np.max(np.abs(step)) < 1e-12:
+            break
+    conics, z_image = list(x[:3]), float(x[3])
+
+    # the secondary's and tertiary's apertures: the footprints of the field's beams (its corners included)
+    footprint = [[], [], []]
+    image_centre = None
+    for fx in np.linspace(-field_radius, field_radius, 5):
+        for fy in np.linspace(field_bias - field_radius, field_bias + field_radius, 5):
+            points = _trace(curvatures, conics, zs, (fx, fy), _disc(Y, D / 2, 21), z_image=z_image)
+            for j in range(3):
+                footprint[j].append(points[j][:, :2])
+            if fx == 0 and abs(fy - field_bias) < 1e-15:
+                image_centre = points[3][:, :2].mean(axis=0)
+    apertures = []
+    for j in (1, 2):
+        p = np.concatenate(footprint[j])
+        centre = np.array([0.0, (p[:, 1].min() + p[:, 1].max()) / 2])
+        apertures.append((float(np.max(np.linalg.norm(p - centre, axis=1))) + margin, (0.0, float(centre[1]))))
+
+    elements = [
+        Element("mirror", "primary", D / 2, translation(), radius=1 / c1, conic=conics[0], aperture_centre=(0.0, Y)),
+        Element("mirror", "secondary", apertures[0][0], translation(z=zs[1]), radius=1 / c2, conic=conics[1],
+                aperture_centre=apertures[0][1]),
+        Element("mirror", "tertiary", apertures[1][0], translation(z=zs[2]), radius=1 / curvatures[2],
+                conic=conics[2], aperture_centre=apertures[1][1]),
+    ]
+    # the focal plane faces the tertiary (light arrives travelling -z), centred on the biased field's image; with
+    # three mirrors, the image is mirrored
+    focal_plane = frame((image_centre[0], image_centre[1], z_image), (1, 0, 0), (0, 1, 0), (0, 0, 1))
+
+    # the image's scale about the biased field: its centroid's motion per angle, along x and y (the sensor checks its
+    # `focal_length` against their mean)
+    def centroid(fx, fy):
+        return _trace(curvatures, conics, zs, (fx, fy), pupil, z_image=z_image)[-1][:, :2].mean(axis=0)
+
+    def direction(fx, fy):
+        v = np.array([math.tan(fx), math.tan(fy), 1.0])
+        return v / np.linalg.norm(v)
+    delta = 1e-5
+    scale_x = (np.linalg.norm(centroid(delta, field_bias) - centroid(-delta, field_bias)) /
+               np.linalg.norm(direction(delta, field_bias) - direction(-delta, field_bias)))
+    scale_y = (np.linalg.norm(centroid(0, field_bias + delta) - centroid(0, field_bias - delta)) /
+               np.linalg.norm(direction(0, field_bias + delta) - direction(0, field_bias - delta)))
+    return Design(f"three-mirror anastigmat f/{f / D:.3g}", elements, focal_plane, f, D, 0.0,
+                  film_centre_scale=float((scale_x + scale_y) / 2))
+
+
+def curve_focal_plane(design, field_radius):
+    """The design (of coaxial mirrors) with a curved focal plane: the sphere, centred on the axis, on which the
+    images of the field (`field_radius` radians about the field that images at the flat focal plane's centre) are the
+    smallest (its vertex and curvature by Levenberg-Marquardt), the film tangent to it at that field's image."""
+    mirrors = design.elements
+    for e in mirrors:
+        if e.kind != "mirror" or not np.allclose(e.to_telescope[:3, :3], np.eye(3)) or any(e.to_telescope[:2, 3]):
+            raise ValueError("a curved focal plane is fitted to designs of coaxial mirrors only (no fold, baffles)")
+    curvatures = [1 / e.radius if e.radius else 0.0 for e in mirrors]
+    conics = [e.conic for e in mirrors]
+    zs = [float(e.to_telescope[2, 3]) for e in mirrors]
+    primary = mirrors[0]
+    pupil = _disc(primary.aperture_centre[1], primary.aperture_radius, 21)
+    # (not the central obscuration's)
+    pupil = pupil[np.hypot(pupil[:, 0], pupil[:, 1]) >= design.obscuration * primary.aperture_radius]
+
+    # the field (along y: `_trace`'s direction of travel) that images at the flat focal plane's centre (Newton)
+    def centre_y(fy):
+        return _trace(curvatures, conics, zs, (0.0, fy), pupil, z_image=design.focal_plane[2, 3])[-1][:, 1].mean()
+    field_bias = 0.0
+    for _ in range(8):
+        h = 1e-6
+        slope = (centre_y(field_bias + h) - centre_y(field_bias - h)) / (2 * h)
+        field_bias -= (centre_y(field_bias) - design.focal_plane[1, 3]) / slope
+    fields = [(fx, fy) for fx in np.linspace(-field_radius, field_radius, 5)
+              for fy in np.linspace(field_bias - field_radius, field_bias + field_radius, 5)]
+    # the focal plane's frame's z faces the optics: telescope z along it is `side` times local z
+    side = float(np.sign(design.focal_plane[2, 2]))
+
+    def images(x, field, rays=pupil):
+        return _trace(curvatures, conics, zs, field, rays, z_image=x[0], c_image=x[1])[-1]
+
+    def residuals(x):
+        out = []
+        for field in fields:
+            p = images(x, field)[:, :2]
+            out.append((p - p.mean(axis=0)).ravel())
+        return np.concatenate(out)
+
+    # (vertex z, curvature), from the flat focal plane's
+    x = np.array([float(design.focal_plane[2, 3]), 0.0])
+    r = residuals(x)
+    lam = 1e-3
+    for _ in range(100):
+        J = np.empty((len(r), len(x)))
+        for j, h in enumerate((1e-7, 1e-6)):
+            xp = x.copy()
+            xp[j] += h
+            J[:, j] = (residuals(xp) - r) / h
+        improved = False
+        while lam < 1e12:
+            H = J.T @ J
+            step = np.linalg.solve(H + lam * np.diag(np.diag(H)), -J.T @ r)
+            rn = residuals(x + step)
+            if np.all(np.isfinite(rn)) and rn @ rn < r @ r:
+                x, r, lam, improved = x + step, rn, lam * 0.3, True
+                break
+            lam *= 10
+        if not improved or np.max(np.abs(step)) < 1e-14:
+            break
+    z_vertex, c = float(x[0]), float(x[1])
+
+    # the film's centre: the biased field's image, on the sphere; its normal there (facing the optics, as the flat
+    # focal plane's z); its x as the flat focal plane's
+    p = images(x, (0.0, field_bias)).mean(axis=0)
+    # (back on the sphere: the centroid of points on it is not)
+    r2 = p[0] ** 2 + p[1] ** 2
+    p[2] = z_vertex + (c * r2 / (1 + math.sqrt(1 - c * c * r2)) if c else 0.0)
+    n = np.array([-p[0] * c, -p[1] * c, 1 - c * (p[2] - z_vertex)])
+    z_axis = side * n / np.linalg.norm(n)
+    x_axis = design.focal_plane[:3, 0] - np.dot(design.focal_plane[:3, 0], z_axis) * z_axis
+    x_axis /= np.linalg.norm(x_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    focal_plane = frame(p, x_axis, y_axis, z_axis)
+
+    # the image's scale about the biased field, on the sphere (as `three_mirror`)
+    def centroid(fx, fy):
+        return images(x, (fx, fy)).mean(axis=0)
+
+    def direction(fx, fy):
+        v = np.array([math.tan(fx), math.tan(fy), 1.0])
+        return v / np.linalg.norm(v)
+    delta = 1e-5
+    scale_x = (np.linalg.norm(centroid(delta, field_bias) - centroid(-delta, field_bias)) /
+               np.linalg.norm(direction(delta, field_bias) - direction(-delta, field_bias)))
+    scale_y = (np.linalg.norm(centroid(0, field_bias + delta) - centroid(0, field_bias - delta)) /
+               np.linalg.norm(direction(0, field_bias + delta) - direction(0, field_bias - delta)))
+    return dataclasses.replace(design, focal_plane=focal_plane, film_centre_scale=float((scale_x + scale_y) / 2),
+                               focal_plane_radius=side / c if c else None,
+                               name=design.name + ", curved focal plane")
 
 
 def hubble():
@@ -271,6 +567,8 @@ def elements_xml(design, indent="    "):
                        f'<float name="g" value="{g:.9g}"/></scatter>')
         out.append(f"{indent}</{e.kind}>")
     out.append(_transform("focal_plane", design.focal_plane, indent))
+    if design.focal_plane_radius:
+        out.append(f'{indent}<quantity name="focal_plane_radius" value="{_length(design.focal_plane_radius)}"/>')
     return "\n".join(out)
 
 
@@ -283,7 +581,7 @@ def sensor_xml(design, pixel_pitch, pixels, placement, samples="$spp", band_nm=(
              f"obscuration {design.obscuration:.3g} -->"]
     lines += [f'    <quantity name="{k}" value="{v}"/>' for k, v in placement.items()]
     lines += [f'    <quantity name="pixel_pitch" value="{_length(pixel_pitch)}"/>',
-              f'    <quantity name="focal_length" value="{_length(design.focal_length)}"/>',
+              f'    <quantity name="focal_length" value="{_length(design.film_centre_scale or design.focal_length)}"/>',
               f'    <integer name="samples" value="{samples}"/>']
     if extra:
         lines.append(extra)
@@ -304,7 +602,7 @@ def sensor_xml(design, pixel_pitch, pixels, placement, samples="$spp", band_nm=(
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("design", choices=["two-mirror", "hubble"])
+    p.add_argument("design", choices=["two-mirror", "three-mirror", "hubble"])
     p.add_argument("--kind", choices=["cassegrain", "ritchey-chretien"], default="ritchey-chretien")
     p.add_argument("--diameter", type=float, default=0.4, help="m (default 0.4)")
     p.add_argument("--focal-length", type=float, default=2.5, help="m (default 2.5)")
@@ -313,7 +611,11 @@ def main():
     p.add_argument("--off-axis", type=float, default=0.0, help="m: an off-axis segment, its centre this far off the axis")
     p.add_argument("--field-bias", type=float, default=0.0, help="degrees: the film's centre at this field angle")
     p.add_argument("--fold", type=float, help="m: a fold mirror this far before the focal plane")
+    p.add_argument("--separations", default="0.45,1.15",
+                   help="three-mirror: m, primary to secondary and secondary to tertiary (default 0.45,1.15)")
     p.add_argument("--secondary-radius", type=float, help="m: the secondary's aperture radius (default: the field's)")
+    p.add_argument("--curved-focal-plane", action="store_true",
+                   help="the sphere on which the film's field images best (coaxial mirrors only)")
     p.add_argument("--coating", choices=list(COATINGS), default="ideal", help="every mirror's (default ideal)")
     p.add_argument("--scatter", help="A,B,g: every mirror's ABg scatter (default: smooth)")
     p.add_argument("--baffles", action="store_true", help="a secondary baffle tube and a vane (on-axis two-mirror)")
@@ -331,12 +633,20 @@ def main():
 
     if args.design == "hubble":
         design = hubble()
+    elif args.design == "three-mirror":
+        field = math.atan(args.pixels * args.pixel_pitch / math.sqrt(2) / args.focal_length)
+        design = three_mirror(args.diameter, args.focal_length, args.primary_focal_length,
+                              tuple(float(v) for v in args.separations.split(",")),
+                              off_axis=args.off_axis or 0.2, field_bias=math.radians(args.field_bias or 1.0),
+                              field_radius=field)
     else:
         # the secondary and the hole pass the film's corners
         field = math.atan(args.pixels * args.pixel_pitch / math.sqrt(2) / args.focal_length)
         design = two_mirror(args.kind, args.diameter, args.focal_length, args.primary_focal_length, args.back_focus,
                             field_radius=field, off_axis=args.off_axis, field_bias=math.radians(args.field_bias),
                             fold=args.fold, secondary_radius=args.secondary_radius)
+    if args.curved_focal_plane:
+        design = curve_focal_plane(design, math.atan(args.pixels * args.pixel_pitch / math.sqrt(2) / design.focal_length))
     design = coat(design, args.coating)
     if args.scatter:
         design = roughen(design, [float(v) for v in args.scatter.split(",")])
@@ -346,7 +656,7 @@ def main():
         print(f"<!-- {design.name}: f = {design.focal_length:.6g} m, D = {design.entrance_pupil_diameter:.6g} m, "
               f"obscuration {design.obscuration:.3g}; for a {args.pixels}² film -->")
         print(f'<quantity name="pixel_pitch" value="{_length(args.pixel_pitch)}"/>')
-        print(f'<quantity name="focal_length" value="{_length(design.focal_length)}"/>')
+        print(f'<quantity name="focal_length" value="{_length(design.film_centre_scale or design.focal_length)}"/>')
         print(elements_xml(design, indent=""))
         return
     placement = {"altitude": args.altitude, "view_zenith": args.view_zenith, "view_azimuth": args.view_azimuth}

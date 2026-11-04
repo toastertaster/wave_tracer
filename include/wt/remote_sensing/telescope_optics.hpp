@@ -157,11 +157,12 @@ struct element_t {
 
 /**
  * @brief The focal-plane array, as an absorbing rectangle (non-sequential tracing): |x|, |y| within `half_extent`
- *        on the plane z = 0 of its frame.
+ *        on the plane z = 0 of its frame, or on the sphere of `curvature` tangent to it there (`surface_shape_t`).
  */
 struct detector_t {
     glm::dmat4 to_telescope = glm::dmat4(1), to_local = glm::dmat4(1);
     glm::dvec2 half_extent = { 0,0 };
+    double curvature = 0;
 };
 
 /**

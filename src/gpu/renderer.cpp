@@ -965,7 +965,7 @@ sensor_spectral_t compile_telescope(const remote_sensing::telescope_t<polarimetr
     // the focal plane, and the telescope's placement
     const auto& fp = tel.focal_plane();
     compile_rigid(fp.to_telescope, T.fp_to_telescope);
-    T.fp_normal = dvec_to_kernel(glm::normalize(glm::dvec3{ fp.to_telescope * glm::dvec4{ 0,0,1,0 } }));
+    T.fp_curvature = real(fp.curvature);
     T.pixel_pitch = real(fp.pixel_pitch);
     const auto& place = tel.placement();
     for (int r=0; r<3; ++r)

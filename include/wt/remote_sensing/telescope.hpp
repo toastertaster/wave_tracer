@@ -75,12 +75,27 @@ public:
     using film_t = sensor::film_backed_sensor_t<2,polarimetric>::film_t;
 
     /**
-     * @brief The focal-plane array: pixel (i,j) spans [i,i+1)×[j,j+1) pixel pitches about the film's centre, on
-     *        the plane z=0 of the focal plane's frame, at local x and y.
+     * @brief The focal-plane array: pixel (i,j) spans [i,i+1)×[j,j+1) pixel pitches about the film's centre, at
+     *        local x and y of the focal plane's frame, on its plane z=0; or, curved, on the sphere of curvature
+     *        `curvature` tangent to that plane at the film's centre (its centre of curvature at local +z if the
+     *        curvature is positive), each pixel at the sag of its x and y.
      */
     struct focal_plane_t {
         glm::dmat4 to_telescope;
         double pixel_pitch;
+        double curvature = 0;
+
+        /** @brief The point of the focal surface at local x and y (telescope frame). */
+        [[nodiscard]] inline glm::dvec3 point(const glm::dvec2& local) const noexcept {
+            const auto r2 = glm::dot(local, local);
+            const auto z = curvature*r2 / (1 + std::sqrt(std::max(0., 1 - curvature*curvature*r2)));
+            return glm::dvec3{ to_telescope * glm::dvec4{ local, z, 1 } };
+        }
+        /** @brief The focal surface's unit normal at local x and y (telescope frame), facing local +z. */
+        [[nodiscard]] inline glm::dvec3 normal(const glm::dvec2& local) const noexcept {
+            const auto g = curvature / std::sqrt(std::max(1e-300, 1 - curvature*curvature*glm::dot(local, local)));
+            return glm::normalize(glm::dvec3{ to_telescope * glm::dvec4{ -local.x*g, -local.y*g, 1, 0 } });
+        }
     };
     /**
      * @brief Telescope frame to world: rotation, and the telescope's origin (metres), and where rays start.
@@ -100,6 +115,8 @@ public:
         optics::field_point_t centre;
         /** @brief Throughput of the film's corners, relative to its centre's. */
         double corner_relative_throughput;
+        /** @brief The largest of the film's corners' geometric blur (`optics::field_point_t::rms_spread`). */
+        double corner_rms_spread;
         /**
          * @brief The point-source transmittance (PST) at the film's centre: of a distant point source at an angle
          *        (radians) off the film centre's line of sight, towards the film's +x, the irradiance it gives the
@@ -111,8 +128,9 @@ public:
     /**
      * @brief Stray light: whether samples are traced non-sequentially; and how. A rough mirror scatters with
      *        probability at least `scatter_probability`; `hemisphere_fraction` of the samples' directions are drawn
-     *        from the hemisphere in front of the focal plane (about `front`), as light that bypasses the design's
-     *        paths may arrive from any of them. The focal-plane array (`detector`) absorbs.
+     *        from the hemisphere in front of the focal plane (the side of `front`, its normal at the film's centre;
+     *        about the focal surface's normal where the sample starts), as light that bypasses the design's paths may
+     *        arrive from any of them. The focal-plane array (`detector`, on the focal surface) absorbs.
      */
     struct stray_light_t {
         bool enabled = false;
@@ -161,13 +179,9 @@ private:
         return { .axis = axis, .cos_half_angle = std::cos(half_angle) };
     }
 
-    [[nodiscard]] inline glm::dvec3 focal_plane_point(const vec2_t& film_pos) const noexcept {
+    [[nodiscard]] inline glm::dvec2 focal_plane_local(const vec2_t& film_pos) const noexcept {
         const auto dims = glm::dvec2{ this->film().dimensions() };
-        const auto local = (glm::dvec2{ film_pos } - dims/2.) * fp.pixel_pitch;
-        return glm::dvec3{ fp.to_telescope * glm::dvec4{ local, 0, 1 } };
-    }
-    [[nodiscard]] inline glm::dvec3 focal_plane_normal() const noexcept {
-        return glm::normalize(glm::dvec3{ fp.to_telescope * glm::dvec4{ 0,0,1,0 } });
+        return (glm::dvec2{ film_pos } - dims/2.) * fp.pixel_pitch;
     }
     /**
      * @brief The frame of the Stokes parameters that the film records, of light arriving at the focal plane along

@@ -65,7 +65,7 @@ The render then has the telescope's geometric optics in it: its distortion, its 
 Diffraction by the aperture is not traced: it is the detector model's (``detector.py``).
 
 The telescope's optics are configured, not built in: a list of elements, in the order light meets them.
-``tools/remote_sensing/telescope.py`` writes them for Cassegrain and Ritchey-Chrétien designs (centred, off-axis or folded) and for the Hubble Space Telescope (:doc:`tools`).
+``tools/remote_sensing/telescope.py`` writes them for Cassegrain and Ritchey-Chrétien designs (centred, off-axis or folded), for unobscured three-mirror anastigmats and for the Hubble Space Telescope, and fits curved focal planes to their fields (:doc:`tools`).
 
 .. code-block:: xml
 
@@ -99,7 +99,9 @@ The telescope's optics are configured, not built in: a list of elements, in the 
 The telescope's frame follows optical design software's convention: light from the scene arrives travelling towards +z.
 Each element has its own frame, its vertex at the origin and its axis along local +z, placed by its ``to_telescope`` transform (rotations and translations).
 A surface's radius of curvature is positive when its centre of curvature is at local +z: prescriptions from Zemax, CODE V or Optiland carry over for surfaces whose frames are not flipped (a two-mirror telescope's mirrors both have negative radii).
-Pixel (*i*, *j*) of the film spans [*i*, *i*\ +1) × [*j*, *j*\ +1) pixel pitches about the film's centre, at x and y of the ``focal_plane`` transform's frame (on its plane z = 0).
+Pixel (*i*, *j*) of the film spans [*i*, *i*\ +1) × [*j*, *j*\ +1) pixel pitches about the film's centre, at x and y of the ``focal_plane`` transform's frame: on its plane z = 0, or, with ``focal_plane_radius``, on the sphere of that radius tangent to the plane at the film's centre (its centre of curvature at the frame's +z if the radius is positive), each point at the sphere's sag of its x and y.
+A curved focal plane follows a telescope's curved field (a Ritchey-Chrétien's is concave towards the secondary: 0.15 m in radius for the tests' design, f = 2.5 m): off the axis, the film is tilted to the sphere's normal at its centre, its x and y unchanged.
+Its pixels span equal steps of x and y: their areas on the sphere are larger away from the centre, as one over the cosine of its slope (by 2·10⁻⁵ at the corners of the tests' curved film), which the render's radiance does not count.
 The image is the one the optics form: for the film's x to be east and its y south at nadir (as a ``satellite_frame`` camera's), a two-mirror telescope's focal plane is turned half a turn about y, as above; with an odd number of mirrors the image is mirrored.
 
 **Placement.**
@@ -162,6 +164,8 @@ Every mirror is also an obstacle to the rays' other segments, within its clear a
      - The film's pixels, on the focal plane.
    * - ``focal_plane``
      - The focal-plane array's frame in the telescope's (required).
+   * - ``focal_plane_radius``
+     - A curved focal plane's radius of curvature (above). Default: flat. Refused if the film's corners are beyond the sphere.
    * - ``focal_length``
      - Optional: refused unless the optics' focal length (below) is within 1% of it.
    * - placement
@@ -205,7 +209,7 @@ With ideal mirrors, a uniform scene renders as its radiance at the film's centre
 The render is still the radiance at the entrance pupil, for ``detector.py`` to scale by the aperture: give its instrument the aperture's diameter and obscuration that the sensor reports, a wavefront error without the design's own aberrations, which the render has, and a transmittance without the coated mirrors' reflectances, which the render has too.
 
 **When loading**, the sensor traces its optics from the film's centre (2\ :sup:`18` rays), near it and from its corners, and refuses designs through which no ray passes from the film's centre, or whose film centre does not look towards the scene.
-It logs and describes (the scene's description, e.g. ``Scene::info`` in the Rust bindings) what it found: the focal lengths along the film's x and y (from the lines of sight 10 pixels either side of the centre: the image's centroid's scale, which a telescope's coma lengthens), the entrance pupil's diameter and obscuration, the film centre's projected solid angle and geometric blur (RMS, warning beyond 10 pixels), and the corners' throughput relative to the centre's.
+It logs and describes (the scene's description, e.g. ``Scene::info`` in the Rust bindings) what it found: the focal lengths along the film's x and y (from the lines of sight 10 pixels either side of the centre: the image's centroid's scale, which a telescope's coma lengthens), the entrance pupil's diameter and obscuration, the film centre's projected solid angle and geometric blur (the RMS angle of its rays towards the scene; warning beyond 10 pixels), the corners' throughput relative to the centre's and the largest of their blurs, and the focal plane's radius (0: flat).
 
 **Sampling.**
 The rays that the optics vignette are samples of no importance: they cost noise (1.5–3% per pixel at 256 samples, for the designs of the tests).
@@ -216,8 +220,8 @@ Light reaches the film by paths other than the design's: past baffles (the focal
 With ``stray_light``, each sample's ray is traced non-sequentially: it meets whichever element is nearest, in any order.
 
 * Mirrors reflect on their reflective side (the side the design's rays meet), and absorb on their back. Smooth, they reflect specularly; rough, they scatter by the ABg model of stray-light analysis (as in FRED, ASAP or Zemax), BSDF = A / (B + \|β − β₀\|\ :sup:`g`), relative to their coating's reflectance (β and β₀ the projections of the scattered and specular directions on the mirror's tangent plane), and reflect specularly only what they do not scatter: the total integrated scatter TIS = ∫ BSDF d²β, πA ln((B + 1)/B) at normal incidence for g = 2. Scatter depolarizes.
-* Stops (a plate around their opening), obscurations and tubes reflect diffusely (Lambertian, of their ``reflectance``); the focal-plane array absorbs.
-* A tenth of the samples' directions are drawn from the hemisphere in front of the focal plane (cosine-distributed), as such light may arrive from any of them.
+* Stops (a plate around their opening), obscurations and tubes reflect diffusely (Lambertian, of their ``reflectance``); the focal-plane array (on its plane or sphere) absorbs.
+* A tenth of the samples' directions are drawn from the hemisphere in front of the focal plane (cosine-distributed, about its normal where the sample starts), as such light may arrive from any of them.
 
 Rays that leave the telescope gather the scene's light as the design's do.
 Without ``stray_light``, rough mirrors still lose their TIS from the specular image (that light leaves the image).
@@ -228,8 +232,8 @@ A render cannot find a point source by its rays (a ``directional`` emitter, the 
 Only backward ``plt_path``: the sensor cannot connect to scene points, as ``plt_bdpt`` and forward ``plt_path`` need (scenes are refused).
 On the GPU, the kernels trace the optics in their precision: in single precision, directions leaving the telescope are accurate to ~10⁻⁷ rad, a twentieth of a pixel for the tests' designs (f = 2.5 m, 5 µm pixels), but more than one for Hubble's (f = 57.6 m; the GPU warns when it is more than a tenth): render long focal lengths on the CPU, or with ``GPU_DBL_PRECISION``.
 The GPU supports up to 32 elements, 8 aspheric terms per surface, 16 coating layers and 16 refractive indices over all coatings, and 8 distinct mirror scatter models.
-Stray light: a ray scattered off a mirror does not meet that mirror again; mirrors have no edges or substrates beyond their apertures; baffles are Lambertian; the PST counts the source's light where it shines directly on a scattering surface, not after specular reflections (e.g. the sun reflected by the primary onto a baffle), and only at the film's centre.
-The focal plane is flat, and the scene loader reads transforms in single precision (their rotations are orthonormalized again; translations are good to ~0.1 µm per metre).
+Stray light: mirrors have no edges or substrates beyond their apertures; baffles are Lambertian; the PST counts the source's light where it shines directly on a scattering surface, not after specular reflections (e.g. the sun reflected by the primary onto a baffle), and only at the film's centre.
+The focal plane is a plane or a sphere (not a cylinder, nor the aspheric field of a field-flattened design), and the scene loader reads transforms in single precision (their rotations are orthonormalized again; translations are good to ~0.1 µm per metre).
 
 
 ``band_radiance`` response

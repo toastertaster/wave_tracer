@@ -69,8 +69,9 @@ std::optional<double> surface_shape_t::intersect(const ray_t& r, double tmin) co
     const auto& o = r.o;
     const auto& d = r.d;
 
-    // the base conic, c (x² + y² + (1+κ) z²) - 2z = 0: of the quadratic's roots, the one through the vertex (which
-    // tends to the plane's as c tends to 0)
+    // the base conic, c (x² + y² + (1+κ) z²) - 2z = 0, as A t² + 2B t + C = 0: of its roots beyond tmin, the
+    // nearest on the branch through the vertex, where (1+κ) c z ≤ 1 (the other branch is a sphere's far side, an
+    // ellipsoid's, or a hyperboloid's other sheet)
     const auto c = curvature, k1 = 1+conic;
     const auto A = c*(d.x*d.x + d.y*d.y + k1*d.z*d.z);
     const auto B = c*(o.x*d.x + o.y*d.y + k1*o.z*d.z) - d.z;
@@ -79,10 +80,27 @@ std::optional<double> surface_shape_t::intersect(const ray_t& r, double tmin) co
 
     double t;
     if (D>=0 && (B!=0 || A!=0)) {
-        const auto q = B + std::copysign(std::sqrt(D), B);
-        if (q==0)
+        double roots[2];
+        int count = 0;
+        if (A==0) {
+            roots[count++] = -C/(2*B);
+        } else {
+            const auto q = -(B + std::copysign(std::sqrt(D), B));
+            roots[count++] = q/A;
+            if (q!=0)
+                roots[count++] = C/q;
+            if (count==2 && roots[1]<roots[0])
+                std::swap(roots[0], roots[1]);
+        }
+        t = std::numeric_limits<double>::quiet_NaN();
+        for (int i=0; i<count; ++i) {
+            if (roots[i]>tmin && k1*c*(o.z + roots[i]*d.z)<=1 + 1e-12) {
+                t = roots[i];
+                break;
+            }
+        }
+        if (std::isnan(t))
             return std::nullopt;
-        t = -C/q;
     } else if (aspheric.empty()) {
         return std::nullopt;
     } else {
@@ -391,14 +409,14 @@ std::size_t telescope_optics_t::nearest(const ray_t& r, double tmin, const detec
             found = i;
         }
     }
-    // the detector's plane
+    // the detector's surface: its plane, or sphere
     const auto o = transform_point(det.to_local, r.o);
     const auto d = transform_direction(det.to_local, r.d);
-    if (d.z!=0) {
-        const auto td = -o.z/d.z;
-        const auto p = o + td*d;
-        if (td>tmin && td<t && std::abs(p.x)<=det.half_extent.x && std::abs(p.y)<=det.half_extent.y) {
-            t = td;
+    const auto td = surface_shape_t{ .curvature = det.curvature }.intersect({ o,d }, tmin);
+    if (td) {
+        const auto p = o + *td*d;
+        if (*td<t && std::abs(p.x)<=det.half_extent.x && std::abs(p.y)<=det.half_extent.y) {
+            t = *td;
             found = stopped_by_detector;
         }
     }

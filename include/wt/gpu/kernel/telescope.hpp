@@ -103,27 +103,57 @@ WT_GPU_FN bool telescope_normal(const WT_GPU_GLOBAL telescope_element& e, real x
     return true;
 }
 
+/** @brief `telescope_intersect_conic`'s outcomes. */
+WT_GPU_CONSTANT constexpr int telescope_conic_hit = 1;
+WT_GPU_CONSTANT constexpr int telescope_conic_missed = 0;
+/** @brief The ray does not meet the conic's quadric at all. */
+WT_GPU_CONSTANT constexpr int telescope_conic_no_roots = -1;
+
+/**
+ * @brief The distance `t` along the local ray (o,d) to the conic of vertex curvature `c` and conic constant `k1`-1
+ *        (`surface_shape_t`, without aspheric terms), beyond `tmin`, on the sheet through the vertex.
+ */
+WT_GPU_FN int telescope_intersect_conic(real c, real k1, vec3 o, vec3 d, real tmin, WT_GPU_THREAD real& t) {
+    // c (x² + y² + (1+κ) z²) - 2z = 0, as A t² + 2B t + C = 0: of its roots beyond tmin, the nearest on the branch
+    // through the vertex, where (1+κ) c z ≤ 1
+    const real A = c*(d.x*d.x + d.y*d.y + k1*d.z*d.z);
+    const real B = c*(o.x*d.x + o.y*d.y + k1*o.z*d.z) - d.z;
+    const real C = c*(o.x*o.x + o.y*o.y + k1*o.z*o.z) - 2*o.z;
+    const real D = B*B - A*C;
+    if (!(D>=real(0)) || (B==real(0) && A==real(0)))
+        return telescope_conic_no_roots;
+
+    real r0, r1;
+    if (A==real(0)) {
+        r0 = r1 = -C/(2*B);
+    } else {
+        const real q = -(B + (B<real(0) ? -sqrt(D) : sqrt(D)));
+        r0 = q/A;
+        r1 = q!=real(0) ? C/q : r0;
+        if (r1<r0)
+            swap(r0, r1);
+    }
+    const real branch = 1 + 16*epsilon;
+    if (r0>tmin && k1*c*(o.z + r0*d.z)<=branch)
+        t = r0;
+    else if (r1>tmin && k1*c*(o.z + r1*d.z)<=branch)
+        t = r1;
+    else
+        return telescope_conic_missed;
+    return isfinite(t) ? telescope_conic_hit : telescope_conic_missed;
+}
+
 /**
  * @brief `surface_shape_t::intersect`: the distance `t` along the local ray (o,d) to the surface, beyond `tmin`, on
  *        the sheet through the vertex. False if the ray misses it.
  */
 WT_GPU_FN bool telescope_intersect_surface(const WT_GPU_GLOBAL telescope_element& e, vec3 o, vec3 d, real tmin,
                                            WT_GPU_THREAD real& t) {
-    // the base conic, c (x² + y² + (1+κ) z²) - 2z = 0: of the quadratic's roots, the one through the vertex
-    const real c = e.curvature, k1 = 1+e.conic;
-    const real A = c*(d.x*d.x + d.y*d.y + k1*d.z*d.z);
-    const real B = c*(o.x*d.x + o.y*d.y + k1*o.z*d.z) - d.z;
-    const real C = c*(o.x*o.x + o.y*o.y + k1*o.z*o.z) - 2*o.z;
-    const real D = B*B - A*C;
-
-    if (D>=real(0) && (B!=real(0) || A!=real(0))) {
-        const real q = B + (B<real(0) ? -sqrt(D) : sqrt(D));
-        if (q==real(0))
-            return false;
-        t = -C/q;
-    } else if (e.aspheric_count==0) {
+    // the base conic's
+    const int conic = telescope_intersect_conic(e.curvature, 1+e.conic, o, d, tmin, t);
+    if (conic==telescope_conic_missed || (conic==telescope_conic_no_roots && e.aspheric_count==0)) {
         return false;
-    } else {
+    } else if (conic==telescope_conic_no_roots) {
         // the aspheric terms may still bring the surface to the ray: start at the vertex plane
         if (d.z==real(0))
             return false;
@@ -280,12 +310,13 @@ WT_GPU_FN u32 telescope_nearest(const WT_GPU_GLOBAL telescope_desc& T, vec3 o, v
             found = i;
         }
     }
+    // the detector's surface: its plane, or sphere
     const vec3 lo = affine_point(T.fp_to_local, o);
     const vec3 ld = affine_direction(T.fp_to_local, d);
-    if (ld.z!=real(0)) {
-        const real td = -lo.z/ld.z;
+    real td;
+    if (telescope_intersect_conic(T.fp_curvature, 1, lo, ld, tmin, td)==telescope_conic_hit) {
         const vec3 q = lo + td*ld;
-        if (td>tmin && td<t && abs(q.x)<=T.fp_half_extent.x && abs(q.y)<=T.fp_half_extent.y) {
+        if (td<t && abs(q.x)<=T.fp_half_extent.x && abs(q.y)<=T.fp_half_extent.y) {
             t = td;
             found = telescope_detector;
         }
@@ -627,21 +658,29 @@ WT_GPU_FN telescope_sample_t sample_telescope(const WT_GPU_GLOBAL telescope_desc
     const vec2 offset = rnd.r2();
     const vec2 film_pos = vec2{ real(ex)+offset.x, real(ey)+offset.y };
     const vec2 local = (film_pos - dims*real(.5)) * T.pixel_pitch;
-    const vec3 p = affine_point(T.fp_to_telescope, vec3{ local.x, local.y, 0 });
+    // on the focal surface: its sag, and its normal (`telescope_t::focal_plane_t::point` and `normal`)
+    const real c = T.fp_curvature, r2 = dot(local, local);
+    const real cos_slope2 = max(real(0), 1 - c*c*r2);
+    const real sag = c*r2 / (1 + sqrt(cos_slope2));
+    const real g = c / sqrt(max(cos_slope2, real(1e-30)));
+    const vec3 p = affine_point(T.fp_to_telescope, vec3{ local.x, local.y, sag });
+    const vec3 fp_normal = normalize(affine_direction(T.fp_to_telescope, vec3{ -local.x*g, -local.y*g, 1 }));
 
     // a direction towards the optics, from the mixture of the cone of passing directions and the cone bounding all
     // that can pass
     // (with stray light, some from the hemisphere in front of the focal plane, cosine-distributed)
     const telescope_sampling_cone tight = telescope_passing_cone(T, film_pos, dims);
     const telescope_sampling_cone bound = telescope_aim(T, p);
+    // (about the focal surface's normal there, on the side of `front`)
+    const vec3 front = dot(fp_normal, T.front)>=real(0) ? fp_normal : -fp_normal;
     const real h = T.stray_light!=0 ? T.hemisphere_fraction : real(0);
     const vec2 u = rnd.r2();
     const real choice = rnd.r();
     const u32 component = choice<h ? 0 : choice<h + (1-h)*T.aim_tight_fraction ? 1 : 2;
-    const vec3 d = component==0 ? telescope_cosine_hemisphere(T.front, u) :
+    const vec3 d = component==0 ? telescope_cosine_hemisphere(front, u) :
                    component==1 ? tight.sample(u) : bound.sample(u);
     const real pdf =
-        h * max(real(0), dot(d, T.front)) * inv_pi +
+        h * max(real(0), dot(d, front)) * inv_pi +
         (1-h) * ((component==1 || tight.contains(d) ? T.aim_tight_fraction / tight.solid_angle() : real(0)) +
                  (component==2 || bound.contains(d) ? (1-T.aim_tight_fraction) / bound.solid_angle() : real(0)));
 
@@ -678,7 +717,7 @@ WT_GPU_FN telescope_sample_t sample_telescope(const WT_GPU_GLOBAL telescope_desc
 
     // projected solid angle over its sampling density, relative to the film centre's
     const real weight = passed && pdf>real(0) ?
-        abs(dot(d, T.fp_normal)) / pdf * T.recp_projected_solid_angle * trace_weight :
+        abs(dot(d, fp_normal)) / pdf * T.recp_projected_solid_angle * trace_weight :
         real(0);
 
     // towards the scene, in world coordinates; starting `near_clip` along, about the film centre's line of sight

@@ -17,7 +17,17 @@ dims it as much.
 Each design is modelled in Optiland as the telescope sensor sees it: light meets the secondary's plane first, where the
 secondary's body (a disc of its aperture radius) blocks it; then the primary (the stop: its aperture and central
 hole), the secondary (its aperture), and the primary's plane again, whose hole the converging beam passes; then a flat
-focal plane. Only centred two-mirror designs are modelled.
+focal plane. Only centred two-mirror designs are modelled so.
+
+Off-axis segments of coaxial parents (the three-mirror anastigmat; the off-axis Ritchey-Chrétien, on its flat focal
+plane and on the sphere telescope.py's --curved-focal-plane fits to its field) are modelled as their parents, whose
+entrance pupil covers the segment; their rays are traced through the segment only (normalized pupil coordinates within
+it), at the field that images at the film's centre, onto the image surface (a curved focal plane's sphere: centred on
+the axis), in the focal plane's x and y. From them: the parent's focal length; the image's local scale (its centroid's
+motion per field angle, along x and y); the RMS spot there; and the film centre's projected solid angle that the
+étendue gives, A cos θ dΩ/dA (the segment's area, seen from the field direction θ, times the solid angle per image
+area: the Jacobian of the field's directions to the image's centroids). The segment's area is the sensor's: of a disc on
+the primary's surface, which the field's rays cross the pupil's plane over.
 
     uv run tools/remote_sensing/telescope_reference.py
 
@@ -30,7 +40,7 @@ import math
 import numpy as np
 from optiland import optic, physical_apertures
 
-from telescope import hubble, two_mirror
+from telescope import curve_focal_plane, hubble, three_mirror, two_mirror
 
 INF = float("inf")
 
@@ -108,6 +118,106 @@ def reference(design):
     return out
 
 
+def segment_reference(design, field_bias, off_axis):
+    """Optiland's values for an off-axis segment of telescope.py's coaxial mirrors (the three-mirror anastigmat, or a
+    two-mirror design's segment), at the field that images at the film's centre (from `field_bias`: radians, along y,
+    the light's direction of travel), on the design's focal plane (see the module's doc)."""
+    mm = 1e3
+    mirrors = design.elements
+    primary = mirrors[0]
+    z = [e.to_telescope[2, 3] for e in mirrors]
+    D = 2 * primary.aperture_radius
+    epd = 2 * (off_axis + D / 2)
+
+    # the image surface: the focal plane, or the sphere it is curved on (centred on the axis), from its vertex
+    fp = design.focal_plane
+    origin, x_axis, y_axis, z_axis = fp[:3, 3], fp[:3, 0], fp[:3, 1], fp[:3, 2]
+    if design.focal_plane_radius:
+        centre = origin + design.focal_plane_radius * z_axis
+        if np.hypot(centre[0], centre[1]) > 1e-9:
+            raise ValueError("the curved focal plane's centre is off the axis")
+        r = abs(design.focal_plane_radius)
+        z_image = min(centre[2] - r, centre[2] + r, key=lambda v: abs(v - origin[2]))
+        image_radius = centre[2] - z_image
+    else:
+        if abs(abs(z_axis[2]) - 1) > 1e-12:
+            raise ValueError("a flat focal plane is modelled perpendicular to the axis")
+        z_image, image_radius = origin[2], INF
+
+    o = optic.Optic()
+    o.surfaces.add(index=0, radius=INF, thickness=INF)
+    for i, e in enumerate(mirrors):
+        z_next = z[i + 1] if i + 1 < len(mirrors) else z_image
+        o.surfaces.add(index=i + 1, radius=e.radius * mm, conic=e.conic, thickness=(z_next - z[i]) * mm,
+                       material="mirror", is_stop=i == 0)
+    o.surfaces.add(index=len(mirrors) + 1, radius=image_radius * mm)
+    o.set_aperture(aperture_type="EPD", value=epd * mm)
+    o.fields.set_type(field_type="angle")
+    max_field = abs(math.degrees(field_bias)) * 2
+    o.fields.add(y=0)
+    o.fields.add(y=max_field)
+    o.wavelengths.add(value=0.55, is_primary=True)
+
+    # the segment's rays: a polar grid, uniform by area, in normalized pupil coordinates
+    n_r, n_phi = 40, 72
+    rr = np.sqrt((np.arange(n_r) + 0.5) / n_r) * (D / 2)
+    phi = 2 * np.pi * (np.arange(n_phi) + 0.5) / n_phi
+    R, PHI = np.meshgrid(rr, phi)
+    px = (R * np.cos(PHI)).ravel() / (epd / 2)
+    py = (off_axis + R * np.sin(PHI)).ravel() / (epd / 2)
+
+    def image(theta_x, theta_y):
+        """The rays' points on the image surface, in the focal plane's x and y (about its origin)."""
+        hx, hy = np.full_like(px, math.degrees(theta_x) / max_field), np.full_like(py, math.degrees(theta_y) / max_field)
+        o.trace_generic(hx, hy, px, py, 0.55)
+        # (Optiland's global coordinates: the telescope's, the first mirror's vertex at the origin)
+        p = np.stack([np.asarray(o.surfaces.x[-1]), np.asarray(o.surfaces.y[-1]),
+                      np.asarray(o.surfaces.z[-1])], axis=1) / mm
+        return (p - origin) @ x_axis, (p - origin) @ y_axis
+
+    # the field that images at the film's centre (the focal plane's origin), from `field_bias` (Newton)
+    delta = 2e-5
+    for _ in range(4):
+        slope = (image(0.0, field_bias + delta)[1].mean() - image(0.0, field_bias - delta)[1].mean()) / (2 * delta)
+        field_bias -= image(0.0, field_bias)[1].mean() / slope
+
+    x0, y0 = image(0.0, field_bias)
+    rms = float(np.sqrt(np.mean((x0 - x0.mean()) ** 2 + (y0 - y0.mean()) ** 2)))
+    xp, yp = image(delta, field_bias)
+    xm, ym = image(-delta, field_bias)
+    xq, yq = image(0.0, field_bias + delta)
+    xr, yr = image(0.0, field_bias - delta)
+    J = np.array([[(xp.mean() - xm.mean()), (xq.mean() - xr.mean())],
+                  [(yp.mean() - ym.mean()), (yq.mean() - yr.mean())]]) / (2 * delta)
+    # the field's direction, (tan θx, tan θy, 1) normalized: the angles its parameters turn it by, and its solid
+    # angle per dθx dθy
+    def direction(tx, ty):
+        v = np.array([math.tan(tx), math.tan(ty), 1.0])
+        return v / np.linalg.norm(v)
+    dx = (direction(delta, field_bias) - direction(-delta, field_bias)) / (2 * delta)
+    dy = (direction(0, field_bias + delta) - direction(0, field_bias - delta)) / (2 * delta)
+    d_omega = np.linalg.norm(np.cross(dx, dy))
+    # the clear aperture is a disc on the primary's surface: the field's rays through it cross the plane z = 0 over
+    # its area times 1 - t·∇sag (t the rays' slopes), 0.29% more than the disc's at a 1° bias
+    c, k = 1 / primary.radius, primary.conic
+    g = np.linspace(-1, 1, 801)
+    gx, gy = np.meshgrid(g, g)
+    inside = gx ** 2 + gy ** 2 <= 1
+    x, y = (D / 2) * gx[inside], off_axis + (D / 2) * gy[inside]
+    slope = c / np.sqrt(1 - (1 + k) * c * c * (x * x + y * y))       # ∇sag = (x, y) slope
+    area = math.pi * (D / 2) ** 2 * float(np.mean(1 - math.tan(field_bias) * y * slope))
+    cos_theta = direction(0, field_bias)[2]
+    return {
+        "focal_length_m": float(o.paraxial.f2()) / mm,
+        # per angle between the directions (as the sensor's focal lengths: from its lines of sight)
+        "scale_x_m_per_rad": float(abs(J[0, 0]) / np.linalg.norm(dx)),
+        "scale_y_m_per_rad": float(abs(J[1, 1]) / np.linalg.norm(dy)),
+        "rms_spot_m": rms,
+        "field_deg": math.degrees(field_bias),
+        "projected_solid_angle_sr": float(area * cos_theta * d_omega / abs(np.linalg.det(J))),
+    }
+
+
 def main():
     pixel_pitch, pixels = 5e-6, 256
     field = math.atan(pixels * pixel_pitch / math.sqrt(2) / 2.5)
@@ -130,6 +240,17 @@ def main():
     corner = (vig_pixels / 2 - 0.5) * vig_pitch * math.sqrt(2)
     refs["vignetting"] = (reference(vig) | relative_throughput(vig, corner)
                           | {"secondary_radius_m": secondary_radius})
+    bias, off_axis = math.radians(1.0), 0.2
+    tma = three_mirror(0.2, 2.5, 0.6, (0.45, 1.15), off_axis=off_axis, field_bias=bias,
+                       field_radius=math.atan(pixels * pixel_pitch / math.sqrt(2) / 2.5))
+    refs["three_mirror"] = segment_reference(tma, bias, off_axis)
+
+    # the off-axis Ritchey-Chrétien segment, 0.3° off its axis (north: light travelling south), on its flat focal
+    # plane and on the sphere telescope.py fits to its field
+    field = math.atan(pixels * pixel_pitch / math.sqrt(2) / 2.5)
+    segment = two_mirror("ritchey-chretien", 0.2, field_radius=field, off_axis=0.2, field_bias=math.radians(0.3))
+    refs["off_axis_biased"] = segment_reference(segment, -math.radians(0.3), 0.2)
+    refs["off_axis_curved"] = segment_reference(curve_focal_plane(segment, field), -math.radians(0.3), 0.2)
     print(json.dumps(refs, indent=2))
 
 

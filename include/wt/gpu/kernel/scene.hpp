@@ -423,7 +423,7 @@ struct telescope_desc {
 
     // the focal plane (`telescope_t::focal_plane_t`)
     real fp_to_telescope[12];               // rigid, row-major 3x4
-    vec3 fp_normal;
+    real fp_curvature;                      // 1/metres; 0 if flat
     real pixel_pitch;                       // metres
 
     // its placement (`telescope_t::placement_t`)
@@ -443,8 +443,9 @@ struct telescope_desc {
     /**
      * @brief Stray light (`telescope_t::stray_light_t`): traced non-sequentially if nonzero; a rough mirror scatters
      *        with probability at least `scatter_probability`; `hemisphere_fraction` of the directions are drawn from
-     *        the hemisphere about `front`; the focal-plane array (its plane z=0 in the frame `fp_to_local` maps to,
-     *        within `fp_half_extent`) absorbs.
+     *        the hemisphere on the side of `front` (the focal plane's normal at its centre) about the focal surface's
+     *        normal; the focal-plane array (its surface, of curvature `fp_curvature`, in the frame `fp_to_local` maps
+     *        to, within `fp_half_extent` in x and y) absorbs.
      */
     u32 stray_light;
     real scatter_probability;

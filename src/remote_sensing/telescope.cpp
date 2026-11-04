@@ -115,17 +115,20 @@ sensor_sample_t telescope_t<polarimetric>::sample(sampler::sampler_t& sampler,
                                                   const wavenumber_t k) const noexcept {
     const auto film_pos = vec2u32_t{ sensor_element };
     const auto offset = sampler.r2();
-    const auto p = focal_plane_point(vec2_t{ film_pos } + offset);
+    const auto local = focal_plane_local(vec2_t{ film_pos } + offset);
+    const auto p = fp.point(local);
+    const auto n = fp.normal(local);
 
     // a direction towards the optics, from the mixture of the cone of passing directions and the cone bounding all
     // that can pass, traced backwards
-    // (with stray light, some from the hemisphere in front of the focal plane, cosine-distributed)
+    // (with stray light, some from the hemisphere in front of the focal plane, cosine-distributed: about the focal
+    // surface's normal there)
     const auto mixture = aim_mixture_t{
         .tight = passing_cone(vec2_t{ film_pos } + offset),
         .bound = optics->aim(p),
         .tight_fraction = aim_tight_fraction,
         .hemisphere_fraction = stray.enabled ? stray.hemisphere_fraction : 0.,
-        .front = stray.front,
+        .front = glm::dot(n, stray.front)>=0 ? n : -n,
     };
     const auto u = sampler.r2();
     const auto d = mixture.sample(u, double(sampler.r()));
@@ -136,7 +139,7 @@ sensor_sample_t telescope_t<polarimetric>::sample(sampler::sampler_t& sampler,
 
     // projected solid angle over its sampling density, relative to the film centre's; and the trace's weight
     const auto weight = traced.passed && pdf>0 ?
-        std::abs(glm::dot(d, focal_plane_normal())) / pdf / props.centre.projected_solid_angle * traced.weight :
+        std::abs(glm::dot(d, n)) / pdf / props.centre.projected_solid_angle * traced.weight :
         0.;
 
     // towards the scene, in world coordinates (in double precision: the telescope is far away)
@@ -230,6 +233,8 @@ scene::element::info_t telescope_t<polarimetric>::description() const {
         { "projected solid angle (sr)", attributes::make_scalar(c.projected_solid_angle) },
         { "centre RMS blur (rad)",      attributes::make_scalar(c.rms_spread) },
         { "corner relative throughput", attributes::make_scalar(props.corner_relative_throughput) },
+        { "corner RMS blur (rad)",      attributes::make_scalar(props.corner_rms_spread) },
+        { "focal plane radius (m)",     attributes::make_scalar(fp.curvature!=0 ? 1/fp.curvature : 0.) },
         { "stray light",                attributes::make_scalar(stray.enabled) },
         { "film",                       attributes::make_map(std::move(film_desc)) },
     });
@@ -511,7 +516,7 @@ std::shared_ptr<sensor::sensor_t> load(std::string id,
     using telescope_t = remote_sensing::telescope_t<polarimetric>;
 
     satellite_placement_t placement;
-    std::optional<double> pixel_pitch, focal_length;
+    std::optional<double> pixel_pitch, focal_length, focal_plane_radius;
     std::optional<transform_d_t> focal_plane;
     std::vector<optics::element_t> elements;
 
@@ -541,6 +546,7 @@ std::shared_ptr<sensor::sensor_t> load(std::string id,
         }
         else if (!placement.read(item, loader) &&
                  !read_length(item, "pixel_pitch", pixel_pitch) &&
+                 !read_length(item, "focal_plane_radius", focal_plane_radius) &&
                  !read_length(item, "focal_length", focal_length) &&
                  !scene::loader::read_attribute(item, "samples", samples_per_element) &&
                  !scene::loader::read_attribute(item, "alpha", requested_alpha) &&
@@ -586,12 +592,15 @@ std::shared_ptr<sensor::sensor_t> load(std::string id,
     const auto fp = typename telescope_t::focal_plane_t{
         .to_telescope = rigid_matrix(*focal_plane, "focal_plane", node),
         .pixel_pitch = *pixel_pitch,
+        .curvature = focal_plane_radius && *focal_plane_radius!=0 ? 1 / *focal_plane_radius : 0.,
     };
     const auto dims = glm::dvec2{ film->dimensions() };
-    const auto fp_point = [&](glm::dvec2 film_pos) {
-        return glm::dvec3{ fp.to_telescope * glm::dvec4{ (film_pos - dims/2.) * fp.pixel_pitch, 0, 1 } };
-    };
-    const auto fp_normal = glm::normalize(glm::dvec3{ fp.to_telescope * glm::dvec4{ 0,0,1,0 } });
+    if (fp.curvature*fp.curvature * glm::dot(dims/2.*fp.pixel_pitch, dims/2.*fp.pixel_pitch) >= 1)
+        throw error("the film does not fit on the curved focal plane: its corners are beyond the sphere's");
+    const auto fp_point = [&](glm::dvec2 film_pos) { return fp.point((film_pos - dims/2.) * fp.pixel_pitch); };
+    const auto fp_normal_at = [&](glm::dvec2 film_pos) { return fp.normal((film_pos - dims/2.) * fp.pixel_pitch); };
+    // at the film's centre
+    const auto fp_normal = fp_normal_at(dims/2.);
 
     // what the optics do: the film centre's rays
     typename telescope_t::properties_t props;
@@ -604,8 +613,8 @@ std::shared_ptr<sensor::sensor_t> load(std::string id,
     // focal lengths: lines of sight about the film's centre
     const auto delta = 10.;     // pixels
     const auto focal_length_along = [&](glm::dvec2 axis) {
-        const auto a = optics->analyse(fp_point(dims/2. - delta*axis), fp_normal, field_samples);
-        const auto b = optics->analyse(fp_point(dims/2. + delta*axis), fp_normal, field_samples);
+        const auto a = optics->analyse(fp_point(dims/2. - delta*axis), fp_normal_at(dims/2. - delta*axis), field_samples);
+        const auto b = optics->analyse(fp_point(dims/2. + delta*axis), fp_normal_at(dims/2. + delta*axis), field_samples);
         if (a.passed_fraction==0 || b.passed_fraction==0)
             throw error("no ray passes through the optics near the film's centre");
         const auto angle = std::atan2(glm::length(glm::cross(a.line_of_sight, b.line_of_sight)),
@@ -621,11 +630,13 @@ std::shared_ptr<sensor::sensor_t> load(std::string id,
 
     // vignetting: the corners' throughput
     props.corner_relative_throughput = 1;
+    props.corner_rms_spread = 0;
     for (const auto corner : { glm::dvec2{ .5,.5 }, glm::dvec2{ dims.x-.5,.5 },
                                glm::dvec2{ .5,dims.y-.5 }, glm::dvec2{ dims.x-.5,dims.y-.5 } }) {
-        const auto c = optics->analyse(fp_point(corner), fp_normal, field_samples);
+        const auto c = optics->analyse(fp_point(corner), fp_normal_at(corner), field_samples);
         props.corner_relative_throughput = std::min(props.corner_relative_throughput,
                                                     c.projected_solid_angle / props.centre.projected_solid_angle);
+        props.corner_rms_spread = std::max(props.corner_rms_spread, c.rms_spread);
     }
 
     // where samples aim: the cones of passing directions, on a grid spanning the film (where no ray passes, the
@@ -634,8 +645,9 @@ std::shared_ptr<sensor::sensor_t> load(std::string id,
     std::vector<optics::cone_t> aim_grid;
     for (std::uint32_t j=0; j<n; ++j)
     for (std::uint32_t i=0; i<n; ++i) {
-        const auto p = fp_point(glm::dvec2{ i,j } / double(n-1) * dims);
-        const auto a = optics->analyse(p, fp_normal, aim_samples);
+        const auto film_pos = glm::dvec2{ i,j } / double(n-1) * dims;
+        const auto p = fp_point(film_pos);
+        const auto a = optics->analyse(p, fp_normal_at(film_pos), aim_samples);
         aim_grid.push_back(a.passed_fraction>0 && a.passing_cone.cos_half_angle<1 ? a.passing_cone : optics->aim(p));
     }
 
@@ -659,6 +671,7 @@ std::shared_ptr<sensor::sensor_t> load(std::string id,
         .to_telescope = fp.to_telescope,
         .to_local = glm::inverse(fp.to_telescope),
         .half_extent = dims/2. * fp.pixel_pitch,
+        .curvature = fp.curvature,
     };
 
     // the point-source transmittance at the film's centre, at the film's mean wavelength
