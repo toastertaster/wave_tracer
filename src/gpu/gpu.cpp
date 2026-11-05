@@ -118,9 +118,12 @@ void collect_triangle_lists(const std::vector<Query>& queries, const Run& run,
             if (retry_slot[i]==std::size_t(-1)) {
                 row = &tris[i*capacity];
             } else {
+                // a cone query that fits drops the triangles past its final search range, which an
+                // overflowed one still counts: the re-run finds those it counted, or fewer
                 const auto& retry = retry_hits[retry_slot[i]];
-                if (tri_count(retry)!=tri_count(hits[start+i]))
+                if (tri_count(retry)>tri_count(hits[start+i]))
                     throw gpu_error_t("GPU query returned different results when re-run");
+                hits[start+i] = retry;
                 row = &retry_tris[retry_slot[i]*retry_capacity];
             }
             check_status(hits[start+i].status);

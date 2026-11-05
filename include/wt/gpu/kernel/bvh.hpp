@@ -374,11 +374,34 @@ WT_GPU_FN void traverse_cone(bvh_view bvh, const WT_GPU_THREAD cone& cn,
  * @brief Cone query (`bvh8w_t::intersect(elliptic_cone_t, range, opts)`): the
  *        triangles hit within `z_scale` cross-section major axes past the closest
  *        hit, in traversal order.
+ *
+ *        Triangles found before a closer hit narrowed the search range are
+ *        dropped afterwards, as `cone_work_to_intersection_record` drops those
+ *        whose distance is past the final range. The sink holds no distances,
+ *        so they are measured again, against the whole search range (as the
+ *        first triangles were: the range narrows only its far end, which
+ *        leaves a triangle's nearest point as it is, and so the closest hit
+ *        its distance), and compared with the final range's end. If the sink
+ *        overflowed, its count stands, so that the caller re-runs the query
+ *        with room for every triangle found.
  */
 WT_GPU_FN cone_hit intersect_cone(bvh_view bvh, cone cn, range rng, real z_scale,
                                   WT_GPU_THREAD tri_sink& sink) {
     cone_hit rec = { inf(), 0, 0, status_ok };
     detail::traverse_cone(bvh, cn, rng, z_scale, rec, sink);
+    if (sink.count<=sink.capacity) {
+        // the search range before any hit (`cone_search_range` of an infinite distance)
+        const range whole = rng.intersect(range::positive());
+        const real max_dist = detail::cone_search_range(cn, rng, rec.dist, z_scale).max;
+        u32 kept = 0;
+        for (u32 i=0; i<sink.count; ++i) {
+            const bvh_tri tri = bvh.tris[sink.out[i]];
+            const auto h = intersect_cone_tri(cn, tri.a, tri.b, tri.c, tri.n, whole);
+            if (h.hit && h.dist<=max_dist)
+                sink.out[kept++] = sink.out[i];
+        }
+        sink.count = kept;
+    }
     rec.tri_count = sink.count;
     return rec;
 }

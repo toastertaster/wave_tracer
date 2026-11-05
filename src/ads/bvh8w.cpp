@@ -172,8 +172,11 @@ inline bool gather_tris(const bvh8w_t* tree,
             }
             found_intersection = true;
 
+            // with its distance: a closer hit found later narrows the search range, and
+            // cone_work_to_intersection_record drops the triangles past it
             record.triangles.emplace_back(intersection_work_tri_t{
                 .tuid = tuid,
+                .dist = dist,
             });
         }
     }
