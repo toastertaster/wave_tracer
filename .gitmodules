@@ -34,7 +34,8 @@
 	url = https://github.com/mpusz/mp-units
 [submodule "deps/tinyexpr-plusplus"]
 	path = deps/tinyexpr-plusplus
-	url = git@github.com:toastertaster/tinyexpr-plusplus.git
+	url = https://github.com/toastertaster/tinyexpr-plusplus.git
+	branch = main
 [submodule "deps/GitHash"]
 	path = deps/GitHash
 	url = https://github.com/Svalorzen/GitHash
