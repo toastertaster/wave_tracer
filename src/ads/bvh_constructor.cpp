@@ -50,6 +50,24 @@ using namespace wt::ads;
 using namespace wt::ads::construction;
 
 
+// tinybvh reports progress through BVHContext::progress, a plain function that
+// reaches its state through BVHContext::userdata. It maps tinybvh's [0,1]
+// onto [from,to] of the progress tracker.
+struct tbvh_progress_t {
+    progress_track_t& pt;
+    f_t from, to;
+    std::atomic<f_t> reported = 0;
+};
+static void tbvh_report_progress(float p, void* userdata) {
+    auto& state = *static_cast<tbvh_progress_t*>(userdata);
+    // Threaded builds report from several threads: only the thread that
+    // advances the last reported value by 2% forwards it.
+    f_t last = state.reported.load();
+    if (p>last+f_t(.02) && state.reported.compare_exchange_strong(last, p))
+        state.pt.set_progress(state.from + p * (state.to-state.from));
+}
+
+
 inline bvh::node_t tbvh_to_bvh_recursive(
 #ifdef TBVH_USE_SINGLES
         const tinybvh::BVH::BVHNode* tbvh_nodes,
@@ -164,18 +182,18 @@ bvh_constructor_t::bvh_constructor_t(
 #else
             tinybvh::BVH_Double;
 #endif
-        tbvh_t tbvh;
+        tbvh_progress_t build_progress{ .pt = pt, .from = 0, .to = build_pb };
+        tbvh_progress_t optimize_progress{ .pt = pt, .from = build_pb, .to = optimize_pb };
+
+        tinybvh::BVHContext tbvh_ctx;
+        tbvh_ctx.progress = tbvh_report_progress;
+        tbvh_ctx.userdata = &build_progress;
+        tbvh_t tbvh(tbvh_ctx);
+        // tinybvh defaults to Bonsai; the binned SAH builder gives lower SAH costs.
+        tbvh.settings.binnedBVH = true;
 
         {
             pt.set_status("tiny_bvh build()");
-            // Threaded builds report from several threads: only the thread that
-            // advances the last reported value by 2% forwards it.
-            std::atomic<f_t> reported = 0;
-            tbvh.progressCallback = [&](f_t p) {
-                f_t last = reported.load();
-                if (p>last+f_t(.02) && reported.compare_exchange_strong(last, p))
-                    pt.set_progress(p * build_pb);
-            };
 
 #ifdef TBVH_USE_SINGLES
             {
@@ -187,13 +205,8 @@ bvh_constructor_t::bvh_constructor_t(
                     tbvhtris.emplace_back(u::to_m(t.c.x), u::to_m(t.c.y), u::to_m(t.c.z), 0);
                 }
 
-#ifdef BVH_USEAVX
-                tbvh.BuildAVX(tbvhtris.data(), tbvhtris.size()/3);
-#else
-                // tinybvh was compiled without AVX (no -mavx, or not x86), so
-                // BuildAVX is a stub that exits: use the reference builder.
+                // uses tinybvh's SIMD (AVX or NEON) builder when available, its reference builder otherwise
                 tbvh.Build(tbvhtris.data(), tbvhtris.size()/3);
-#endif
             }
 #else
             {
@@ -215,10 +228,9 @@ bvh_constructor_t::bvh_constructor_t(
 #ifdef TBVH_USE_SINGLES
             {
                 tinybvh::BVH_Verbose tmp;
-                tmp.progressCallback = [&](f_t p) {
-                    pt.set_progress(p * (optimize_pb-build_pb) + build_pb);
-                };
                 tmp.ConvertFrom(tbvh);
+                // ConvertFrom() copies tbvh's context: report optimization progress separately
+                tmp.context.userdata = &optimize_progress;
                 tmp.Optimize(tbvh_optimize_iterations);
                 tbvh.ConvertFrom(tmp);
             }
