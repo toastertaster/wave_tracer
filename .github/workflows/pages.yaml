@@ -8,6 +8,10 @@
 #
 # Needs GitHub Pages enabled with "GitHub Actions" as its source, and
 # remote-sensing allowed to deploy to the github-pages environment.
+#
+# Because of the paths filter, a push that changes none of those paths (such
+# as an empty commit) doesn't publish. Manual runs (workflow_dispatch) are
+# only offered once this file is also on the default branch, main-gpu.
 name: Documentation (GitHub Pages)
 on:
   push:
