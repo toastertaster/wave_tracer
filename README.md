@@ -7,7 +7,7 @@
 **A wave-optical path tracer**
 
 [![GitHub Tag](https://img.shields.io/github/v/tag/ssteinberg/wave_tracer?include_prereleases&sort=date&logo=github&logoColor=AAEEFF&label=wave_tracer&color=AAEEFF)](https://github.com/ssteinberg/wave_tracer/tags)
-[![Documentation](https://github.com/ssteinberg/wave_tracer/actions/workflows/docs.yaml/badge.svg)](https://github.com/ssteinberg/wave_tracer/actions/workflows/docs.yaml)
+[![Documentation](https://github.com/toastertaster/wave_tracer/actions/workflows/pages.yaml/badge.svg?branch=remote-sensing)](https://github.com/toastertaster/wave_tracer/actions/workflows/pages.yaml)
 [![(Ubuntu latest gcc) Build and Test](https://github.com/ssteinberg/wave_tracer/actions/workflows/build_test_gcc.yaml/badge.svg)](https://github.com/ssteinberg/wave_tracer/actions/workflows/build_test_gcc.yaml)
 [![(Ubuntu latest clang-17) Build and Test](https://github.com/ssteinberg/wave_tracer/actions/workflows/build_test_clang17.yaml/badge.svg)](https://github.com/ssteinberg/wave_tracer/actions/workflows/build_test_clang17.yaml)
 [![(Ubuntu latest clang-20) Build and Test](https://github.com/ssteinberg/wave_tracer/actions/workflows/build_test_clang20.yaml/badge.svg)](https://github.com/ssteinberg/wave_tracer/actions/workflows/build_test_clang20.yaml)
@@ -28,7 +28,7 @@ Nevertheless, powerful hardware is expected in order to render some of the sampl
 
 **This is a work-in-progress and an early alpha release. Expect issues and an incomplete feature set.**
 
-Some documentations are available [here](https://wavetracer.dev). Documentations are a work in progress.
+Some documentations are available [here](https://toastertaster.github.io/wave_tracer/). Documentations are a work in progress.
 
 
 \

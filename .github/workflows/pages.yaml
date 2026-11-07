@@ -1,0 +1,71 @@
+# Publishes this fork's documentation to https://toastertaster.github.io/wave_tracer/
+# from the remote-sensing branch.
+#
+# Upstream's docs.yaml publishes upstream's site (wavetracer.dev) and is
+# disabled in this fork; this workflow is kept separate so that rebasing onto
+# upstream doesn't conflict with it. The build steps are the same as
+# docs.yaml's.
+#
+# Needs GitHub Pages enabled with "GitHub Actions" as its source, and
+# remote-sensing allowed to deploy to the github-pages environment.
+name: Documentation (GitHub Pages)
+on:
+  push:
+    branches: [remote-sensing]
+    paths:
+      - docs/**
+      - include/**
+      - src/**
+      - .github/workflows/pages.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a newer push waits rather than cancelling a
+# deployment that is under way.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    steps:
+      # docs/** is excluded from Git LFS (.gitattributes), so the images in
+      # docs/source/_static check out without LFS.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install docs deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y doxygen
+          pip install -r docs/requirements.txt
+
+      - name: Configure
+        run: cmake -Hdocs -Bdocsbuild
+      - name: Build
+        run: cmake --build docsbuild --target docs Sphinx -j4
+
+      # Hidden files (Sphinx's .doctrees cache, .buildinfo) are left out.
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: docsbuild/sphinx
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
